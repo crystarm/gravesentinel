@@ -2,9 +2,10 @@
 
 ## Назначение этого документа
 
-Документ фиксирует контракты каркаса этапа 01. Он не утверждает, что checkpoint,
-Podman/CRIU, файловое хранилище или IPC уже реализованы. Бинарный target
-`//src/hypervisor:gravesentinel_hypervisor` на этом этапе собирается, но при
+Документ фиксирует общие архитектурные контракты MVP и обновляется по мере
+завершения этапов. Реальный runtime profile и Manifest v1 уже квалифицированы,
+но production orchestration, файловое хранилище и IPC ещё не реализованы.
+Бинарный target `//src/hypervisor:gravesentinel_hypervisor` собирается, но при
 запуске явно завершается с ошибкой до появления сервера в этапе 10.
 
 ## Граница процессов
@@ -47,15 +48,28 @@ flowchart TD
     Protocol[//src/protocol:protocol]
     Hypervisor[//src/hypervisor:gravesentinel_hypervisor]
     Core[//src/core:ccm_core]
+    Hasher[//src/core:blake3_hasher]
+    Manifest[//src/manifest:manifest]
+    Crypto[//src/crypto:blake3]
+    Blake3[@blake3//:blake3]
+    Json[@nlohmann_json//:json]
     Unit[//tests/unit]
 
     SchedulerConsumer --> SchedulerClient
     SchedulerClient --> Protocol
     Hypervisor --> Core
     Core --> Protocol
+    Hasher --> Core
+    Hasher --> Crypto
+    Manifest --> Protocol
+    Manifest --> Crypto
+    Manifest --> Json
+    Crypto --> Protocol
+    Crypto --> Blake3
     Unit --> SchedulerClient
     Unit --> Core
-    Unit --> Protocol
+    Unit --> Hasher
+    Unit --> Manifest
 ```
 
 `//src/core:ccm_core` виден только package гипервизора и unit tests.
@@ -64,9 +78,10 @@ Scheduler-facing библиотека публична, но её единств
 Linux API.
 
 BLAKE3, nlohmann JSON и GoogleTest закреплены точными версиями в `MODULE.bazel`.
-BLAKE3 и JSON намеренно ещё не линкуются к production targets: настоящие hash и
-wire-format появятся в соответствующих этапах, а фиктивные реализации не
-добавляются.
+`//src/crypto:blake3` использует настоящий BLAKE3 C API, а
+`//src/manifest:manifest` — pinned nlohmann JSON для strict canonical Manifest v1.
+Эти зависимости остаются за внутренней hypervisor/core границей и не попадают в
+scheduler-facing target.
 
 ## Типы и валидация
 
@@ -82,6 +97,15 @@ wire-format появятся в соответствующих этапах, а 
 `ColdStartSpec` отделён от изменчивого runtime container ID. Environment в нём
 может содержать секреты: hypervisor не должен персистировать эти значения или
 передавать их в диагностические логи.
+
+`RuntimeFingerprint` содержит отдельные поля kernel, Podman/runtime build, CRIU,
+OCI runtime/commit/features, cgroup, privilege/user namespace,
+capability/SELinux/AppArmor/seccomp и command profile. Manifest v1 персистирует
+их вместе с source image identity и отклоняет неполный fingerprint.
+
+`RelativeSnapshotPath`, ordered artifacts/chunks, canonical JSON, parser limits и
+BLAKE3 checksum определены в `docs/manifest-v1.md`. Лексический join пути не
+заменяет будущий no-follow `openat2/openat` filesystem boundary.
 
 ## Внутренние контракты
 

@@ -7,6 +7,12 @@ filegroup(
 )
 
 filegroup(
+    name = "manifest_v1",
+    srcs = ["manifest-v1.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "testbed",
     srcs = [
         "adr/0001-podman-criu-runtime-profile.md",

@@ -1,0 +1,6 @@
+package(default_visibility = ["//visibility:private"])
+
+filegroup(
+    name = "integration_test_documentation",
+    srcs = ["README.md"],
+)

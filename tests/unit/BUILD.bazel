@@ -1,0 +1,57 @@
+load("//build_defs:cc.bzl", "gravesentinel_cc_test")
+
+package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_test(
+    name = "value_types_test",
+    srcs = ["value_types_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/protocol:protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
+    name = "config_validation_test",
+    srcs = ["config_validation_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/protocol:protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
+    name = "contracts_compile_test",
+    srcs = ["contracts_compile_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/core:ccm_core",
+        "//src/scheduler_client:scheduler_client",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+test_suite(
+    name = "unit_tests",
+    tests = [
+        ":config_validation_test",
+        ":contracts_compile_test",
+        ":value_types_test",
+    ],
+    visibility = ["//:__pkg__"],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = [
+        "config_validation_test.cxx",
+        "contracts_compile_test.cxx",
+        "value_types_test.cxx",
+    ],
+    visibility = ["//scripts:__pkg__"],
+)

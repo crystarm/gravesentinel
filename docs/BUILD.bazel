@@ -1,0 +1,7 @@
+package(default_visibility = ["//visibility:private"])
+
+filegroup(
+    name = "architecture",
+    srcs = ["architecture.md"],
+    visibility = ["//visibility:public"],
+)

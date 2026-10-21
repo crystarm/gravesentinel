@@ -1,0 +1,7 @@
+FROM scratch
+
+COPY --chmod=0555 counter_fixture /counter_fixture
+
+USER 65532:65532
+ENTRYPOINT ["/counter_fixture"]
+CMD ["--threads", "2", "--interval-ms", "250"]

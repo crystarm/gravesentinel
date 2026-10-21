@@ -1,0 +1,50 @@
+load(
+    "//build_defs:cc.bzl",
+    "gravesentinel_cc_binary",
+    "gravesentinel_cc_library",
+    "gravesentinel_cc_test",
+)
+
+package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_library(
+    name = "counter_fixture_lib",
+    srcs = ["counter_fixture.cxx"],
+    hdrs = ["counter_fixture.hpp"],
+)
+
+gravesentinel_cc_binary(
+    name = "counter_fixture",
+    srcs = ["main.cxx"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":counter_fixture_lib"],
+    visibility = ["//tests/integration:__pkg__"],
+)
+
+gravesentinel_cc_test(
+    name = "counter_fixture_test",
+    srcs = ["counter_fixture_test.cxx"],
+    size = "small",
+    deps = [
+        ":counter_fixture_lib",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+exports_files(
+    ["Containerfile"],
+    visibility = ["//tests/integration:__pkg__"],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = [
+        "counter_fixture.cxx",
+        "counter_fixture.hpp",
+        "counter_fixture_test.cxx",
+        "main.cxx",
+    ],
+    visibility = ["//scripts:__pkg__"],
+)

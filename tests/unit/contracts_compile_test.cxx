@@ -1,5 +1,5 @@
-#include "src/core/contracts.hpp"
-#include "src/scheduler_client/hypervisor_client.hpp"
+#include "src/core/contracts.hxx"
+#include "src/scheduler_client/hypervisor_client.hxx"
 
 #include <gtest/gtest.h>
 

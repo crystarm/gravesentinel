@@ -1,5 +1,5 @@
-#include "src/core/blake3_hasher.hpp"
-#include "src/crypto/blake3.hpp"
+#include "src/core/blake3_hasher.hxx"
+#include "src/crypto/blake3.hxx"
 
 #include <gtest/gtest.h>
 

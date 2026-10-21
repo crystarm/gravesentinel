@@ -1,4 +1,4 @@
-#include "src/manifest/types.hpp"
+#include "src/manifest/types.hxx"
 
 #include <algorithm>
 #include <cctype>

@@ -10,7 +10,7 @@ package(default_visibility = ["//visibility:private"])
 gravesentinel_cc_library(
     name = "counter_fixture_lib",
     srcs = ["counter_fixture.cxx"],
-    hdrs = ["counter_fixture.hpp"],
+    hdrs = ["counter_fixture.hxx"],
 )
 
 gravesentinel_cc_binary(
@@ -48,7 +48,7 @@ filegroup(
     name = "format_sources",
     srcs = [
         "counter_fixture.cxx",
-        "counter_fixture.hpp",
+        "counter_fixture.hxx",
         "counter_fixture_test.cxx",
         "main.cxx",
     ],

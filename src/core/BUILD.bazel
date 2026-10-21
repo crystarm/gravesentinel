@@ -5,8 +5,8 @@ package(default_visibility = ["//visibility:private"])
 gravesentinel_cc_library(
     name = "ccm_core",
     hdrs = [
-        "contracts.hpp",
-        "errors.hpp",
+        "contracts.hxx",
+        "errors.hxx",
     ],
     deps = ["//src/protocol:protocol"],
     visibility = [
@@ -18,7 +18,7 @@ gravesentinel_cc_library(
 gravesentinel_cc_library(
     name = "blake3_hasher",
     srcs = ["blake3_hasher.cxx"],
-    hdrs = ["blake3_hasher.hpp"],
+    hdrs = ["blake3_hasher.hxx"],
     deps = [
         ":ccm_core",
         "//src/crypto:blake3",
@@ -33,9 +33,9 @@ filegroup(
     name = "format_sources",
     srcs = [
         "blake3_hasher.cxx",
-        "blake3_hasher.hpp",
-        "contracts.hpp",
-        "errors.hpp",
+        "blake3_hasher.hxx",
+        "contracts.hxx",
+        "errors.hxx",
     ],
     visibility = ["//scripts:__pkg__"],
 )

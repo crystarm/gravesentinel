@@ -1,7 +1,7 @@
 #pragma once
 
-#include "src/core/errors.hpp"
-#include "src/protocol/types.hpp"
+#include "src/core/errors.hxx"
+#include "src/protocol/types.hxx"
 
 #include <chrono>
 #include <cstddef>

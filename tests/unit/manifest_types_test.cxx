@@ -1,4 +1,4 @@
-#include "src/manifest/types.hpp"
+#include "src/manifest/types.hxx"
 
 #include <gtest/gtest.h>
 

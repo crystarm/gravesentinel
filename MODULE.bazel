@@ -1,0 +1,12 @@
+module(
+    name = "gravesentinel",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "blake3", version = "1.8.2.bcr.1")
+bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.2")
+bazel_dep(
+    name = "googletest",
+    version = "1.18.0.bcr.1",
+    dev_dependency = True,
+)

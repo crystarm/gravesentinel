@@ -1,0 +1,31 @@
+common --enable_bzlmod
+common --announce_rc
+
+build --incompatible_strict_action_env
+build --show_result=20
+
+test --test_output=errors
+
+build:debug --compilation_mode=dbg
+build:debug --strip=never
+
+build:release --compilation_mode=opt
+build:release --strip=always
+
+build:asan --config=debug
+build:asan --copt=-fsanitize=address
+build:asan --copt=-fno-omit-frame-pointer
+build:asan --linkopt=-fsanitize=address
+test:asan --test_env=ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1
+
+build:ubsan --config=debug
+build:ubsan --copt=-fsanitize=undefined
+build:ubsan --copt=-fno-omit-frame-pointer
+build:ubsan --linkopt=-fsanitize=undefined
+test:ubsan --test_env=UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+
+build:tsan --config=debug
+build:tsan --copt=-fsanitize=thread
+build:tsan --copt=-fno-omit-frame-pointer
+build:tsan --linkopt=-fsanitize=thread
+test:tsan --test_env=TSAN_OPTIONS=halt_on_error=1

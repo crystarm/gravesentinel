@@ -18,6 +18,21 @@ gravesentinel_cc_library(
 )
 
 gravesentinel_cc_library(
+    name = "checkpoint_creator",
+    srcs = ["checkpoint_creator.cxx"],
+    hdrs = ["checkpoint_creator.hxx"],
+    deps = [
+        ":ccm_core",
+        "//src/chunking:snapshot_chunker",
+        "//src/manifest:manifest",
+    ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+gravesentinel_cc_library(
     name = "blake3_hasher",
     srcs = ["blake3_hasher.cxx"],
     hdrs = ["blake3_hasher.hxx"],
@@ -36,6 +51,8 @@ filegroup(
     srcs = [
         "blake3_hasher.cxx",
         "blake3_hasher.hxx",
+        "checkpoint_creator.cxx",
+        "checkpoint_creator.hxx",
         "contracts.hxx",
         "errors.hxx",
     ],

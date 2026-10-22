@@ -11,6 +11,7 @@ gravesentinel_cc_library(
     deps = ["//src/protocol:protocol"],
     visibility = [
         "//src/hypervisor:__pkg__",
+        "//src/storage:__pkg__",
         "//tests/unit:__pkg__",
     ],
 )

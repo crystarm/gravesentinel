@@ -4,9 +4,11 @@
 #include "src/protocol/types.hxx"
 
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -20,24 +22,60 @@ struct CapturedSnapshot {
   RuntimeFingerprint runtime_fingerprint;
 };
 
+enum class StorageOperationKind : std::uint8_t {
+  create_checkpoint,
+  restore,
+  retention,
+  garbage_collection,
+};
+
+struct StoredManifest {
+  std::uint64_t generation;
+
+  auto operator<=>(const StoredManifest &) const = default;
+};
+
+class IStoragePin {
+public:
+  virtual ~IStoragePin() = default;
+
+  [[nodiscard]] virtual CheckpointResult<void> release() = 0;
+};
+
+class IStorageOperation {
+public:
+  virtual ~IStorageOperation() = default;
+
+  [[nodiscard]] virtual const std::filesystem::path &
+  staging_directory() const noexcept = 0;
+  [[nodiscard]] virtual CheckpointResult<void>
+  publish_chunk(const ChunkHash &hash, std::span<const std::byte> bytes) = 0;
+  [[nodiscard]] virtual CheckpointResult<void>
+  publish_manifest(const CheckpointId &checkpoint_id,
+                   std::span<const std::byte> manifest) = 0;
+  [[nodiscard]] virtual CheckpointResult<std::unique_ptr<IStoragePin>>
+  pin_manifest(std::uint64_t generation) = 0;
+  [[nodiscard]] virtual CheckpointResult<void> cleanup() = 0;
+};
+
 class IStorage {
 public:
   virtual ~IStorage() = default;
 
+  [[nodiscard]] virtual CheckpointResult<std::unique_ptr<IStorageOperation>>
+  begin_operation(const ContainerId &container_id,
+                  const OperationId &operation_id,
+                  StorageOperationKind kind) = 0;
   [[nodiscard]] virtual CheckpointResult<bool>
   contains_chunk(const ContainerId &container_id,
                  const ChunkHash &hash) const = 0;
-  [[nodiscard]] virtual CheckpointResult<void>
-  publish_chunk(const ContainerId &container_id, const ChunkHash &hash,
-                std::span<const std::byte> bytes) = 0;
   [[nodiscard]] virtual CheckpointResult<std::vector<std::byte>>
   read_chunk(const ContainerId &container_id, const ChunkHash &hash) const = 0;
-  [[nodiscard]] virtual CheckpointResult<void>
-  publish_manifest(const ContainerId &container_id,
-                   const CheckpointId &checkpoint_id,
-                   std::span<const std::byte> manifest) = 0;
-  [[nodiscard]] virtual CheckpointResult<std::vector<CheckpointId>>
-  list_checkpoints(const ContainerId &container_id) const = 0;
+  [[nodiscard]] virtual CheckpointResult<std::vector<StoredManifest>>
+  list_manifests(const ContainerId &container_id) const = 0;
+  [[nodiscard]] virtual CheckpointResult<std::vector<std::byte>>
+  read_manifest(const ContainerId &container_id,
+                std::uint64_t generation) const = 0;
 };
 
 class IPodmanAdapter {

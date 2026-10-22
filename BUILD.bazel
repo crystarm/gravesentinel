@@ -1,0 +1,45 @@
+package(default_visibility = ["//visibility:private"])
+
+filegroup(
+    name = "distribution_files",
+    srcs = [
+        ".bazelignore",
+        ".bazelrc",
+        ".bazelversion",
+        ".clang-format",
+        ".gitignore",
+        "AGENTS.md",
+        "MODULE.bazel",
+    ],
+)
+
+filegroup(
+    name = "clang_format_config",
+    srcs = [".clang-format"],
+    visibility = ["//scripts:__pkg__"],
+)
+
+alias(
+    name = "hypervisor",
+    actual = "//src/hypervisor:gravesentinel_hypervisor",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "scheduler_client",
+    actual = "//src/scheduler_client:scheduler_client",
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "unit_tests",
+    tests = ["//tests/unit:unit_tests"],
+)
+
+test_suite(
+    name = "checks",
+    tests = [
+        "//scripts:clang_format_test",
+        "//tests/unit:unit_tests",
+    ],
+)

@@ -1,0 +1,28 @@
+package(default_visibility = ["//visibility:private"])
+
+sh_test(
+    name = "clang_format_test",
+    srcs = ["check_clang_format.sh"],
+    args = [
+        "$(locations //src/core:format_sources)",
+        "$(locations //src/hypervisor:format_sources)",
+        "$(locations //src/protocol:format_sources)",
+        "$(locations //src/scheduler_client:format_sources)",
+        "$(locations //tests/unit:format_sources)",
+    ],
+    data = [
+        "//:clang_format_config",
+        "//src/core:format_sources",
+        "//src/hypervisor:format_sources",
+        "//src/protocol:format_sources",
+        "//src/scheduler_client:format_sources",
+        "//tests/unit:format_sources",
+    ],
+    size = "small",
+    visibility = ["//:__pkg__"],
+)
+
+filegroup(
+    name = "scripts",
+    srcs = ["check_clang_format.sh"],
+)

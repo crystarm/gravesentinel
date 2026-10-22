@@ -3,9 +3,10 @@
 ## Назначение этого документа
 
 Документ фиксирует общие архитектурные контракты MVP и обновляется по мере
-завершения этапов. Реальный runtime profile, Manifest v1 и crash-safe
-FilesystemStorage уже реализованы, но production orchestration и IPC ещё не
-реализованы.
+завершения этапов. Реальный runtime profile, Manifest v1, crash-safe
+FilesystemStorage, fixed-size chunking/reassembly, Linux process/affinity layer и
+production Podman adapter уже реализованы, но create/restore orchestration и IPC
+ещё не реализованы.
 Бинарный target `//src/hypervisor:gravesentinel_hypervisor` собирается, но при
 запуске явно завершается с ошибкой до появления сервера в этапе 10.
 
@@ -48,9 +49,12 @@ flowchart TD
     SchedulerClient[//src/scheduler_client:scheduler_client]
     Protocol[//src/protocol:protocol]
     Hypervisor[//src/hypervisor:gravesentinel_hypervisor]
+    LinuxRuntime[//src/hypervisor:linux_runtime]
+    Podman[//src/hypervisor:podman_adapter]
     Core[//src/core:ccm_core]
     Hasher[//src/core:blake3_hasher]
     Manifest[//src/manifest:manifest]
+    Chunking[//src/chunking:snapshot_chunker]
     Storage[//src/storage:filesystem_storage]
     Crypto[//src/crypto:blake3]
     Blake3[@blake3//:blake3]
@@ -60,9 +64,15 @@ flowchart TD
     SchedulerConsumer --> SchedulerClient
     SchedulerClient --> Protocol
     Hypervisor --> Core
+    Hypervisor --> LinuxRuntime
+    Hypervisor --> Podman
+    Hypervisor --> Chunking
     Core --> Protocol
     Hasher --> Core
     Hasher --> Crypto
+    Chunking --> Core
+    Chunking --> Manifest
+    Chunking --> Storage
     Storage --> Core
     Storage --> Manifest
     Storage --> Crypto
@@ -71,15 +81,19 @@ flowchart TD
     Manifest --> Json
     Crypto --> Protocol
     Crypto --> Blake3
+    Podman --> Core
+    Podman --> Json
+    LinuxRuntime --> Core
     Unit --> SchedulerClient
     Unit --> Core
     Unit --> Hasher
+    Unit --> Chunking
     Unit --> Manifest
     Unit --> Storage
 ```
 
-`//src/core:ccm_core` виден только package гипервизора, внутреннему storage и
-unit tests.
+`//src/core:ccm_core` виден только package гипервизора, внутренним chunking и
+storage, а также unit tests.
 Scheduler-facing библиотека публична, но её единственная проектная зависимость —
 `//src/protocol:protocol`. Общие типы protocol не содержат storage, runtime или
 Linux API.
@@ -102,8 +116,12 @@ scheduler-facing target.
 четырьмя элементами и не может повторно назначать logical CPU.
 
 `ColdStartSpec` отделён от изменчивого runtime container ID. Environment в нём
-может содержать секреты: hypervisor не должен персистировать эти значения или
-передавать их в диагностические логи.
+может содержать секреты: hypervisor не персистирует эти значения, не передаёт их
+в диагностические логи, argv или environment rootful-процесса Podman. Adapter
+создаёт приватный transient env-file `0600` под доверенным staging root, передаёт
+только его путь через `--env-file` и удаляет файл сразу после синхронного вызова.
+Command profile v1 отклоняет CR/LF в значениях, mounts и произвольные
+`runtime_options`, поскольку их безопасная форма не была квалифицирована.
 
 `RuntimeFingerprint` содержит отдельные поля kernel, Podman/runtime build, CRIU,
 OCI runtime/commit/features, cgroup, privilege/user namespace,
@@ -112,7 +130,8 @@ capability/SELinux/AppArmor/seccomp и command profile. Manifest v1 персис
 
 `RelativeSnapshotPath`, ordered artifacts/chunks, canonical JSON, parser limits и
 BLAKE3 checksum определены в `docs/manifest-v1.md`. Лексический join пути не
-заменяет будущий no-follow `openat2/openat` filesystem boundary.
+заменяет реализованный в storage/chunking descriptor-relative no-follow
+filesystem boundary.
 
 ## Внутренние контракты
 
@@ -122,16 +141,21 @@ BLAKE3 checksum определены в `docs/manifest-v1.md`. Лексичес�
   чтение `OperationStatus`;
 - `IStorage` — начало exclusive per-container operation, bounded чтение chunk и
   manifest, перечисление manifest по generation;
-- `IStorageOperation`/`IStoragePin` — RAII lease, уникальный staging, атомарная
-  публикация immutable chunk/manifest, durable pin metadata и cleanup;
-- `IPodmanAdapter` — capture, restore, cold start и cleanup неудачного restore;
+- `IStorageOperation`/`IStoragePin` — bound `ContainerId`/operation kind, RAII
+  lease, lock-bound chunk reads, inode-bound уникальный staging, атомарная
+  публикация immutable chunk/manifest,
+  durable pin metadata и cleanup;
+- `IPodmanAdapter` — runtime/image compatibility, capture, stop/remove ожидаемой
+  incarnation, restore, cold start и cleanup неудачного restore;
 - `IClock`, `IHasher`, `IIdGenerator` — детерминируемые зависимости core;
 - `ILogger` — диагностическое логирование без секретных полей;
-- `IAffinityController` — изоляция Linux affinity от алгоритмического core;
-- `IProcessRunner` — argv-вызов процесса без shell;
+- `IAffinityController`/`IThreadAffinityBinding` — проверка allowed logical CPU,
+  привязка только текущего worker thread и RAII-восстановление прежней mask;
+- `IProcessRunner` — exact argv/environment без shell, bounded stdout/stderr,
+  typed exit/signal/timeout, child process group и явная child affinity;
 - `CheckpointResult<T>` — `std::expected<T, CheckpointErrorDetail>` со стабильным
-  кодом, retryability, optional correlation ID и внутренним признаком
-  `publication_may_be_visible` для ошибки directory `fsync` после rename.
+  кодом, retryability, optional correlation ID, storage side effect
+  `publication_may_be_visible` и runtime side effect `incarnation_may_exist`.
 
 `//src/storage:filesystem_storage` отображает недоверенные ID в domain-separated
 BLAKE3 keys, работает относительно доверенных directory descriptors с
@@ -139,6 +163,28 @@ no-follow/type checks и возвращает success публикации то�
 no-replace rename и directory `fsync`. Полный persisted layout, lock/staging/pin
 semantics и поддерживаемый filesystem profile зафиксированы в
 `docs/filesystem-storage.md`.
+
+`//src/chunking:snapshot_chunker` детерминированно преобразует immutable дерево
+regular files в 4 MiB BLAKE3 chunks с per-container deduplication и собирает его
+обратно в отдельный `staging/snapshot`, проверяя chunk size/hash и file mode до
+передачи runtime adapter. Полный контракт и ограничения описаны в
+`docs/chunking.md`.
+
+`//src/hypervisor:linux_runtime` реализует Linux-only boundary: `fork`/`execve`
+без shell, закрытие посторонних child file descriptors, одновременное bounded
+чтение stdout/stderr, TERM→KILL всей process group по deadline и affinity child.
+`LinuxAffinityController` меняет mask только вызывающего thread; binding должен
+быть восстановлен и уничтожен тем же thread.
+
+`//src/hypervisor:podman_adapter` принимает только профиль
+`podman-criu-rootful-v1`, проверяет exact runtime fingerprint, ownership labels,
+container cpuset и immutable image ID. Logical `ContainerId`, стабильная
+`RuntimeContainerRef` и конкретный 64-hex `RuntimeIncarnation::runtime_id` не
+смешиваются. Stop/remove требует ожидаемую incarnation и не удаляет replacement.
+Absence считается доказанным лишь когда и обычный `podman container exists`, и
+`podman container exists --external` возвращают documented not-found status.
+Failed restore до доказанного cleanup сохраняет `incarnation_may_exist` и не даёт
+права на fallback.
 
 Подробный `diagnostic` остаётся внутри hypervisor. Будущий wire response содержит
 только стабильный error code, request/correlation ID и однозначный status.

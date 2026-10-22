@@ -150,8 +150,9 @@ filesystem boundary.
 
 `//src/core:ccm_core` объявляет:
 
-- `ICheckpointService` — register/unregister, submit длительных create/restore и
-  чтение `OperationStatus`;
+- `ICheckpointService` — синхронные register/unregister/create/restore и
+  детерминированный shutdown внутреннего service core; async submit/poll и
+  `OperationStatus` принадлежат будущей IPC-границе этапа 10;
 - `IStorage` — начало exclusive per-container operation, bounded чтение chunk и
   manifest, перечисление manifest по generation;
 - `IStorageOperation`/`IStoragePin` — bound `ContainerId`/operation kind, RAII
@@ -202,6 +203,15 @@ chunk до restore. Fallback разрешён только после подтв
 выполняется единожды при наличии явного `ColdStartSpec`. Отдельные
 `snapshot-<generation>` staging trees позволяют сохранить lease между попытками.
 Полный контракт описан в `docs/checkpoint-restore.md`.
+
+`//src/core:checkpoint_service` владеет максимум четырьмя регистрациями и одним
+привязанным к `checkpoint_cpu` worker на регистрацию. Синхронные операции одного
+`ContainerId` сериализованы, разные слоты выполняются параллельно, а periodic tick
+имеет mailbox capacity один и пропускается при занятом слоте без catch-up backlog.
+Unregister и shutdown закрывают приём, отменяют pending periodic работу и
+дожидаются уже принятой/активной операции. Injectable generation timer делает
+периодику и гонки lifecycle детерминированно тестируемыми. Полный контракт описан в
+`docs/service-core.md`.
 
 `//src/hypervisor:linux_runtime` реализует Linux-only boundary: `fork`/`execve`
 без shell, закрытие посторонних child file descriptors, одновременное bounded

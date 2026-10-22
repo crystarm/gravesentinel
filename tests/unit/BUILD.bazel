@@ -83,6 +83,21 @@ gravesentinel_cc_test(
 )
 
 gravesentinel_cc_test(
+    name = "checkpoint_creator_test",
+    srcs = ["checkpoint_creator_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/chunking:snapshot_chunker",
+        "//src/core:blake3_hasher",
+        "//src/core:checkpoint_creator",
+        "//src/manifest:manifest",
+        "//src/storage:filesystem_storage",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
     name = "manifest_types_test",
     srcs = ["manifest_types_test.cxx"],
     size = "small",
@@ -120,6 +135,7 @@ test_suite(
     name = "unit_tests",
     tests = [
         ":blake3_test",
+        ":checkpoint_creator_test",
         ":config_validation_test",
         ":contracts_compile_test",
         ":filesystem_storage_test",
@@ -137,6 +153,7 @@ filegroup(
     name = "format_sources",
     srcs = [
         "blake3_test.cxx",
+        "checkpoint_creator_test.cxx",
         "config_validation_test.cxx",
         "contracts_compile_test.cxx",
         "filesystem_storage_test.cxx",

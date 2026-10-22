@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -161,6 +162,25 @@ public:
   [[nodiscard]] virtual MonotonicTime monotonic_now() const noexcept = 0;
 };
 
+enum class TimerWaitResult : std::uint8_t {
+  deadline_reached,
+  interrupted,
+  stopped,
+};
+
+class ITimer {
+public:
+  using Generation = std::uint64_t;
+
+  virtual ~ITimer() = default;
+
+  [[nodiscard]] virtual Generation generation() const noexcept = 0;
+  [[nodiscard]] virtual TimerWaitResult
+  wait_until(IClock::MonotonicTime deadline, Generation observed_generation,
+             std::stop_token stop_token) = 0;
+  virtual void interrupt() noexcept = 0;
+};
+
 class IHasher {
 public:
   virtual ~IHasher() = default;
@@ -256,14 +276,15 @@ public:
   [[nodiscard]] virtual CheckpointResult<void>
   unregister_container(const ContainerId &container_id,
                        const RequestId &request_id) = 0;
-  [[nodiscard]] virtual CheckpointResult<OperationId>
-  submit_create_checkpoint(const ContainerId &container_id,
-                           const RequestId &request_id) = 0;
-  [[nodiscard]] virtual CheckpointResult<OperationId>
-  submit_restore_or_restart(const ContainerId &container_id,
-                            const RequestId &request_id) = 0;
-  [[nodiscard]] virtual CheckpointResult<OperationStatus>
-  get_operation(const OperationId &operation_id) const = 0;
+  [[nodiscard]] virtual CheckpointResult<void>
+  create_checkpoint(const ContainerId &container_id,
+                    const RequestId &request_id,
+                    const OperationId &operation_id) = 0;
+  [[nodiscard]] virtual CheckpointResult<void>
+  restore_or_restart(const ContainerId &container_id,
+                     const RequestId &request_id,
+                     const OperationId &operation_id) = 0;
+  [[nodiscard]] virtual CheckpointResult<void> shutdown() = 0;
 };
 
 } // namespace gravesentinel::ccm

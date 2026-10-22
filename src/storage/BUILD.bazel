@@ -1,0 +1,35 @@
+load("//build_defs:cc.bzl", "gravesentinel_cc_library")
+
+package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_library(
+    name = "filesystem_storage",
+    srcs = [
+        "filesystem_storage.cxx",
+        "posix_file_operations.cxx",
+    ],
+    hdrs = [
+        "file_operations.hxx",
+        "filesystem_storage.hxx",
+    ],
+    deps = [
+        "//src/core:ccm_core",
+        "//src/crypto:blake3",
+        "//src/manifest:manifest",
+    ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = [
+        "file_operations.hxx",
+        "filesystem_storage.cxx",
+        "filesystem_storage.hxx",
+        "posix_file_operations.cxx",
+    ],
+    visibility = ["//scripts:__pkg__"],
+)

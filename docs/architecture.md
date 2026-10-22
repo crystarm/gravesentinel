@@ -3,8 +3,9 @@
 ## Назначение этого документа
 
 Документ фиксирует общие архитектурные контракты MVP и обновляется по мере
-завершения этапов. Реальный runtime profile и Manifest v1 уже квалифицированы,
-но production orchestration, файловое хранилище и IPC ещё не реализованы.
+завершения этапов. Реальный runtime profile, Manifest v1 и crash-safe
+FilesystemStorage уже реализованы, но production orchestration и IPC ещё не
+реализованы.
 Бинарный target `//src/hypervisor:gravesentinel_hypervisor` собирается, но при
 запуске явно завершается с ошибкой до появления сервера в этапе 10.
 
@@ -50,6 +51,7 @@ flowchart TD
     Core[//src/core:ccm_core]
     Hasher[//src/core:blake3_hasher]
     Manifest[//src/manifest:manifest]
+    Storage[//src/storage:filesystem_storage]
     Crypto[//src/crypto:blake3]
     Blake3[@blake3//:blake3]
     Json[@nlohmann_json//:json]
@@ -61,6 +63,9 @@ flowchart TD
     Core --> Protocol
     Hasher --> Core
     Hasher --> Crypto
+    Storage --> Core
+    Storage --> Manifest
+    Storage --> Crypto
     Manifest --> Protocol
     Manifest --> Crypto
     Manifest --> Json
@@ -70,9 +75,11 @@ flowchart TD
     Unit --> Core
     Unit --> Hasher
     Unit --> Manifest
+    Unit --> Storage
 ```
 
-`//src/core:ccm_core` виден только package гипервизора и unit tests.
+`//src/core:ccm_core` виден только package гипервизора, внутреннему storage и
+unit tests.
 Scheduler-facing библиотека публична, но её единственная проектная зависимость —
 `//src/protocol:protocol`. Общие типы protocol не содержат storage, runtime или
 Linux API.
@@ -113,15 +120,25 @@ BLAKE3 checksum определены в `docs/manifest-v1.md`. Лексичес�
 
 - `ICheckpointService` — register/unregister, submit длительных create/restore и
   чтение `OperationStatus`;
-- `IStorage` — атомарная публикация chunk/manifest и чтение опубликованных
-  данных; требования fsync/rename и leases уточняются реализацией storage;
+- `IStorage` — начало exclusive per-container operation, bounded чтение chunk и
+  manifest, перечисление manifest по generation;
+- `IStorageOperation`/`IStoragePin` — RAII lease, уникальный staging, атомарная
+  публикация immutable chunk/manifest, durable pin metadata и cleanup;
 - `IPodmanAdapter` — capture, restore, cold start и cleanup неудачного restore;
 - `IClock`, `IHasher`, `IIdGenerator` — детерминируемые зависимости core;
 - `ILogger` — диагностическое логирование без секретных полей;
 - `IAffinityController` — изоляция Linux affinity от алгоритмического core;
 - `IProcessRunner` — argv-вызов процесса без shell;
 - `CheckpointResult<T>` — `std::expected<T, CheckpointErrorDetail>` со стабильным
-  кодом, retryability и optional correlation ID.
+  кодом, retryability, optional correlation ID и внутренним признаком
+  `publication_may_be_visible` для ошибки directory `fsync` после rename.
+
+`//src/storage:filesystem_storage` отображает недоверенные ID в domain-separated
+BLAKE3 keys, работает относительно доверенных directory descriptors с
+no-follow/type checks и возвращает success публикации только после file `fsync`,
+no-replace rename и directory `fsync`. Полный persisted layout, lock/staging/pin
+semantics и поддерживаемый filesystem profile зафиксированы в
+`docs/filesystem-storage.md`.
 
 Подробный `diagnostic` остаётся внутри hypervisor. Будущий wire response содержит
 только стабильный error code, request/correlation ID и однозначный status.

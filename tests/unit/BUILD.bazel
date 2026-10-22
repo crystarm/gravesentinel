@@ -37,6 +37,18 @@ gravesentinel_cc_test(
 )
 
 gravesentinel_cc_test(
+    name = "filesystem_storage_test",
+    srcs = ["filesystem_storage_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/manifest:manifest",
+        "//src/storage:filesystem_storage",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
     name = "manifest_types_test",
     srcs = ["manifest_types_test.cxx"],
     size = "small",
@@ -76,6 +88,7 @@ test_suite(
         ":blake3_test",
         ":config_validation_test",
         ":contracts_compile_test",
+        ":filesystem_storage_test",
         ":manifest_codec_test",
         ":manifest_types_test",
         ":value_types_test",
@@ -89,6 +102,7 @@ filegroup(
         "blake3_test.cxx",
         "config_validation_test.cxx",
         "contracts_compile_test.cxx",
+        "filesystem_storage_test.cxx",
         "manifest_codec_test.cxx",
         "manifest_types_test.cxx",
         "value_types_test.cxx",

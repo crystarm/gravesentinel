@@ -70,6 +70,49 @@ The adapter must use an argv process runner and must not concatenate a shell
 command. A disconnect, nonzero exit, malformed result, or indeterminate cleanup
 is never converted to success.
 
+## Adapter command profile v1
+
+Stage 06 implements `podman-criu-rootful-v1`. In addition to the two qualified
+checkpoint/restore commands above, its cold-start argv is:
+
+```text
+["podman", "run", "--detach", "--name", RUNTIME_NAME,
+ "--label", "io.gravesentinel.ccm.managed=true",
+ "--label", "io.gravesentinel.ccm.logical-id=" + CONTAINER_ID,
+ "--network=none", "--read-only", "--cap-drop=all", "--passwd=false",
+ "--security-opt=no-new-privileges", "--cpuset-cpus=" + CONTAINER_CPU,
+ ["--env-file", TRANSIENT_ENV_FILE], IMAGE_REFERENCE, WORKLOAD_ARGV...]
+```
+
+The optional environment file is created under the private adapter staging root
+with mode `0600`, is never logged or persisted, and is removed immediately after
+the synchronous Podman invocation. Workload environment values are never placed
+in Podman's own process environment or command-line arguments. Values containing
+NUL, CR, or LF are rejected. Mounts and arbitrary runtime options are rejected by
+v1 instead of being mapped to an unqualified command form.
+
+Operational inspection and cleanup use these exact argv forms:
+
+```text
+["podman", "version", "--format=json"]
+["podman", "info", "--format=json"]
+["criu", "--version"]
+["podman", "container", "inspect", "--format=json", REF_OR_ID]
+["podman", "image", "inspect", "--format=json", IMAGE]
+["podman", "stop", "--time=10", EXPECTED_RUNTIME_ID]
+["podman", "rm", EXPECTED_RUNTIME_ID]
+["podman", "container", "exists", RUNTIME_NAME]
+["podman", "container", "exists", "--external", RUNTIME_NAME]
+```
+
+The adapter requires the qualified Podman/CRIU/kernel/cgroup/crun versions,
+rootful local mode, the recorded controller and security profile, and disabled
+Podman AppArmor enforcement with crun AppArmor support still present. It records a
+canonical fingerprint and requires exact equality before restore. The new
+adapter-mode smoke must requalify these stage-06 assumptions on the rootful host;
+the earlier stage-02 runs establish the direct command boundary but do not count
+as an adapter smoke result.
+
 ## Artifact decision
 
 A successful Podman export is an immutable opaque artifact:
@@ -114,10 +157,14 @@ must be absent. Import must create the requested new name and a runtime containe
 ID distinct from the original.
 
 The smoke generates an unpredictable per-run suffix and removes a Podman object
-only after its ownership label exactly matches that run. A name match alone is
-insufficient. Cleanup failures fail the gate, and an indeterminate result forbids
-another start for the same logical `ContainerId`. This is the reference safety
-behavior for the stage 06 adapter.
+only after its ownership label exactly matches that run. The production adapter
+also requires the first inspected immutable runtime ID to equal the expected
+`RuntimeIncarnation`; a name or logical-ID label match alone is insufficient.
+Cleanup proves both ordinary libpod-record and external containers/storage
+absence. Cleanup failures fail the gate, and an indeterminate result carries
+`incarnation_may_exist` and forbids another start for the same logical
+`ContainerId`. The integration smoke separately observes and verifies cgroup
+removal.
 
 ## Consequences
 

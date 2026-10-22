@@ -204,6 +204,57 @@ them, but must not extract, normalize, reorder, or synthesize archive entries.
 Listing entries is allowed only as a diagnostic operation that does not modify
 the artifact.
 
+## Stage 06 production adapter smoke
+
+The production Linux runtime and Podman adapter are built as
+`//src/hypervisor:linux_runtime` and `//src/hypervisor:podman_adapter`. Their
+non-privileged tests use a scripted process runner and do not require Podman:
+
+```text
+bazel test //tests/unit:linux_runtime_test //tests/unit:podman_adapter_test
+bazel build //tests/integration:podman_adapter_smoke
+```
+
+The separate adapter smoke reuses the stage-02 fixture and continuity/cgroup
+checks, but delegates cold start, capture, stop/remove, failed-restore cleanup and
+valid restore to the production adapter and process runner. Build as the normal
+user and run the built artifacts in the qualified rootful context:
+
+```text
+bazel build \
+  //tests/integration/fixture:counter_fixture \
+  //tests/integration:podman_adapter_smoke_driver
+
+sudo env \
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  tests/integration/podman_checkpoint_smoke.sh \
+  --fixture-binary bazel-bin/tests/integration/fixture/counter_fixture \
+  --containerfile tests/integration/fixture/Containerfile \
+  --check-script scripts/check_testbed.sh \
+  --adapter-helper bazel-bin/tests/integration/podman_adapter_smoke_driver
+```
+
+A CI process already running in the rootful profile may use:
+
+```text
+bazel test //tests/integration:podman_adapter_smoke --test_output=streamed
+```
+
+The target is tagged `manual`, `requires-podman`, `exclusive`, and `local` and is
+therefore excluded from `bazel test //...`. A successful adapter run ends with:
+
+```text
+RESULT: QUALIFIED production PodmanAdapter smoke passed
+```
+
+**Current stage-06 status on 2026-10-22: BLOCKED.** The implementation, unit tests
+and smoke target are complete, but the current agent session has no noninteractive
+root privilege. The prerequisite gate observes the qualified kernel, CPU/cgroup,
+Podman 5.4.2, crun 1.21 and CRIU 4.1.1, but reports
+`podman_rootless=true`, no effective capabilities, and ends with
+`RESULT: BLOCKED (1 failed prerequisite checks)`. `sudo -n` requires a password,
+so the mandatory rootful adapter smoke has not been claimed as passed.
+
 ## Unsupported modes and requalification limits
 
 Rootless mode is not supported by the MVP profile. Even after

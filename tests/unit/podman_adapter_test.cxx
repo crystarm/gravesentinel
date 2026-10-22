@@ -261,7 +261,7 @@ adapter_config(const std::filesystem::path &staging_root) {
       .user_namespace_mode = "host",
       .capability_profile = "CapEff=000001ffffffffff",
       .selinux_mode = "disabled",
-      .apparmor_profile = "disabled",
+      .apparmor_profile = "host-default",
       .seccomp_profile = "default",
       .command_profile = "podman-criu-rootful-v1",
   };
@@ -272,8 +272,16 @@ adapter_config(const std::filesystem::path &staging_root) {
          R"(","OsArch":"linux/amd64","BuildOrigin":"Debian"}})";
 }
 
-[[nodiscard]] std::string info_json() {
-  return R"({"host":{"arch":"amd64","kernel":"6.12.111+deb13-amd64","distribution":{"distribution":"debian","version":"13","codename":"trixie"},"cgroupVersion":"v2","cgroupManager":"systemd","cgroupControllers":["cpuset","cpu","io","memory","hugetlb","pids","rdma","misc"],"serviceIsRemote":false,"idMappings":{"uidmap":null,"gidmap":null},"security":{"rootless":false,"apparmorEnabled":false,"seccompEnabled":true,"seccompProfilePath":"/usr/share/containers/seccomp.json","selinuxEnabled":false,"capabilities":"CAP_CHOWN,CAP_DAC_OVERRIDE,CAP_FOWNER,CAP_FSETID,CAP_KILL,CAP_NET_BIND_SERVICE,CAP_SETFCAP,CAP_SETGID,CAP_SETPCAP,CAP_SETUID,CAP_SYS_CHROOT"},"ociRuntime":{"name":"crun","version":"crun version 1.21\ncommit: 10269840aa07fb7e6b7e1acff6198692d8ff5c88\n+SYSTEMD +SELINUX +APPARMOR +CAP +SECCOMP +CRIU"}},"version":{"Version":"5.4.2"}})";
+[[nodiscard]] std::string info_json(bool apparmor_enabled = true) {
+  std::string document =
+      R"({"host":{"arch":"amd64","kernel":"6.12.111+deb13-amd64","distribution":{"distribution":"debian","version":"13","codename":"trixie"},"cgroupVersion":"v2","cgroupManager":"systemd","cgroupControllers":["cpuset","cpu","io","memory","hugetlb","pids","rdma","misc"],"serviceIsRemote":false,"idMappings":{"uidmap":null,"gidmap":null},"security":{"rootless":false,"apparmorEnabled":true,"seccompEnabled":true,"seccompProfilePath":"/usr/share/containers/seccomp.json","selinuxEnabled":false,"capabilities":"CAP_CHOWN,CAP_DAC_OVERRIDE,CAP_FOWNER,CAP_FSETID,CAP_KILL,CAP_NET_BIND_SERVICE,CAP_SETFCAP,CAP_SETGID,CAP_SETPCAP,CAP_SETUID,CAP_SYS_CHROOT"},"ociRuntime":{"name":"crun","version":"crun version 1.21\ncommit: 10269840aa07fb7e6b7e1acff6198692d8ff5c88\n+SYSTEMD +SELINUX +APPARMOR +CAP +SECCOMP +CRIU"}},"version":{"Version":"5.4.2"}})";
+  if (!apparmor_enabled) {
+    const auto position = document.find("\"apparmorEnabled\":true");
+    document.replace(position,
+                     std::string_view{"\"apparmorEnabled\":true"}.size(),
+                     "\"apparmorEnabled\":false");
+  }
+  return document;
 }
 
 [[nodiscard]] std::string
@@ -713,6 +721,41 @@ TEST(PodmanAdapterTest, RejectsProfileMismatchBeforeInspectingImage) {
 
   ASSERT_FALSE(compatible);
   EXPECT_EQ(compatible.error().code, StableErrorCode::incompatible_runtime);
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, ReportsTheMismatchedQualifiedProfileField) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"version", "--format=json"},
+      .result = exited(0, version_json()),
+      .inspect_request = {},
+  });
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"info", "--format=json"},
+      .result = exited(0, info_json(false)),
+      .inspect_request = {},
+  });
+  runner.push(ScriptStep{
+      .executable = config.criu_executable,
+      .argv = {"--version"},
+      .result = exited(0, "Version: 4.1.1\n"),
+      .inspect_request = {},
+  });
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto compatible = adapter.validate_restore_compatibility(
+      qualified_fingerprint(), image_identity(), kCpuAssignment);
+
+  ASSERT_FALSE(compatible);
+  EXPECT_EQ(compatible.error().code, StableErrorCode::incompatible_runtime);
+  EXPECT_NE(compatible.error().diagnostic.find("AppArmor"), std::string::npos);
   EXPECT_TRUE(runner.empty());
 }
 

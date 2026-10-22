@@ -1,4 +1,16 @@
+load("//build_defs:cc.bzl", "gravesentinel_cc_binary")
+
 package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_binary(
+    name = "podman_adapter_smoke_driver",
+    srcs = ["podman_adapter_smoke_driver.cxx"],
+    deps = [
+        "//src/hypervisor:linux_runtime",
+        "//src/hypervisor:podman_adapter",
+        "@nlohmann_json//:json",
+    ],
+)
 
 sh_test(
     name = "testbed_check",
@@ -52,6 +64,48 @@ sh_test(
         "requires-podman",
     ],
     timeout = "long",
+)
+
+sh_test(
+    name = "podman_adapter_smoke",
+    srcs = ["podman_checkpoint_smoke.sh"],
+    args = [
+        "--fixture-binary",
+        "$(location //tests/integration/fixture:counter_fixture)",
+        "--containerfile",
+        "$(location //tests/integration/fixture:Containerfile)",
+        "--check-script",
+        "$(location //scripts:check_testbed)",
+        "--adapter-helper",
+        "$(location :podman_adapter_smoke_driver)",
+    ],
+    data = [
+        ":podman_adapter_smoke_driver",
+        "//scripts:check_testbed",
+        "//tests/integration/fixture:Containerfile",
+        "//tests/integration/fixture:counter_fixture",
+    ],
+    env_inherit = [
+        "DBUS_SESSION_BUS_ADDRESS",
+        "HOME",
+        "PATH",
+        "XDG_RUNTIME_DIR",
+    ],
+    local = True,
+    size = "large",
+    tags = [
+        "exclusive",
+        "local",
+        "manual",
+        "requires-podman",
+    ],
+    timeout = "long",
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = ["podman_adapter_smoke_driver.cxx"],
+    visibility = ["//scripts:__pkg__"],
 )
 
 filegroup(

@@ -37,11 +37,45 @@ gravesentinel_cc_test(
 )
 
 gravesentinel_cc_test(
+    name = "linux_runtime_test",
+    srcs = ["linux_runtime_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/hypervisor:linux_runtime",
+        "@googletest//:gtest",
+    ],
+)
+
+gravesentinel_cc_test(
+    name = "podman_adapter_test",
+    srcs = ["podman_adapter_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/hypervisor:podman_adapter",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
     name = "filesystem_storage_test",
     srcs = ["filesystem_storage_test.cxx"],
     size = "small",
     deps = [
         "//src/manifest:manifest",
+        "//src/storage:filesystem_storage",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
+    name = "snapshot_chunker_test",
+    srcs = ["snapshot_chunker_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/chunking:snapshot_chunker",
+        "//src/core:blake3_hasher",
         "//src/storage:filesystem_storage",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
@@ -89,8 +123,11 @@ test_suite(
         ":config_validation_test",
         ":contracts_compile_test",
         ":filesystem_storage_test",
+        ":linux_runtime_test",
         ":manifest_codec_test",
         ":manifest_types_test",
+        ":podman_adapter_test",
+        ":snapshot_chunker_test",
         ":value_types_test",
     ],
     visibility = ["//:__pkg__"],
@@ -103,8 +140,11 @@ filegroup(
         "config_validation_test.cxx",
         "contracts_compile_test.cxx",
         "filesystem_storage_test.cxx",
+        "linux_runtime_test.cxx",
         "manifest_codec_test.cxx",
         "manifest_types_test.cxx",
+        "podman_adapter_test.cxx",
+        "snapshot_chunker_test.cxx",
         "value_types_test.cxx",
     ],
     visibility = ["//scripts:__pkg__"],

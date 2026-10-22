@@ -811,6 +811,13 @@ public:
         StableErrorCode::internal, "stop-and-remove is not under test"));
   }
 
+  [[nodiscard]] CheckpointResult<void>
+  confirm_absence(const ContainerId &, const RuntimeContainerRef &,
+                  RuntimeCpuAssignment) override {
+    return std::unexpected(make_test_error(StableErrorCode::internal,
+                                           "absence check is not under test"));
+  }
+
   [[nodiscard]] CheckpointResult<RuntimeIncarnation>
   restore(const ContainerId &, const RuntimeContainerRef &,
           const std::filesystem::path &, const RuntimeFingerprint &,

@@ -106,12 +106,12 @@ Operational inspection and cleanup use these exact argv forms:
 ```
 
 The adapter requires the qualified Podman/CRIU/kernel/cgroup/crun versions,
-rootful local mode, the recorded controller and security profile, and disabled
-Podman AppArmor enforcement with crun AppArmor support still present. It records a
-canonical fingerprint and requires exact equality before restore. The new
-adapter-mode smoke must requalify these stage-06 assumptions on the rootful host;
-the earlier stage-02 runs establish the direct command boundary but do not count
-as an adapter smoke result.
+rootful local mode and the recorded controller/security profile: Podman AppArmor
+and seccomp enabled, SELinux disabled, with crun AppArmor support present. It
+records a canonical fingerprint and requires exact equality before restore. The
+production adapter-mode smoke qualified these stage-06 assumptions on the rootful
+host on 2026-10-22 and ended with
+`RESULT: QUALIFIED production PodmanAdapter smoke passed`.
 
 ## Artifact decision
 

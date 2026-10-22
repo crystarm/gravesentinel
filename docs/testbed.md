@@ -30,6 +30,7 @@ is the evidence that the complete workflow works.
 | OCI runtime features | includes `+CRIU`, `+APPARMOR`, `+SELINUX`, `+SECCOMP` |
 | CRIU | `4.1.1` at `/usr/sbin/criu` |
 | Qualification process capabilities | `CapEff=000001ffffffffff`, `NoNewPrivs=0` |
+| Podman security | AppArmor enabled, SELinux disabled, seccomp enabled with `/usr/share/containers/seccomp.json` |
 | Host LSM list | `lockdown,capability,landlock,yama,apparmor,tomoyo,bpf,ipe,ima,evm` |
 | Workload | static C++23 CPU-only fixture in a `scratch` image |
 
@@ -247,13 +248,21 @@ therefore excluded from `bazel test //...`. A successful adapter run ends with:
 RESULT: QUALIFIED production PodmanAdapter smoke passed
 ```
 
-**Current stage-06 status on 2026-10-22: BLOCKED.** The implementation, unit tests
-and smoke target are complete, but the current agent session has no noninteractive
-root privilege. The prerequisite gate observes the qualified kernel, CPU/cgroup,
-Podman 5.4.2, crun 1.21 and CRIU 4.1.1, but reports
-`podman_rootless=true`, no effective capabilities, and ends with
-`RESULT: BLOCKED (1 failed prerequisite checks)`. `sudo -n` requires a password,
-so the mandatory rootful adapter smoke has not been claimed as passed.
+**QUALIFIED for stage 06 on 2026-10-22.** The rootful prerequisite gate passed
+with the documented kernel, CPU/cgroup, Podman 5.4.2, crun 1.21 and CRIU 4.1.1
+profile. An initial adapter run failed closed on an AppArmor fingerprint mismatch:
+the rootful measurement is `apparmorEnabled=true`, unlike the earlier rootless
+observation. After correcting the canonical fingerprint to the measured rootful
+security profile, the production adapter smoke completed with:
+
+```text
+RESULT: QUALIFIED production PodmanAdapter smoke passed
+```
+
+The run exercised production cold start, capture with `--leave-running`, exact
+incarnation stop/remove, invalid-restore cleanup and absence proof, valid import
+restore, state continuity, container/checkpoint CPU isolation, cgroup cleanup and
+final resource cleanup.
 
 ## Unsupported modes and requalification limits
 

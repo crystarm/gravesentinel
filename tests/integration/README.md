@@ -90,4 +90,5 @@ separate success marker:
 RESULT: QUALIFIED production PodmanAdapter smoke passed
 ```
 
-It must pass in the rootful profile before stage 06 can be marked complete.
+This marker was obtained on the qualified rootful profile on 2026-10-22; rerun
+the gate and complete smoke whenever the runtime or host profile changes.

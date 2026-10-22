@@ -98,6 +98,19 @@ gravesentinel_cc_test(
 )
 
 gravesentinel_cc_test(
+    name = "restore_coordinator_test",
+    srcs = ["restore_coordinator_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/core:blake3_hasher",
+        "//src/core:restore_coordinator",
+        "//src/manifest:manifest",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
     name = "manifest_types_test",
     srcs = ["manifest_types_test.cxx"],
     size = "small",
@@ -143,6 +156,7 @@ test_suite(
         ":manifest_codec_test",
         ":manifest_types_test",
         ":podman_adapter_test",
+        ":restore_coordinator_test",
         ":snapshot_chunker_test",
         ":value_types_test",
     ],
@@ -161,6 +175,7 @@ filegroup(
         "manifest_codec_test.cxx",
         "manifest_types_test.cxx",
         "podman_adapter_test.cxx",
+        "restore_coordinator_test.cxx",
         "snapshot_chunker_test.cxx",
         "value_types_test.cxx",
     ],

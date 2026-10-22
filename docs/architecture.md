@@ -4,9 +4,9 @@
 
 Документ фиксирует общие архитектурные контракты MVP и обновляется по мере
 завершения этапов. Реальный runtime profile, Manifest v1, crash-safe
-FilesystemStorage, fixed-size chunking/reassembly, Linux process/affinity layer и
-production Podman adapter уже реализованы, но create/restore orchestration и IPC
-ещё не реализованы.
+FilesystemStorage, fixed-size chunking/reassembly, Linux process/affinity layer,
+production Podman adapter и crash-safe create transaction уже реализованы, но
+restore orchestration, service core и IPC ещё не реализованы.
 Бинарный target `//src/hypervisor:gravesentinel_hypervisor` собирается, но при
 запуске явно завершается с ошибкой до появления сервера в этапе 10.
 
@@ -52,6 +52,7 @@ flowchart TD
     LinuxRuntime[//src/hypervisor:linux_runtime]
     Podman[//src/hypervisor:podman_adapter]
     Core[//src/core:ccm_core]
+    Creator[//src/core:checkpoint_creator]
     Hasher[//src/core:blake3_hasher]
     Manifest[//src/manifest:manifest]
     Chunking[//src/chunking:snapshot_chunker]
@@ -64,9 +65,13 @@ flowchart TD
     SchedulerConsumer --> SchedulerClient
     SchedulerClient --> Protocol
     Hypervisor --> Core
+    Hypervisor --> Creator
     Hypervisor --> LinuxRuntime
     Hypervisor --> Podman
     Hypervisor --> Chunking
+    Creator --> Core
+    Creator --> Chunking
+    Creator --> Manifest
     Core --> Protocol
     Hasher --> Core
     Hasher --> Crypto
@@ -86,6 +91,7 @@ flowchart TD
     LinuxRuntime --> Core
     Unit --> SchedulerClient
     Unit --> Core
+    Unit --> Creator
     Unit --> Hasher
     Unit --> Chunking
     Unit --> Manifest
@@ -142,12 +148,13 @@ filesystem boundary.
 - `IStorage` — начало exclusive per-container operation, bounded чтение chunk и
   manifest, перечисление manifest по generation;
 - `IStorageOperation`/`IStoragePin` — bound `ContainerId`/operation kind, RAII
-  lease, lock-bound chunk reads, inode-bound уникальный staging, атомарная
-  публикация immutable chunk/manifest,
+  lease, lock-bound chunk reads, inode-bound уникальные staging и отдельный
+  runtime-artifact каталог, атомарная публикация immutable chunk/manifest,
   durable pin metadata и cleanup;
 - `IPodmanAdapter` — runtime/image compatibility, capture, stop/remove ожидаемой
   incarnation, restore, cold start и cleanup неудачного restore;
-- `IClock`, `IHasher`, `IIdGenerator` — детерминируемые зависимости core;
+- `IClock`, fallible `IHasher`, `IIdGenerator` — детерминируемые зависимости
+  core;
 - `ILogger` — диагностическое логирование без секретных полей;
 - `IAffinityController`/`IThreadAffinityBinding` — проверка allowed logical CPU,
   привязка только текущего worker thread и RAII-восстановление прежней mask;
@@ -167,8 +174,18 @@ semantics и поддерживаемый filesystem profile зафиксиро�
 `//src/chunking:snapshot_chunker` детерминированно преобразует immutable дерево
 regular files в 4 MiB BLAKE3 chunks с per-container deduplication и собирает его
 обратно в отдельный `staging/snapshot`, проверяя chunk size/hash и file mode до
-передачи runtime adapter. Полный контракт и ограничения описаны в
+передачи runtime adapter. Fallible hash/read/publication errors распространяются
+как structured failures. Полный контракт и ограничения описаны в
 `docs/chunking.md`.
+
+`//src/core:checkpoint_creator` под exclusive per-container storage lease выдаёт
+новый `CheckpointId`, вычисляет `max(committed generation)+1`, выполняет capture в
+отдельный `runtime-artifact`, chunking и атомарную публикацию Manifest v1 строго
+последней. Переходы `IDLE -> CAPTURING -> CHUNKING -> COMMITTING -> COMMITTED` и
+`FAILED/INCOMPLETE` структурированно логируются; ordinary paths очищают staging,
+а прежние версии не удаляются. Ошибка directory `fsync` после manifest rename
+классифицируется как `INCOMPLETE`, потому что publication может быть уже видна.
+Полный контракт описан в `docs/checkpoint-create.md`.
 
 `//src/hypervisor:linux_runtime` реализует Linux-only boundary: `fork`/`execve`
 без shell, закрытие посторонних child file descriptors, одновременное bounded

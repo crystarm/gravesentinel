@@ -5,3 +5,12 @@ filegroup(
     srcs = ["architecture.md"],
     visibility = ["//visibility:public"],
 )
+
+filegroup(
+    name = "testbed",
+    srcs = [
+        "adr/0001-podman-criu-runtime-profile.md",
+        "testbed.md",
+    ],
+    visibility = ["//visibility:public"],
+)

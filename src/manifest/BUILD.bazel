@@ -18,6 +18,7 @@ gravesentinel_cc_library(
         "@nlohmann_json//:json",
     ],
     visibility = [
+        "//src/chunking:__pkg__",
         "//src/core:__pkg__",
         "//src/hypervisor:__pkg__",
         "//src/storage:__pkg__",

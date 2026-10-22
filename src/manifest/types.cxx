@@ -224,49 +224,22 @@ join_within_root(const std::filesystem::path &root,
   return joined;
 }
 
-ManifestResult<void> validate_manifest_v1(const ManifestV1 &manifest) {
-  if (manifest.generation == 0) {
-    return std::unexpected(
-        make_error(ManifestErrorCode::invalid_generation, "generation",
-                   "manifest generation must be greater than zero"));
-  }
-
-  if (auto result = validate_text(manifest.container_id.value(), "container_id",
-                                  ManifestLimits::maximum_identifier_bytes);
-      !result) {
-    return result;
-  }
-  if (auto result =
-          validate_text(manifest.checkpoint_id.value(), "checkpoint_id",
-                        ManifestLimits::maximum_identifier_bytes);
-      !result) {
-    return result;
-  }
-  if (auto result =
-          validate_text(manifest.source_image_identity, "source_image_identity",
-                        ManifestLimits::maximum_source_image_bytes);
-      !result) {
-    return result;
-  }
-  if (auto result = validate_runtime_fingerprint(manifest.runtime_fingerprint);
-      !result) {
-    return result;
-  }
-
-  if (manifest.artifacts.size() > ManifestLimits::maximum_artifacts) {
+ManifestResult<void>
+validate_manifest_artifacts_v1(std::span<const ManifestArtifactV1> artifacts) {
+  if (artifacts.size() > ManifestLimits::maximum_artifacts) {
     return std::unexpected(make_error(ManifestErrorCode::limit_exceeded,
                                       "artifacts",
                                       "manifest contains too many artifacts"));
   }
 
   std::unordered_set<std::string> paths;
-  paths.reserve(manifest.artifacts.size());
+  paths.reserve(artifacts.size());
   std::size_t total_chunks = 0;
   std::uint64_t total_size = 0;
 
-  for (std::size_t artifact_index = 0;
-       artifact_index < manifest.artifacts.size(); ++artifact_index) {
-    const auto &artifact = manifest.artifacts[artifact_index];
+  for (std::size_t artifact_index = 0; artifact_index < artifacts.size();
+       ++artifact_index) {
+    const auto &artifact = artifacts[artifact_index];
     const auto field_prefix =
         "artifacts[" + std::to_string(artifact_index) + "]";
 
@@ -356,7 +329,69 @@ ManifestResult<void> validate_manifest_v1(const ManifestV1 &manifest) {
     }
   }
 
+  std::unordered_set<std::string> directories;
+  directories.reserve(artifacts.size());
+  for (const auto &artifact : artifacts) {
+    const auto &path = artifact.path.value();
+    const auto component_count =
+        1U + static_cast<std::size_t>(std::ranges::count(path, '/'));
+    if (component_count > ManifestLimits::maximum_path_components) {
+      return std::unexpected(
+          make_error(ManifestErrorCode::limit_exceeded, "artifacts",
+                     "artifact path exceeds the supported component depth"));
+    }
+
+    auto separator = path.find('/');
+    while (separator != std::string::npos) {
+      const auto prefix = path.substr(0, separator);
+      if (paths.contains(prefix)) {
+        return std::unexpected(make_error(
+            ManifestErrorCode::artifact_path_prefix_conflict, "artifacts",
+            "an artifact path must not be the parent of another artifact"));
+      }
+      directories.insert(prefix);
+      if (directories.size() + 1U > ManifestLimits::maximum_directories) {
+        return std::unexpected(
+            make_error(ManifestErrorCode::limit_exceeded, "artifacts",
+                       "artifact paths require too many directories"));
+      }
+      separator = path.find('/', separator + 1U);
+    }
+  }
+
   return {};
+}
+
+ManifestResult<void> validate_manifest_v1(const ManifestV1 &manifest) {
+  if (manifest.generation == 0) {
+    return std::unexpected(
+        make_error(ManifestErrorCode::invalid_generation, "generation",
+                   "manifest generation must be greater than zero"));
+  }
+
+  if (auto result = validate_text(manifest.container_id.value(), "container_id",
+                                  ManifestLimits::maximum_identifier_bytes);
+      !result) {
+    return result;
+  }
+  if (auto result =
+          validate_text(manifest.checkpoint_id.value(), "checkpoint_id",
+                        ManifestLimits::maximum_identifier_bytes);
+      !result) {
+    return result;
+  }
+  if (auto result =
+          validate_text(manifest.source_image_identity, "source_image_identity",
+                        ManifestLimits::maximum_source_image_bytes);
+      !result) {
+    return result;
+  }
+  if (auto result = validate_runtime_fingerprint(manifest.runtime_fingerprint);
+      !result) {
+    return result;
+  }
+
+  return validate_manifest_artifacts_v1(manifest.artifacts);
 }
 
 } // namespace gravesentinel::ccm

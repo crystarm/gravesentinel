@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,8 @@ struct ManifestLimits final {
   static constexpr std::size_t maximum_json_object_fields = 32;
   static constexpr std::size_t maximum_json_nodes = 550000;
   static constexpr std::size_t maximum_artifacts = 4096;
+  static constexpr std::size_t maximum_directories = 4096;
+  static constexpr std::size_t maximum_path_components = 256;
   static constexpr std::size_t maximum_chunks = 131072;
   static constexpr std::uint64_t chunk_bytes = 4U * 1024U * 1024U;
   static constexpr std::uint64_t maximum_snapshot_bytes = 1ULL << 40U;
@@ -39,6 +42,7 @@ enum class ManifestErrorCode : std::uint8_t {
   invalid_file_mode,
   invalid_chunk_layout,
   duplicate_artifact_path,
+  artifact_path_prefix_conflict,
   malformed_json,
   schema_violation,
   unsupported_version,
@@ -111,6 +115,9 @@ struct ManifestV1 {
 
   bool operator==(const ManifestV1 &) const = default;
 };
+
+[[nodiscard]] ManifestResult<void>
+validate_manifest_artifacts_v1(std::span<const ManifestArtifactV1> artifacts);
 
 [[nodiscard]] ManifestResult<void>
 validate_manifest_v1(const ManifestV1 &manifest);

@@ -225,6 +225,38 @@ TEST(ManifestValidationTest, RejectsDuplicateArtifactPaths) {
   expect_manifest_error(manifest, ManifestErrorCode::duplicate_artifact_path);
 }
 
+TEST(ManifestValidationTest, RejectsArtifactPathPrefixConflicts) {
+  auto manifest = make_valid_manifest();
+  manifest.artifacts[0].path = make_path("artifact");
+  manifest.artifacts[1].path = make_path("artifact-other");
+  manifest.artifacts.push_back(ManifestArtifactV1{
+      .path = make_path("artifact/child"),
+      .size = 0,
+      .mode = kRegularFileMode,
+      .chunks = {},
+  });
+
+  expect_manifest_error(manifest,
+                        ManifestErrorCode::artifact_path_prefix_conflict);
+}
+
+TEST(ManifestValidationTest, RejectsTooManyRequiredDirectories) {
+  auto manifest = make_valid_manifest();
+  manifest.artifacts.clear();
+  manifest.artifacts.reserve(ManifestLimits::maximum_directories);
+  for (std::size_t index = 0; index < ManifestLimits::maximum_directories;
+       ++index) {
+    manifest.artifacts.push_back(ManifestArtifactV1{
+        .path = make_path("directory-" + std::to_string(index) + "/artifact"),
+        .size = 0,
+        .mode = kRegularFileMode,
+        .chunks = {},
+    });
+  }
+
+  expect_manifest_error(manifest, ManifestErrorCode::limit_exceeded);
+}
+
 TEST(ManifestValidationTest, RejectsSymlinkAndSpecialFileModes) {
   constexpr std::array invalid_modes{
       0120777U,

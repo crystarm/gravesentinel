@@ -56,6 +56,27 @@ make_registration(std::string suffix, std::uint32_t container_cpu,
   };
 }
 
+[[nodiscard]] ColdStartSpec make_cold_start_spec() {
+  return ColdStartSpec{
+      .image_reference = "registry.example/worker:latest",
+      .argv = {"worker", "", "--threads", "2"},
+      .environment =
+          {
+              {.name = "WORKER_MODE", .value = "steady"},
+              {.name = "_EMPTY_VALUE", .value = ""},
+          },
+      .mounts = {},
+      .runtime_options = {},
+  };
+}
+
+void expect_invalid_cold_start(const ContainerRegistration &registration) {
+  const auto result = validate_container_registration(registration);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code, ValidationErrorCode::invalid_cold_start_spec);
+}
+
 TEST(CheckpointConfigTest, UsesRequiredIntervalAndRetentionDefaults) {
   const CheckpointConfig config{};
 
@@ -122,6 +143,146 @@ TEST(ContainerRegistrationTest, RejectsEmptyColdStartImage) {
 
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, ValidationErrorCode::invalid_cold_start_spec);
+}
+
+TEST(ContainerRegistrationTest, AcceptsColdStartArgvAndEnvironment) {
+  auto registration = make_registration("one", 0, 1);
+  registration.cold_start = make_cold_start_spec();
+
+  EXPECT_TRUE(validate_container_registration(registration));
+}
+
+TEST(ContainerRegistrationTest, RejectsNulInColdStartStrings) {
+  auto registration = make_registration("one", 0, 1);
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->image_reference = std::string("image\0suffix", 12);
+  expect_invalid_cold_start(registration);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->argv.push_back(std::string("arg\0tail", 8));
+  expect_invalid_cold_start(registration);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->environment.push_back(
+      {.name = std::string("BAD\0NAME", 8), .value = "secret-name-value"});
+  const auto name_result = validate_container_registration(registration);
+  ASSERT_FALSE(name_result);
+  EXPECT_EQ(name_result.error().code,
+            ValidationErrorCode::invalid_cold_start_spec);
+  EXPECT_EQ(name_result.error().diagnostic.find("secret-name-value"),
+            std::string::npos);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->environment.push_back(
+      {.name = "SECRET", .value = std::string("secret\0tail", 11)});
+  const auto value_result = validate_container_registration(registration);
+  ASSERT_FALSE(value_result);
+  EXPECT_EQ(value_result.error().code,
+            ValidationErrorCode::invalid_cold_start_spec);
+  EXPECT_EQ(value_result.error().diagnostic.find("secret"), std::string::npos);
+}
+
+TEST(ContainerRegistrationTest, RejectsInvalidEnvironmentNames) {
+  constexpr std::array invalid_names{"", "1STARTS_WITH_DIGIT", "HAS-DASH",
+                                     "HAS.DOT"};
+
+  for (const auto *invalid_name : invalid_names) {
+    auto registration = make_registration("one", 0, 1);
+    registration.cold_start = make_cold_start_spec();
+    registration.cold_start->environment.push_back(
+        {.name = invalid_name, .value = "secret-value"});
+
+    const auto result = validate_container_registration(registration);
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code,
+              ValidationErrorCode::invalid_cold_start_spec);
+    EXPECT_EQ(result.error().diagnostic.find("secret-value"),
+              std::string::npos);
+  }
+}
+
+TEST(ContainerRegistrationTest, RejectsDuplicateEnvironmentNames) {
+  auto registration = make_registration("one", 0, 1);
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->environment = {
+      {.name = "DUPLICATE", .value = "first-secret"},
+      {.name = "DUPLICATE", .value = "second-secret"},
+  };
+
+  const auto result = validate_container_registration(registration);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code, ValidationErrorCode::invalid_cold_start_spec);
+  EXPECT_EQ(result.error().diagnostic.find("first-secret"), std::string::npos);
+  EXPECT_EQ(result.error().diagnostic.find("second-secret"), std::string::npos);
+}
+
+TEST(ContainerRegistrationTest, RejectsOversizedColdStartStrings) {
+  auto registration = make_registration("one", 0, 1);
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->image_reference = std::string(2049, 'i');
+  expect_invalid_cold_start(registration);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->argv.push_back(std::string(4097, 'a'));
+  expect_invalid_cold_start(registration);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->environment.push_back(
+      {.name = std::string(257, 'A'), .value = ""});
+  expect_invalid_cold_start(registration);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->environment.push_back(
+      {.name = "OVERSIZED", .value = std::string(4097, 'v')});
+  expect_invalid_cold_start(registration);
+}
+
+TEST(ContainerRegistrationTest, RejectsExcessiveColdStartCountsAndTotalBytes) {
+  auto registration = make_registration("one", 0, 1);
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->argv.assign(257, "argument");
+  expect_invalid_cold_start(registration);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->environment.clear();
+  registration.cold_start->environment.reserve(257);
+  for (std::size_t index = 0; index < 257; ++index) {
+    registration.cold_start->environment.push_back(
+        {.name = "VARIABLE_" + std::to_string(index), .value = "value"});
+  }
+  expect_invalid_cold_start(registration);
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->environment.clear();
+  registration.cold_start->argv.assign(16, std::string(4096, 'a'));
+  expect_invalid_cold_start(registration);
+}
+
+TEST(ContainerRegistrationTest, RejectsUnsupportedColdStartMountsAndOptions) {
+  auto registration = make_registration("one", 0, 1);
+  registration.runtime_fingerprint = make_runtime_fingerprint();
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->mounts.push_back(
+      {.source = "/srv/data", .target = "/data", .read_only = true});
+
+  const auto mount_result = validate_container_registration(registration);
+
+  ASSERT_FALSE(mount_result);
+  EXPECT_EQ(mount_result.error().code,
+            ValidationErrorCode::invalid_cold_start_spec);
+  EXPECT_EQ(mount_result.error().field, "cold_start.mounts");
+
+  registration.cold_start = make_cold_start_spec();
+  registration.cold_start->runtime_options.push_back("--privileged");
+
+  const auto options_result = validate_container_registration(registration);
+
+  ASSERT_FALSE(options_result);
+  EXPECT_EQ(options_result.error().code,
+            ValidationErrorCode::invalid_cold_start_spec);
+  EXPECT_EQ(options_result.error().field, "cold_start.runtime_options");
 }
 
 TEST(ContainerRegistrationTest, AcceptsCompleteRuntimeFingerprint) {

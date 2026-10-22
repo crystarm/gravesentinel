@@ -5,8 +5,9 @@
 Документ фиксирует общие архитектурные контракты MVP и обновляется по мере
 завершения этапов. Реальный runtime profile, Manifest v1, crash-safe
 FilesystemStorage, fixed-size chunking/reassembly, Linux process/affinity layer,
-production Podman adapter и crash-safe create transaction уже реализованы, но
-restore orchestration, service core и IPC ещё не реализованы.
+production Podman adapter, crash-safe create transaction и безопасная restore /
+fallback / cold-start orchestration уже реализованы, но service core и IPC ещё не
+реализованы.
 Бинарный target `//src/hypervisor:gravesentinel_hypervisor` собирается, но при
 запуске явно завершается с ошибкой до появления сервера в этапе 10.
 
@@ -53,6 +54,7 @@ flowchart TD
     Podman[//src/hypervisor:podman_adapter]
     Core[//src/core:ccm_core]
     Creator[//src/core:checkpoint_creator]
+    Restorer[//src/core:restore_coordinator]
     Hasher[//src/core:blake3_hasher]
     Manifest[//src/manifest:manifest]
     Chunking[//src/chunking:snapshot_chunker]
@@ -66,12 +68,16 @@ flowchart TD
     SchedulerClient --> Protocol
     Hypervisor --> Core
     Hypervisor --> Creator
+    Hypervisor --> Restorer
     Hypervisor --> LinuxRuntime
     Hypervisor --> Podman
     Hypervisor --> Chunking
     Creator --> Core
     Creator --> Chunking
     Creator --> Manifest
+    Restorer --> Core
+    Restorer --> Chunking
+    Restorer --> Manifest
     Core --> Protocol
     Hasher --> Core
     Hasher --> Crypto
@@ -92,6 +98,7 @@ flowchart TD
     Unit --> SchedulerClient
     Unit --> Core
     Unit --> Creator
+    Unit --> Restorer
     Unit --> Hasher
     Unit --> Chunking
     Unit --> Manifest
@@ -152,7 +159,8 @@ filesystem boundary.
   runtime-artifact каталог, атомарная публикация immutable chunk/manifest,
   durable pin metadata и cleanup;
 - `IPodmanAdapter` — runtime/image compatibility, capture, stop/remove ожидаемой
-  incarnation, restore, cold start и cleanup неудачного restore;
+  incarnation, недеструктивное подтверждение absence, restore, cold start и cleanup
+  собственной неудачной restore-попытки;
 - `IClock`, fallible `IHasher`, `IIdGenerator` — детерминируемые зависимости
   core;
 - `ILogger` — диагностическое логирование без секретных полей;
@@ -187,6 +195,14 @@ regular files в 4 MiB BLAKE3 chunks с per-container deduplication и соби�
 классифицируется как `INCOMPLETE`, потому что publication может быть уже видна.
 Полный контракт описан в `docs/checkpoint-create.md`.
 
+`//src/core:restore_coordinator` под тем же exclusive storage lease перебирает
+committed Manifest v1 строго по убыванию generation, pin-ит кандидата до завершения
+runtime call/cleanup, проверяет checksum/schema/fingerprint/image и BLAKE3 каждого
+chunk до restore. Fallback разрешён только после подтверждённого absence; cold start
+выполняется единожды при наличии явного `ColdStartSpec`. Отдельные
+`snapshot-<generation>` staging trees позволяют сохранить lease между попытками.
+Полный контракт описан в `docs/checkpoint-restore.md`.
+
 `//src/hypervisor:linux_runtime` реализует Linux-only boundary: `fork`/`execve`
 без shell, закрытие посторонних child file descriptors, одновременное bounded
 чтение stdout/stderr, TERM→KILL всей process group по deadline и affinity child.
@@ -200,8 +216,11 @@ container cpuset и immutable image ID. Logical `ContainerId`, стабильн�
 смешиваются. Stop/remove требует ожидаемую incarnation и не удаляет replacement.
 Absence считается доказанным лишь когда и обычный `podman container exists`, и
 `podman container exists --external` возвращают documented not-found status.
-Failed restore до доказанного cleanup сохраняет `incarnation_may_exist` и не даёт
-права на fallback.
+`confirm_absence` выполняет только эти read-only probes и никогда не удаляет
+неожиданный live container. Failed restore до доказанного cleanup сохраняет
+`incarnation_may_exist` и не даёт права на fallback; destructive cleanup допустим
+только после собственной restore/cold-start попытки, начатой при подтверждённом
+absence под непрерывным lease.
 
 Подробный `diagnostic` остаётся внутри hypervisor. Будущий wire response содержит
 только стабильный error code, request/correlation ID и однозначный status.

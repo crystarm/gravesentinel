@@ -13,6 +13,12 @@ filegroup(
 )
 
 filegroup(
+    name = "chunking",
+    srcs = ["chunking.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "filesystem_storage",
     srcs = ["filesystem-storage.md"],
     visibility = ["//visibility:public"],

@@ -111,7 +111,8 @@ MAC; authenticity must come from the trusted storage/process boundary.
 The model and decoder enforce all of the following:
 
 - `generation > 0`;
-- artifact paths are unique;
+- artifact paths are unique, and no file path may be the parent prefix of another
+  file path (for example, `a` and `a/b` conflict);
 - only regular-file modes are accepted; symlink, directory, device, socket, and
   FIFO mode declarations are rejected;
 - an empty artifact has zero chunks;
@@ -137,6 +138,8 @@ The v1 parser applies these limits before accepting untrusted input:
 | JSON object fields | 32 |
 | JSON values/nodes | 550000 |
 | Artifacts | 4096 |
+| Directories implied by artifact paths, including root | 4096 |
+| Components in one artifact path | 256 |
 | Chunks across the manifest | 131072 |
 | Chunk size | 4 MiB |
 | Total artifact bytes | 1 TiB |
@@ -149,7 +152,8 @@ The v1 parser applies these limits before accepting untrusted input:
 A SAX preflight pass enforces nesting, node, object, array, duplicate-key, and
 string limits before the DOM parser allocates the full JSON tree. The typed parse
 then enforces the exact schema, numeric ranges, aggregate chunk count, and total
-sizes before constructing the accepted model.
+sizes, implied directory count, and path component depth before constructing the
+accepted model.
 
 ## Path safety boundary
 
@@ -161,9 +165,9 @@ into a different accepted value.
 
 `join_within_root` performs a lexical join beneath an absolute root and returns a
 normalized path. That is not proof of physical filesystem containment: a path
-component can later be replaced with a symlink. Storage code must open relative
-to a trusted directory descriptor using Linux no-follow/beneath semantics, such
-as `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+component can later be replaced with a symlink. Storage and chunking code must
+open relative to a trusted directory descriptor using Linux no-follow/beneath
+semantics, such as `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
 `RESOLVE_NO_MAGICLINKS`, or an equivalent component-by-component `openat` design.
 It must also verify the actual file type with `fstat`. `weakly_canonical` or a
 check-then-open path comparison is insufficient because of TOCTOU races.

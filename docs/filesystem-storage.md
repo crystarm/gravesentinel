@@ -13,6 +13,8 @@ The supported MVP profile is a local Linux filesystem that provides:
 - atomic same-filesystem `renameat2(RENAME_NOREPLACE)` or hard-link publication;
 - working file and directory `fsync`;
 - `flock` locks shared by all hypervisor processes using the storage root;
+- Linux `openat2` with `RESOLVE_NO_SYMLINKS`/`RESOLVE_NO_MAGICLINKS` and
+  `statx` mount IDs;
 - accessible Linux `/proc/self/fd` for reopening an already type-checked inode;
 - normal POSIX behavior for `openat`, `mkdirat`, `unlinkat`, and regular files.
 
@@ -146,8 +148,12 @@ caller cannot bypass the required lease:
 - `list_manifests`, returning generations in descending order;
 - bounded `read_manifest(container, generation)`.
 
-`IStorageOperation` provides the staging path, immutable chunk publication,
-final manifest publication, manifest pinning, and cleanup. Once manifest
+`IStorageOperation` exposes its bound container identity and operation kind, plus
+the staging path and its captured device/inode identity, lock-bound chunk reads,
+immutable chunk publication, final manifest publication,
+manifest pinning, and cleanup. Algorithm layers use that identity rather than a
+second caller-supplied `ContainerId`, preventing cross-namespace read/publish
+mismatches. Once manifest
 publication succeeds—or reaches the rename-but-directory-fsync indeterminate
 state—the operation rejects further chunk or manifest publication.
 

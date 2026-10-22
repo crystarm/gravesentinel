@@ -128,6 +128,10 @@ public:
   stop_and_remove(const ContainerId &container_id,
                   const RuntimeIncarnation &expected_incarnation,
                   RuntimeCpuAssignment cpu_assignment) = 0;
+  [[nodiscard]] virtual CheckpointResult<void>
+  confirm_absence(const ContainerId &container_id,
+                  const RuntimeContainerRef &runtime_container,
+                  RuntimeCpuAssignment cpu_assignment) = 0;
   [[nodiscard]] virtual CheckpointResult<RuntimeIncarnation>
   restore(const ContainerId &container_id,
           const RuntimeContainerRef &runtime_container,

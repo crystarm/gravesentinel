@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace gravesentinel::ccm {
@@ -44,6 +45,9 @@ public:
 
   [[nodiscard]] CheckpointResult<std::filesystem::path>
   reassemble(std::span<const ManifestArtifactV1> artifacts);
+  [[nodiscard]] CheckpointResult<std::filesystem::path>
+  reassemble(std::span<const ManifestArtifactV1> artifacts,
+             std::string_view output_directory_name);
 
 private:
   IStorageOperation &operation_;

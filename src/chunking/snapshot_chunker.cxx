@@ -29,6 +29,18 @@ constexpr std::size_t kMaximumSnapshotDirectoryEntries =
     ManifestLimits::maximum_artifacts + ManifestLimits::maximum_directories;
 constexpr std::string_view kReassembledDirectoryName = "snapshot";
 
+[[nodiscard]] bool valid_output_directory_name(std::string_view name) noexcept {
+  if (name.empty() ||
+      name.size() > ManifestLimits::maximum_path_component_bytes ||
+      name == "." || name == "..") {
+    return false;
+  }
+  return std::ranges::all_of(name, [](char value) {
+    return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+           (value >= '0' && value <= '9') || value == '-' || value == '_';
+  });
+}
+
 [[nodiscard]] CheckpointErrorDetail logical_error(StableErrorCode code,
                                                   std::string diagnostic,
                                                   bool retryable = false) {
@@ -1095,6 +1107,12 @@ SnapshotReassembler::SnapshotReassembler(
 
 CheckpointResult<std::filesystem::path>
 SnapshotReassembler::reassemble(std::span<const ManifestArtifactV1> artifacts) {
+  return reassemble(artifacts, kReassembledDirectoryName);
+}
+
+CheckpointResult<std::filesystem::path>
+SnapshotReassembler::reassemble(std::span<const ManifestArtifactV1> artifacts,
+                                std::string_view output_directory_name) {
   if (operation_.kind() != StorageOperationKind::restore) {
     return std::unexpected(logical_error(
         StableErrorCode::conflict,
@@ -1104,6 +1122,11 @@ SnapshotReassembler::reassemble(std::span<const ManifestArtifactV1> artifacts) {
     return std::unexpected(
         logical_error(StableErrorCode::invalid_argument,
                       "snapshot reassembly requires file operations"));
+  }
+  if (!valid_output_directory_name(output_directory_name)) {
+    return std::unexpected(
+        logical_error(StableErrorCode::invalid_argument,
+                      "snapshot reassembly output directory name is invalid"));
   }
   if (auto validated = validate_manifest_artifacts_v1(artifacts); !validated) {
     return std::unexpected(
@@ -1146,8 +1169,9 @@ SnapshotReassembler::reassemble(std::span<const ManifestArtifactV1> artifacts) {
     return std::unexpected(mount_id.error());
   }
 
-  auto created = create_directory(file_operations_, staging->get(),
-                                  kReassembledDirectoryName);
+  const std::string output_directory{output_directory_name};
+  auto created =
+      create_directory(file_operations_, staging->get(), output_directory);
   if (!created) {
     return std::unexpected(
         filesystem_error("create reassembled snapshot directory",
@@ -1158,8 +1182,8 @@ SnapshotReassembler::reassemble(std::span<const ManifestArtifactV1> artifacts) {
         logical_error(StableErrorCode::conflict,
                       "reassembled snapshot directory already exists"));
   }
-  auto output = open_directory(file_operations_, staging->get(),
-                               kReassembledDirectoryName);
+  auto output =
+      open_directory(file_operations_, staging->get(), output_directory);
   if (!output) {
     return std::unexpected(
         filesystem_error("open reassembled snapshot directory", output.error(),
@@ -1206,7 +1230,7 @@ SnapshotReassembler::reassemble(std::span<const ManifestArtifactV1> artifacts) {
                       "operation staging identity changed during reassembly"));
   }
   auto rebound_output = open_directory(file_operations_, rebound_staging->get(),
-                                       kReassembledDirectoryName);
+                                       output_directory);
   if (!rebound_output) {
     return std::unexpected(
         logical_error(StableErrorCode::storage_error,
@@ -1222,7 +1246,7 @@ SnapshotReassembler::reassemble(std::span<const ManifestArtifactV1> artifacts) {
         StableErrorCode::storage_error,
         "reassembled snapshot identity changed before publication"));
   }
-  return staging_path / kReassembledDirectoryName;
+  return staging_path / output_directory;
 }
 
 } // namespace gravesentinel::ccm

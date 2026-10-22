@@ -902,6 +902,51 @@ TEST(PodmanAdapterTest, ColdStartFailureDoesNotExposeEnvironmentValue) {
 }
 
 TEST(PodmanAdapterTest,
+     ConfirmAbsenceRequiresBothNormalAndExternalRecordsToBeMissing) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 1);
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto absent =
+      adapter.confirm_absence(container_id(), runtime_ref(), kCpuAssignment);
+
+  EXPECT_TRUE(absent) << absent.error().diagnostic;
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest,
+     ConfirmAbsenceRefusesPresenceWithoutStoppingOrRemovingAnything) {
+  for (const auto &presence :
+       {std::pair{0, 1}, std::pair{1, 0}, std::pair{0, 0}}) {
+    TemporaryDirectory temporary;
+    const auto config = adapter_config(temporary.path());
+    ScriptedProcessRunner runner;
+    FakeAffinityController affinity;
+    RecordingLogger logger;
+    push_exists(runner, config, "runtime-1", presence.first, presence.second);
+    PodmanAdapter adapter(runner, affinity, logger, config);
+
+    const auto absent =
+        adapter.confirm_absence(container_id(), runtime_ref(), kCpuAssignment);
+
+    ASSERT_FALSE(absent);
+    EXPECT_EQ(absent.error().code, StableErrorCode::conflict);
+    EXPECT_EQ(absent.error().runtime_side_effect, RuntimeSideEffect::none);
+    ASSERT_EQ(runner.requests().size(), 2U);
+    EXPECT_EQ(runner.requests()[0].argv,
+              (std::vector<std::string>{"container", "exists", "runtime-1"}));
+    EXPECT_EQ(runner.requests()[1].argv,
+              (std::vector<std::string>{"container", "exists", "--external",
+                                        "runtime-1"}));
+    EXPECT_TRUE(runner.empty());
+  }
+}
+
+TEST(PodmanAdapterTest,
      CleanupRejectsExternalPresenceWhenNormalContainerIsAbsent) {
   TemporaryDirectory temporary;
   const auto config = adapter_config(temporary.path());

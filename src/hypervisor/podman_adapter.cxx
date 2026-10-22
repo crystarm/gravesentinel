@@ -565,6 +565,27 @@ public:
         });
   }
 
+  [[nodiscard]] CheckpointResult<void>
+  confirm_absence(const ContainerId &container_id,
+                  const RuntimeContainerRef &runtime_container,
+                  RuntimeCpuAssignment cpu_assignment) {
+    return with_affinity<void>(
+        cpu_assignment, "confirm container absence",
+        [&]() -> CheckpointResult<void> {
+          if (const auto reference =
+                  validate_runtime_reference(runtime_container);
+              !reference) {
+            return reference;
+          }
+          if (const auto logical_id = validate_logical_id(container_id);
+              !logical_id) {
+            return logical_id;
+          }
+          return prove_absence(runtime_container.value(), cpu_assignment,
+                               StableErrorCode::conflict);
+        });
+  }
+
   [[nodiscard]] CheckpointResult<RuntimeIncarnation>
   restore(const ContainerId &container_id,
           const RuntimeContainerRef &runtime_container,
@@ -1803,6 +1824,14 @@ PodmanAdapter::stop_and_remove(const ContainerId &container_id,
                                const RuntimeIncarnation &expected_incarnation,
                                RuntimeCpuAssignment cpu_assignment) {
   return impl_->stop_and_remove(container_id, expected_incarnation,
+                                cpu_assignment);
+}
+
+CheckpointResult<void>
+PodmanAdapter::confirm_absence(const ContainerId &container_id,
+                               const RuntimeContainerRef &runtime_container,
+                               RuntimeCpuAssignment cpu_assignment) {
+  return impl_->confirm_absence(container_id, runtime_container,
                                 cpu_assignment);
 }
 

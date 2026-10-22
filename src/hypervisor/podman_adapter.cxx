@@ -1341,22 +1341,63 @@ private:
     const auto reported_version = string_member(*info_version, "Version");
     if (!distribution_name || *distribution_name != "debian" ||
         !distribution_version || *distribution_version != "13" ||
-        (distribution_codename && *distribution_codename != "trixie") ||
-        !architecture || *architecture != kArchitecture || !kernel ||
-        *kernel != kKernelRelease || !cgroup_version ||
-        *cgroup_version != "v2" || !cgroup_manager ||
-        *cgroup_manager != "systemd" || !service_is_remote ||
-        *service_is_remote || !rootless || *rootless || !apparmor_enabled ||
-        *apparmor_enabled || !seccomp_enabled || !*seccomp_enabled ||
-        !seccomp_path ||
-        std::filesystem::path(*seccomp_path).filename() != "seccomp.json" ||
-        !selinux_enabled || *selinux_enabled || !runtime_name ||
-        *runtime_name != "crun" || !runtime_version || !reported_version ||
-        *reported_version != kPodmanVersion ||
-        !has_qualified_capabilities(*security)) {
+        !distribution_codename || *distribution_codename != "trixie") {
       return std::unexpected(make_error(
           StableErrorCode::incompatible_runtime,
-          "Podman host profile does not match the qualified profile"));
+          "Podman distribution does not match qualified Debian 13 trixie"));
+    }
+    if (!architecture || *architecture != kArchitecture || !kernel ||
+        *kernel != kKernelRelease) {
+      return std::unexpected(make_error(StableErrorCode::incompatible_runtime,
+                                        "Podman architecture or kernel does "
+                                        "not match the qualified profile"));
+    }
+    if (!cgroup_version || *cgroup_version != "v2" || !cgroup_manager ||
+        *cgroup_manager != "systemd") {
+      return std::unexpected(
+          make_error(StableErrorCode::incompatible_runtime,
+                     "Podman cgroup mode does not match qualified v2/systemd"));
+    }
+    if (!service_is_remote || *service_is_remote) {
+      return std::unexpected(
+          make_error(StableErrorCode::incompatible_runtime,
+                     "Podman service must be local for the qualified profile"));
+    }
+    if (!rootless || *rootless) {
+      return std::unexpected(
+          make_error(StableErrorCode::incompatible_runtime,
+                     "Podman must be rootful for the qualified profile"));
+    }
+    if (!apparmor_enabled || !*apparmor_enabled) {
+      return std::unexpected(make_error(
+          StableErrorCode::incompatible_runtime,
+          "Podman AppArmor support must be enabled for the qualified profile"));
+    }
+    if (!selinux_enabled || *selinux_enabled) {
+      return std::unexpected(make_error(
+          StableErrorCode::incompatible_runtime,
+          "Podman SELinux mode does not match the qualified disabled profile"));
+    }
+    if (!seccomp_enabled || !*seccomp_enabled || !seccomp_path ||
+        *seccomp_path != "/usr/share/containers/seccomp.json") {
+      return std::unexpected(make_error(
+          StableErrorCode::incompatible_runtime,
+          "Podman seccomp profile does not match the qualified default"));
+    }
+    if (!runtime_name || *runtime_name != "crun" || !runtime_version) {
+      return std::unexpected(
+          make_error(StableErrorCode::incompatible_runtime,
+                     "Podman OCI runtime does not match qualified crun"));
+    }
+    if (!reported_version || *reported_version != kPodmanVersion) {
+      return std::unexpected(make_error(
+          StableErrorCode::incompatible_runtime,
+          "Podman info version does not match the qualified profile"));
+    }
+    if (!has_qualified_capabilities(*security)) {
+      return std::unexpected(make_error(
+          StableErrorCode::incompatible_runtime,
+          "Podman capability profile does not match the qualified profile"));
     }
 
     const auto *uid_map = member(*id_mappings, "uidmap");
@@ -1442,7 +1483,7 @@ private:
         .user_namespace_mode = "host",
         .capability_profile = std::string(kCapabilityProfile),
         .selinux_mode = "disabled",
-        .apparmor_profile = "disabled",
+        .apparmor_profile = "host-default",
         .seccomp_profile = "default",
         .command_profile = std::string(command_profile),
     };

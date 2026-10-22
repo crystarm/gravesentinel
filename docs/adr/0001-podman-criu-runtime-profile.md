@@ -160,8 +160,14 @@ The smoke generates an unpredictable per-run suffix and removes a Podman object
 only after its ownership label exactly matches that run. The production adapter
 also requires the first inspected immutable runtime ID to equal the expected
 `RuntimeIncarnation`; a name or logical-ID label match alone is insufficient.
-Cleanup proves both ordinary libpod-record and external containers/storage
-absence. Cleanup failures fail the gate, and an indeterminate result carries
+Before a restore attempt, production `confirm_absence` is deliberately read-only:
+it requires both ordinary and external `podman container exists` probes to return
+the documented not-found status and never stops or removes an unexpected live
+container. Destructive `cleanup_failed_restore` is permitted only after the
+coordinator proved absence and then initiated its own restore/cold-start attempt
+under an uninterrupted per-container storage lease. It proves both ordinary
+libpod-record and external containers/storage absence before fallback. Cleanup
+failures fail the gate, and an indeterminate result carries
 `incarnation_may_exist` and forbids another start for the same logical
 `ContainerId`. The integration smoke separately observes and verifies cgroup
 removal.

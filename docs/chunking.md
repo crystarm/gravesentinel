@@ -95,12 +95,15 @@ first validates the complete artifact vector, including count/size limits, chunk
 layout, duplicate paths, modes, and file-vs-parent conflicts such as `a` and
 `a/b`. Invalid metadata causes no output filesystem side effect.
 
-After validation it reopens the operation staging path, requires its device/inode
-to match the identity captured by storage, and creates a fresh exclusive `snapshot`
-directory inside it. The storage-owned `state` and pin metadata therefore
-never appear in the runtime artifact tree. Intermediate directories and files are
-created relative to checked directory descriptors; unexpected existing entries,
-symlinks, special files, hardlinks, and mount crossings are rejected.
+After validation it reopens the operation staging path and requires its
+device/inode to match the identity captured by storage. The default overload
+creates a fresh exclusive `snapshot` directory; restore orchestration may supply a
+strict single-component `[A-Za-z0-9_-]+` name such as `snapshot-9`, allowing one
+unique output tree per fallback candidate under the same uninterrupted operation
+lease. The storage-owned `state` and pin metadata therefore never appear in a
+runtime artifact tree. Intermediate directories and files are created relative to
+checked directory descriptors; unexpected existing entries, symlinks, special
+files, hardlinks, and mount crossings are rejected.
 
 Every referenced chunk is read in the operation's container namespace. Its exact
 manifest size and BLAKE3 are checked before any of its bytes are written. A
@@ -109,10 +112,10 @@ the same failure path used for other validation errors. Output handles partial
 writes and `EINTR`; each completed file is checked for exact size,
 regular-file type, single link, expected mode, and mount containment, then
 `fsync`ed. A partial current file is unlinked on failure. Before return, staging
-and `snapshot` are rebound by pathname and must still identify the checked
-inodes. The caller receives the `.../staging/<operation>/snapshot` path only after
-every artifact succeeds, so a
-runtime adapter cannot be handed a partially validated tree through this API.
+and the selected output directory are rebound by pathname and must still identify
+the checked inodes. The caller receives the output root path only after every
+artifact succeeds, so a runtime adapter cannot be handed a partially validated
+tree through this API.
 
 ## Resource bounds and errors
 

@@ -5,7 +5,9 @@ sh_test(
     srcs = ["check_clang_format.sh"],
     args = [
         "$(locations //src/core:format_sources)",
+        "$(locations //src/crypto:format_sources)",
         "$(locations //src/hypervisor:format_sources)",
+        "$(locations //src/manifest:format_sources)",
         "$(locations //src/protocol:format_sources)",
         "$(locations //src/scheduler_client:format_sources)",
         "$(locations //tests/integration/fixture:format_sources)",
@@ -14,7 +16,9 @@ sh_test(
     data = [
         "//:clang_format_config",
         "//src/core:format_sources",
+        "//src/crypto:format_sources",
         "//src/hypervisor:format_sources",
+        "//src/manifest:format_sources",
         "//src/protocol:format_sources",
         "//src/scheduler_client:format_sources",
         "//tests/integration/fixture:format_sources",

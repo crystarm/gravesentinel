@@ -1,0 +1,36 @@
+load("//build_defs:cc.bzl", "gravesentinel_cc_library")
+
+package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_library(
+    name = "manifest",
+    srcs = [
+        "codec.cxx",
+        "types.cxx",
+    ],
+    hdrs = [
+        "codec.hpp",
+        "types.hpp",
+    ],
+    deps = [
+        "//src/crypto:blake3",
+        "//src/protocol:protocol",
+        "@nlohmann_json//:json",
+    ],
+    visibility = [
+        "//src/core:__pkg__",
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = [
+        "codec.cxx",
+        "codec.hpp",
+        "types.cxx",
+        "types.hpp",
+    ],
+    visibility = ["//scripts:__pkg__"],
+)

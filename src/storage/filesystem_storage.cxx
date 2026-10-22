@@ -28,6 +28,7 @@ constexpr std::uint32_t kFileMode = 0600U;
 constexpr std::size_t kMaximumIdentifierBytes = 256U;
 constexpr std::size_t kMaximumTemporaryAttempts = 64U;
 constexpr std::size_t kManifestNameDigits = 20U;
+constexpr std::size_t kMaximumDirectoryEntries = 131072U;
 constexpr std::string_view kManifestSuffix = ".json";
 
 class UniqueFileDescriptor final {
@@ -516,7 +517,8 @@ list_manifest_references(const std::shared_ptr<IFileOperations> &operations,
   FileOperationResult<std::vector<std::string>> entries =
       std::unexpected(EINTR);
   while (!entries && entries.error() == EINTR) {
-    entries = operations->list_directory(manifests_fd);
+    entries =
+        operations->list_directory(manifests_fd, kMaximumDirectoryEntries);
   }
   if (!entries) {
     return std::unexpected(
@@ -787,7 +789,8 @@ ensure_container(const std::shared_ptr<StorageContext> &context,
 [[nodiscard]] CheckpointResult<void>
 remove_tree_contents(const std::shared_ptr<IFileOperations> &operations,
                      int directory_fd) {
-  auto entries = operations->list_directory(directory_fd);
+  auto entries =
+      operations->list_directory(directory_fd, kMaximumDirectoryEntries);
   if (!entries) {
     return std::unexpected(filesystem_error(
         "list staging directory for cleanup", entries.error()));
@@ -823,14 +826,17 @@ remove_tree_contents(const std::shared_ptr<IFileOperations> &operations,
 
 struct StorageOperationData {
   StorageOperationData(std::shared_ptr<StorageContext> storage_context,
-                       ContainerId logical_container_id)
+                       ContainerId logical_container_id,
+                       StorageOperationKind operation_kind)
       : context(std::move(storage_context)),
-        container_id(std::move(logical_container_id)) {}
+        container_id(std::move(logical_container_id)), kind(operation_kind) {}
 
   std::shared_ptr<StorageContext> context;
   ContainerId container_id;
+  StorageOperationKind kind;
   std::string operation_key;
   std::filesystem::path staging_path;
+  StorageDirectoryIdentity staging_identity{};
   UniqueFileDescriptor lock_fd;
   UniqueFileDescriptor container_fd;
   UniqueFileDescriptor manifests_fd;
@@ -929,19 +935,70 @@ public:
     }
   }
 
+  [[nodiscard]] const ContainerId &container_id() const noexcept override {
+    return state_->container_id;
+  }
+
+  [[nodiscard]] StorageOperationKind kind() const noexcept override {
+    return state_->kind;
+  }
+
   [[nodiscard]] const std::filesystem::path &
   staging_directory() const noexcept override {
     return state_->staging_path;
+  }
+
+  [[nodiscard]] StorageDirectoryIdentity
+  staging_directory_identity() const noexcept override {
+    return state_->staging_identity;
+  }
+
+  [[nodiscard]] CheckpointResult<std::vector<std::byte>>
+  read_chunk(const ChunkHash &hash) override {
+    std::scoped_lock lock{state_->mutex};
+    if (state_->cleaned) {
+      return std::unexpected(
+          logical_error(StableErrorCode::conflict,
+                        "chunks cannot be read after operation cleanup"));
+    }
+
+    if (auto result =
+            sync_directory(state_->context->operations, state_->chunks_fd.get(),
+                           "confirm operation chunk prefix durability");
+        !result) {
+      return std::unexpected(result.error());
+    }
+    const auto encoded_hash = hash_to_hex(hash);
+    auto prefix = open_directory(
+        state_->context->operations, state_->chunks_fd.get(),
+        encoded_hash.substr(0, 2), "open operation chunk prefix directory");
+    if (!prefix) {
+      return std::unexpected(prefix.error());
+    }
+    auto bytes = read_regular_file(state_->context->operations, prefix->get(),
+                                   encoded_hash, ManifestLimits::chunk_bytes,
+                                   "read operation chunk");
+    if (!bytes) {
+      return std::unexpected(bytes.error());
+    }
+    if (auto result = sync_directory(state_->context->operations, prefix->get(),
+                                     "confirm operation chunk durability");
+        !result) {
+      return std::unexpected(result.error());
+    }
+    return bytes;
   }
 
   [[nodiscard]] CheckpointResult<void>
   publish_chunk(const ChunkHash &hash,
                 std::span<const std::byte> bytes) override {
     std::scoped_lock lock{state_->mutex};
-    if (state_->cleaned || state_->manifest_finalized) {
+    if (state_->kind != StorageOperationKind::create_checkpoint ||
+        state_->cleaned || state_->manifest_finalized) {
       return std::unexpected(logical_error(
-          StableErrorCode::conflict, "chunks cannot be published after "
-                                     "operation cleanup or manifest commit"));
+          StableErrorCode::conflict,
+          "chunks can be published only by an active create operation before "
+          "manifest commit"));
     }
     if (bytes.empty() || bytes.size() > ManifestLimits::chunk_bytes) {
       return std::unexpected(
@@ -995,10 +1052,12 @@ public:
   publish_manifest(const CheckpointId &checkpoint_id,
                    std::span<const std::byte> manifest_bytes) override {
     std::scoped_lock lock{state_->mutex};
-    if (state_->cleaned || state_->manifest_finalized) {
+    if (state_->kind != StorageOperationKind::create_checkpoint ||
+        state_->cleaned || state_->manifest_finalized) {
       return std::unexpected(logical_error(
           StableErrorCode::conflict,
-          "manifest publication is final for a storage operation"));
+          "manifest publication is final and requires an active create "
+          "operation"));
     }
     auto manifest = decode_manifest_v1(manifest_bytes);
     if (!manifest) {
@@ -1279,9 +1338,30 @@ FilesystemStorage::begin_operation(const ContainerId &container_id,
     return std::unexpected(result.error());
   }
 
+  auto operation_status =
+      implementation_->context_->operations->status(operation_directory->get());
+  while (!operation_status && operation_status.error() == EINTR) {
+    operation_status = implementation_->context_->operations->status(
+        operation_directory->get());
+  }
+  if (!operation_status || operation_status->type != FileType::directory) {
+    static_cast<void>(
+        implementation_->context_->operations->unlock(lock_fd->get()));
+    return std::unexpected(
+        !operation_status
+            ? filesystem_error("inspect operation staging directory",
+                               operation_status.error())
+            : logical_error(StableErrorCode::storage_error,
+                            "operation staging object is not a directory"));
+  }
+
   auto state = std::make_shared<StorageOperationData>(implementation_->context_,
-                                                      container_id);
+                                                      container_id, kind);
   state->operation_key = *operation_key;
+  state->staging_identity = StorageDirectoryIdentity{
+      .device = operation_status->device,
+      .inode = operation_status->inode,
+  };
   state->staging_path = implementation_->context_->root / "containers" /
                         directories->key / "staging" / *operation_key;
   state->lock_fd = std::move(*lock_fd);

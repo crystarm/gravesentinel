@@ -193,6 +193,7 @@ enum class StableErrorCode : std::uint8_t {
   incompatible_runtime,
   restore_failed,
   cold_start_failed,
+  deadline_exceeded,
   unavailable,
   internal,
 };

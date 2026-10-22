@@ -3,12 +3,21 @@
 #include <array>
 #include <cstdint>
 #include <string_view>
+#include <unordered_set>
 
 namespace gravesentinel::ccm {
 namespace {
 
 constexpr std::size_t kMaximumRegistrations = 4;
 constexpr std::size_t kMvpCpuCount = 8;
+
+constexpr std::size_t kMaximumColdStartImageBytes = 2048;
+constexpr std::size_t kMaximumColdStartArgvEntries = 256;
+constexpr std::size_t kMaximumColdStartArgumentBytes = 4096;
+constexpr std::size_t kMaximumColdStartEnvironmentEntries = 256;
+constexpr std::size_t kMaximumColdStartEnvironmentNameBytes = 256;
+constexpr std::size_t kMaximumColdStartEnvironmentValueBytes = 4096;
+constexpr std::size_t kMaximumColdStartTotalBytes = 64U * 1024U;
 
 constexpr std::array<std::array<std::uint32_t, 2>, kMaximumRegistrations>
     kStandardCpuPairs{{{0, 1}, {2, 3}, {4, 5}, {6, 7}}};
@@ -25,6 +34,36 @@ constexpr std::array<std::array<std::uint32_t, 2>, kMaximumRegistrations>
 
 [[nodiscard]] bool is_nonempty_without_nul(std::string_view value) noexcept {
   return !value.empty() && value.find('\0') == std::string_view::npos;
+}
+
+[[nodiscard]] bool is_ascii_letter(char value) noexcept {
+  return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+}
+
+[[nodiscard]] bool is_ascii_digit(char value) noexcept {
+  return value >= '0' && value <= '9';
+}
+
+[[nodiscard]] bool is_posix_environment_name(std::string_view name) noexcept {
+  if (name.empty() || (!is_ascii_letter(name.front()) && name.front() != '_')) {
+    return false;
+  }
+
+  for (const char value : name.substr(1)) {
+    if (!is_ascii_letter(value) && !is_ascii_digit(value) && value != '_') {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] bool consume_cold_start_bytes(std::size_t &total,
+                                            std::size_t bytes) noexcept {
+  if (bytes > kMaximumColdStartTotalBytes - total) {
+    return false;
+  }
+  total += bytes;
+  return true;
 }
 
 } // namespace
@@ -66,12 +105,114 @@ validate_container_registration(const ContainerRegistration &registration) {
     return result;
   }
 
-  if (registration.cold_start.has_value() &&
-      !is_nonempty_without_nul(registration.cold_start->image_reference)) {
-    return std::unexpected(make_error(
-        ValidationErrorCode::invalid_cold_start_spec,
-        "cold_start.image_reference",
-        "cold-start image reference must be nonempty and contain no NUL"));
+  if (registration.cold_start.has_value()) {
+    const auto &cold_start = *registration.cold_start;
+    if (!is_nonempty_without_nul(cold_start.image_reference)) {
+      return std::unexpected(make_error(
+          ValidationErrorCode::invalid_cold_start_spec,
+          "cold_start.image_reference",
+          "cold-start image reference must be nonempty and contain no NUL"));
+    }
+    if (cold_start.image_reference.size() > kMaximumColdStartImageBytes) {
+      return std::unexpected(
+          make_error(ValidationErrorCode::invalid_cold_start_spec,
+                     "cold_start.image_reference",
+                     "cold-start image reference exceeds the 2048-byte limit"));
+    }
+    if (cold_start.argv.size() > kMaximumColdStartArgvEntries) {
+      return std::unexpected(make_error(
+          ValidationErrorCode::invalid_cold_start_spec, "cold_start.argv",
+          "cold-start argv exceeds the 256-entry limit"));
+    }
+    if (cold_start.environment.size() > kMaximumColdStartEnvironmentEntries) {
+      return std::unexpected(
+          make_error(ValidationErrorCode::invalid_cold_start_spec,
+                     "cold_start.environment",
+                     "cold-start environment exceeds the 256-entry limit"));
+    }
+
+    std::size_t total_bytes = 0;
+    if (!consume_cold_start_bytes(total_bytes,
+                                  cold_start.image_reference.size())) {
+      return std::unexpected(
+          make_error(ValidationErrorCode::invalid_cold_start_spec, "cold_start",
+                     "cold-start strings exceed the 65536-byte total limit"));
+    }
+
+    for (const auto &argument : cold_start.argv) {
+      if (argument.find('\0') != std::string::npos) {
+        return std::unexpected(make_error(
+            ValidationErrorCode::invalid_cold_start_spec, "cold_start.argv",
+            "cold-start argv entries must not contain NUL"));
+      }
+      if (argument.size() > kMaximumColdStartArgumentBytes) {
+        return std::unexpected(make_error(
+            ValidationErrorCode::invalid_cold_start_spec, "cold_start.argv",
+            "a cold-start argv entry exceeds the 4096-byte limit"));
+      }
+      if (!consume_cold_start_bytes(total_bytes, argument.size())) {
+        return std::unexpected(make_error(
+            ValidationErrorCode::invalid_cold_start_spec, "cold_start",
+            "cold-start strings exceed the 65536-byte total limit"));
+      }
+    }
+
+    std::unordered_set<std::string_view> environment_names;
+    environment_names.reserve(cold_start.environment.size());
+    for (const auto &variable : cold_start.environment) {
+      if (variable.name.size() > kMaximumColdStartEnvironmentNameBytes) {
+        return std::unexpected(make_error(
+            ValidationErrorCode::invalid_cold_start_spec,
+            "cold_start.environment.name",
+            "a cold-start environment name exceeds the 256-byte limit"));
+      }
+      if (variable.name.find('\0') != std::string::npos ||
+          !is_posix_environment_name(variable.name)) {
+        return std::unexpected(
+            make_error(ValidationErrorCode::invalid_cold_start_spec,
+                       "cold_start.environment.name",
+                       "cold-start environment names must match "
+                       "[A-Za-z_][A-Za-z0-9_]* and contain no NUL"));
+      }
+      if (!environment_names.insert(variable.name).second) {
+        return std::unexpected(
+            make_error(ValidationErrorCode::invalid_cold_start_spec,
+                       "cold_start.environment.name",
+                       "cold-start environment names must be unique"));
+      }
+      if (variable.value.find('\0') != std::string::npos) {
+        return std::unexpected(
+            make_error(ValidationErrorCode::invalid_cold_start_spec,
+                       "cold_start.environment.value",
+                       "cold-start environment values must not contain NUL"));
+      }
+      if (variable.value.size() > kMaximumColdStartEnvironmentValueBytes) {
+        return std::unexpected(make_error(
+            ValidationErrorCode::invalid_cold_start_spec,
+            "cold_start.environment.value",
+            "a cold-start environment value exceeds the 4096-byte limit"));
+      }
+      if (!consume_cold_start_bytes(total_bytes, variable.name.size()) ||
+          !consume_cold_start_bytes(total_bytes, variable.value.size())) {
+        return std::unexpected(make_error(
+            ValidationErrorCode::invalid_cold_start_spec, "cold_start",
+            "cold-start strings exceed the 65536-byte total limit"));
+      }
+    }
+
+    if (!cold_start.mounts.empty()) {
+      return std::unexpected(make_error(
+          ValidationErrorCode::invalid_cold_start_spec, "cold_start.mounts",
+          "cold-start mounts are unsupported by "
+          "podman-criu-rootful-v1"));
+    }
+    if (!cold_start.runtime_options.empty()) {
+      return std::unexpected(
+          make_error(ValidationErrorCode::invalid_cold_start_spec,
+                     "cold_start.runtime_options",
+                     "cold-start runtime options are unsupported by "
+                     "podman-criu-rootful-v1"));
+    }
   }
 
   if (registration.runtime_fingerprint.has_value()) {

@@ -179,6 +179,11 @@ public:
   }
 
   [[nodiscard]] FileOperationResult<void>
+  set_permissions(int fd, std::uint32_t permissions) override {
+    return delegate_->set_permissions(fd, permissions);
+  }
+
+  [[nodiscard]] FileOperationResult<void>
   random_bytes(std::span<std::byte> buffer) override {
     return delegate_->random_bytes(buffer);
   }
@@ -223,12 +228,12 @@ public:
   }
 
   [[nodiscard]] FileOperationResult<std::vector<std::string>>
-  list_directory(int directory_fd) override {
+  list_directory(int directory_fd, std::size_t maximum_entries) override {
     if (const auto action = take(FaultPoint::list_directory);
         action.has_value() && action->error != 0) {
       return std::unexpected(action->error);
     }
-    return delegate_->list_directory(directory_fd);
+    return delegate_->list_directory(directory_fd, maximum_entries);
   }
 
   [[nodiscard]] FileOperationResult<bool> try_lock_exclusive(int fd) override {

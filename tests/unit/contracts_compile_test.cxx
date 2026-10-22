@@ -24,6 +24,7 @@ static_assert(std::is_abstract_v<IClock>);
 static_assert(std::is_abstract_v<IHasher>);
 static_assert(std::is_abstract_v<IIdGenerator>);
 static_assert(std::is_abstract_v<ILogger>);
+static_assert(std::is_abstract_v<IThreadAffinityBinding>);
 static_assert(std::is_abstract_v<IAffinityController>);
 static_assert(std::is_abstract_v<IProcessRunner>);
 static_assert(std::is_abstract_v<ICheckpointService>);
@@ -33,6 +34,9 @@ static_assert(std::has_virtual_destructor_v<IStorage>);
 static_assert(std::has_virtual_destructor_v<IStorageOperation>);
 static_assert(std::has_virtual_destructor_v<IStoragePin>);
 static_assert(std::has_virtual_destructor_v<IPodmanAdapter>);
+static_assert(std::has_virtual_destructor_v<IThreadAffinityBinding>);
+static_assert(std::has_virtual_destructor_v<IAffinityController>);
+static_assert(std::has_virtual_destructor_v<IProcessRunner>);
 static_assert(std::has_virtual_destructor_v<ICheckpointService>);
 static_assert(std::has_virtual_destructor_v<IHypervisorClient>);
 
@@ -44,6 +48,7 @@ TEST(ContractTest, InternalErrorsRemainStructured) {
       .retryable = true,
       .correlation_id = request_id,
       .storage_side_effect = StorageSideEffect::publication_may_be_visible,
+      .runtime_side_effect = RuntimeSideEffect::none,
   });
 
   ASSERT_FALSE(result);

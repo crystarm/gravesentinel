@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <linux/openat2.h>
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
@@ -76,12 +77,22 @@ class PosixFileOperations final : public IFileOperations {
 public:
   [[nodiscard]] FileOperationResult<int>
   open_root_directory(const std::filesystem::path &path) override {
-    const int fd =
-        ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
+#ifdef SYS_openat2
+    const struct open_how how{
+        .flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        .mode = 0,
+        .resolve = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+    };
+    const auto result =
+        ::syscall(SYS_openat2, AT_FDCWD, path.c_str(), &how, sizeof(how));
+    if (result < 0) {
       return std::unexpected(errno);
     }
-    return fd;
+    return static_cast<int>(result);
+#else
+    static_cast<void>(path);
+    return std::unexpected(EOPNOTSUPP);
+#endif
   }
 
   [[nodiscard]] FileOperationResult<int>
@@ -137,7 +148,10 @@ public:
     if (::fstat(fd, &attributes) != 0) {
       return std::unexpected(errno);
     }
-    if (attributes.st_size < 0) {
+    if (attributes.st_size < 0 || attributes.st_mtim.tv_nsec < 0 ||
+        attributes.st_mtim.tv_nsec > 999999999L ||
+        attributes.st_ctim.tv_nsec < 0 ||
+        attributes.st_ctim.tv_nsec > 999999999L) {
       return std::unexpected(EIO);
     }
 
@@ -147,9 +161,40 @@ public:
     } else if (S_ISDIR(attributes.st_mode)) {
       type = FileType::directory;
     }
+
+    std::optional<std::uint64_t> mount_id;
+#ifdef STATX_MNT_ID
+    struct statx extended_attributes{};
+    if (::statx(fd, "", AT_EMPTY_PATH | AT_NO_AUTOMOUNT, STATX_MNT_ID,
+                &extended_attributes) == 0) {
+      if ((extended_attributes.stx_mask & STATX_MNT_ID) != 0U) {
+        mount_id = extended_attributes.stx_mnt_id;
+      }
+    } else if (errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP) {
+      return std::unexpected(errno);
+    }
+#endif
+
     return FileStatus{
         .type = type,
         .size = static_cast<std::uint64_t>(attributes.st_size),
+        .mode = static_cast<std::uint32_t>(attributes.st_mode),
+        .device = static_cast<std::uint64_t>(attributes.st_dev),
+        .inode = static_cast<std::uint64_t>(attributes.st_ino),
+        .link_count = static_cast<std::uint64_t>(attributes.st_nlink),
+        .modification_time =
+            FileTimestamp{
+                .seconds = static_cast<std::int64_t>(attributes.st_mtim.tv_sec),
+                .nanoseconds =
+                    static_cast<std::uint32_t>(attributes.st_mtim.tv_nsec),
+            },
+        .status_change_time =
+            FileTimestamp{
+                .seconds = static_cast<std::int64_t>(attributes.st_ctim.tv_sec),
+                .nanoseconds =
+                    static_cast<std::uint32_t>(attributes.st_ctim.tv_nsec),
+            },
+        .mount_id = mount_id,
     };
   }
 
@@ -169,6 +214,14 @@ public:
       return std::unexpected(errno);
     }
     return static_cast<std::size_t>(bytes_written);
+  }
+
+  [[nodiscard]] FileOperationResult<void>
+  set_permissions(int fd, std::uint32_t permissions) override {
+    if (::fchmod(fd, static_cast<mode_t>(permissions)) != 0) {
+      return std::unexpected(errno);
+    }
+    return {};
   }
 
   [[nodiscard]] FileOperationResult<void>
@@ -249,7 +302,7 @@ public:
   }
 
   [[nodiscard]] FileOperationResult<std::vector<std::string>>
-  list_directory(int directory_fd) override {
+  list_directory(int directory_fd, std::size_t maximum_entries) override {
     const int listing_fd =
         ::openat(directory_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (listing_fd < 0) {
@@ -268,6 +321,10 @@ public:
     while (const auto *entry = ::readdir(raw_directory)) {
       const std::string_view name{entry->d_name};
       if (name != "." && name != "..") {
+        if (entries.size() >= maximum_entries) {
+          static_cast<void>(::closedir(raw_directory));
+          return std::unexpected(EOVERFLOW);
+        }
         entries.emplace_back(name);
       }
       errno = 0;

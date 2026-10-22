@@ -14,12 +14,18 @@ enum class StorageSideEffect : std::uint8_t {
   publication_may_be_visible,
 };
 
+enum class RuntimeSideEffect : std::uint8_t {
+  none,
+  incarnation_may_exist,
+};
+
 struct CheckpointErrorDetail {
   StableErrorCode code;
   std::string diagnostic;
   bool retryable{false};
   std::optional<RequestId> correlation_id;
   StorageSideEffect storage_side_effect{StorageSideEffect::none};
+  RuntimeSideEffect runtime_side_effect{RuntimeSideEffect::none};
 
   bool operator==(const CheckpointErrorDetail &) const = default;
 };

@@ -5,6 +5,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,9 +21,25 @@ enum class FileType : std::uint8_t {
   other,
 };
 
+struct FileTimestamp {
+  std::int64_t seconds;
+  std::uint32_t nanoseconds;
+
+  bool operator==(const FileTimestamp &) const = default;
+};
+
 struct FileStatus {
   FileType type;
   std::uint64_t size;
+  std::uint32_t mode;
+  std::uint64_t device;
+  std::uint64_t inode;
+  std::uint64_t link_count;
+  FileTimestamp modification_time;
+  FileTimestamp status_change_time;
+  std::optional<std::uint64_t> mount_id;
+
+  bool operator==(const FileStatus &) const = default;
 };
 
 class IFileOperations {
@@ -49,6 +66,8 @@ public:
   [[nodiscard]] virtual FileOperationResult<std::size_t>
   write(int fd, std::span<const std::byte> buffer) = 0;
   [[nodiscard]] virtual FileOperationResult<void>
+  set_permissions(int fd, std::uint32_t permissions) = 0;
+  [[nodiscard]] virtual FileOperationResult<void>
   random_bytes(std::span<std::byte> buffer) = 0;
   [[nodiscard]] virtual FileOperationResult<void> sync_file(int fd) = 0;
   [[nodiscard]] virtual FileOperationResult<void> sync_directory(int fd) = 0;
@@ -61,7 +80,7 @@ public:
   [[nodiscard]] virtual FileOperationResult<void>
   remove_directory_at(int parent_fd, std::string_view name) = 0;
   [[nodiscard]] virtual FileOperationResult<std::vector<std::string>>
-  list_directory(int directory_fd) = 0;
+  list_directory(int directory_fd, std::size_t maximum_entries) = 0;
   [[nodiscard]] virtual FileOperationResult<bool>
   try_lock_exclusive(int fd) = 0;
   [[nodiscard]] virtual FileOperationResult<void> unlock(int fd) = 0;

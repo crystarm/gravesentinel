@@ -16,10 +16,17 @@ profile; the usual MVP form is one regular archive artifact.
 
 ## Ingest contract
 
-`SnapshotChunker` is bound to an `IStorageOperation` of kind
-`create_checkpoint`. The operation supplies the `ContainerId`, preventing reads
-from one container namespace and publication into another. `ingest()` returns an
-ordered `std::vector<ManifestArtifactV1>` and never publishes a manifest.
+`ISnapshotChunker` is the orchestration seam used for fault injection.
+`SnapshotChunker` implements it and retains only its `IHasher` and file-operations
+dependencies. Each `ingest(IStorageOperation&, snapshot_root)` call receives an
+operation of kind `create_checkpoint`; the same chunker instance can therefore be
+used across operations without retaining operation state. The operation supplies
+the `ContainerId`, preventing reads from one container namespace and publication
+into another. `ingest()` returns an ordered
+`std::vector<ManifestArtifactV1>` and never publishes a manifest. When the source
+is the operation's dedicated `runtime-artifact` path, its opened device/inode must
+match the identity captured by storage; replacing that directory between capture
+and ingest fails before any source bytes are accepted.
 
 The producer must keep the source tree immutable for the entire call. Descriptor
 and metadata checks detect ordinary contract violations, but they are not a
@@ -56,11 +63,14 @@ orphan publication.
 
 ## Deduplication and immutable chunks
 
-For each source block, the chunker computes production BLAKE3-256 and calls
-`IStorageOperation::read_chunk`. Read and publication therefore use one
-operation-bound backend, namespace, and per-container lock capability; a caller
-cannot accidentally read from one storage root and publish to another. An existing chunk
-is reusable only when all of these match the source block:
+For each source block, the chunker requests a BLAKE3-256 digest from `IHasher`
+and calls `IStorageOperation::read_chunk`. Production `Blake3Hasher` completes
+this fallible contract with a successful result and remains `noexcept`. Any
+injected hasher error is returned unchanged, and no publication follows that
+failure. Read and publication therefore use one call-bound backend,
+namespace, and per-container lock capability; a caller cannot accidentally read
+from one storage root and publish to another. An existing chunk is reusable only
+when all of these match the source block:
 
 - exact byte size;
 - BLAKE3 digest;
@@ -93,8 +103,10 @@ created relative to checked directory descriptors; unexpected existing entries,
 symlinks, special files, hardlinks, and mount crossings are rejected.
 
 Every referenced chunk is read in the operation's container namespace. Its exact
-manifest size and BLAKE3 are checked before any of its bytes are written. Output
-handles partial writes and `EINTR`; each completed file is checked for exact size,
+manifest size and BLAKE3 are checked before any of its bytes are written. A
+hasher failure is returned unchanged, and the partial current file is removed by
+the same failure path used for other validation errors. Output handles partial
+writes and `EINTR`; each completed file is checked for exact size,
 regular-file type, single link, expected mode, and mount containment, then
 `fsync`ed. A partial current file is unlinked on failure. Before return, staging
 and `snapshot` are rebound by pathname and must still identify the checked
@@ -113,6 +125,7 @@ the whole tree at 4096 directories including the root and 256 path components.
 
 Errors use `CheckpointResult<T>`. Unsafe or changing source trees report
 `capture_failed`; malformed stored layouts and missing/hash-mismatched chunks
-report `corrupted_snapshot`; permission, capacity, storage, conflict, and
-availability failures retain their stable internal codes. Diagnostics contain
+report `corrupted_snapshot`; injected hasher errors are propagated without
+remapping; permission, capacity, storage, conflict, and availability failures
+retain their stable internal codes. Diagnostics contain
 phases and safe relative context, never artifact payload or cold-start secrets.

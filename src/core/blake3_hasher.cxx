@@ -4,7 +4,8 @@
 
 namespace gravesentinel::ccm {
 
-ChunkHash Blake3Hasher::hash(std::span<const std::byte> bytes) const noexcept {
+CheckpointResult<ChunkHash>
+Blake3Hasher::hash(std::span<const std::byte> bytes) const noexcept {
   return blake3_hash(bytes);
 }
 

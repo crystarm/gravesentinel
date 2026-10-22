@@ -612,17 +612,29 @@ private:
   [[nodiscard]] CheckpointResult<void>
   store_chunk(std::span<const std::byte> bytes,
               std::vector<ManifestChunkV1> &chunks) {
-    const auto hash = hasher_.hash(bytes);
-    auto existing = operation_.read_chunk(hash);
+    auto hash = hasher_.hash(bytes);
+    if (!hash) {
+      return std::unexpected(hash.error());
+    }
+
+    auto existing = operation_.read_chunk(*hash);
     if (existing) {
-      if (existing->size() != bytes.size() || hasher_.hash(*existing) != hash ||
-          !std::ranges::equal(*existing, bytes)) {
+      if (existing->size() != bytes.size()) {
+        return std::unexpected(logical_error(
+            StableErrorCode::corrupted_snapshot,
+            "existing immutable chunk failed size, hash, or byte validation"));
+      }
+      auto existing_hash = hasher_.hash(*existing);
+      if (!existing_hash) {
+        return std::unexpected(existing_hash.error());
+      }
+      if (*existing_hash != *hash || !std::ranges::equal(*existing, bytes)) {
         return std::unexpected(logical_error(
             StableErrorCode::corrupted_snapshot,
             "existing immutable chunk failed size, hash, or byte validation"));
       }
     } else if (existing.error().code == StableErrorCode::not_found) {
-      if (auto published = operation_.publish_chunk(hash, bytes); !published) {
+      if (auto published = operation_.publish_chunk(*hash, bytes); !published) {
         return published;
       }
     } else if (existing.error().code == StableErrorCode::resource_exhausted) {
@@ -634,7 +646,7 @@ private:
     }
 
     chunks.push_back(ManifestChunkV1{
-        .hash = hash,
+        .hash = *hash,
         .size = static_cast<std::uint64_t>(bytes.size()),
     });
     return {};
@@ -914,7 +926,16 @@ private:
         if (!bytes) {
           return std::unexpected(corrupted_chunk_error(bytes.error()));
         }
-        if (bytes->size() != chunk.size || hasher_.hash(*bytes) != chunk.hash) {
+        if (bytes->size() != chunk.size) {
+          return std::unexpected(logical_error(
+              StableErrorCode::corrupted_snapshot,
+              "stored chunk failed manifest size or BLAKE3 validation"));
+        }
+        auto hash = hasher_.hash(*bytes);
+        if (!hash) {
+          return std::unexpected(hash.error());
+        }
+        if (*hash != chunk.hash) {
           return std::unexpected(logical_error(
               StableErrorCode::corrupted_snapshot,
               "stored chunk failed manifest size or BLAKE3 validation"));
@@ -982,19 +1003,17 @@ private:
 
 } // namespace
 
-SnapshotChunker::SnapshotChunker(IStorageOperation &operation,
-                                 const IHasher &hasher)
-    : SnapshotChunker(operation, hasher, make_posix_file_operations()) {}
+SnapshotChunker::SnapshotChunker(const IHasher &hasher)
+    : SnapshotChunker(hasher, make_posix_file_operations()) {}
 
 SnapshotChunker::SnapshotChunker(
-    IStorageOperation &operation, const IHasher &hasher,
-    std::shared_ptr<IFileOperations> file_operations)
-    : operation_(operation), hasher_(hasher),
-      file_operations_(std::move(file_operations)) {}
+    const IHasher &hasher, std::shared_ptr<IFileOperations> file_operations)
+    : hasher_(hasher), file_operations_(std::move(file_operations)) {}
 
 CheckpointResult<std::vector<ManifestArtifactV1>>
-SnapshotChunker::ingest(const std::filesystem::path &snapshot_root) {
-  if (operation_.kind() != StorageOperationKind::create_checkpoint) {
+SnapshotChunker::ingest(IStorageOperation &operation,
+                        const std::filesystem::path &snapshot_root) {
+  if (operation.kind() != StorageOperationKind::create_checkpoint) {
     return std::unexpected(logical_error(
         StableErrorCode::conflict,
         "snapshot ingest requires a create-checkpoint storage operation"));
@@ -1027,12 +1046,23 @@ SnapshotChunker::ingest(const std::filesystem::path &snapshot_root) {
     return std::unexpected(logical_error(StableErrorCode::capture_failed,
                                          "snapshot root is not a directory"));
   }
+  if (snapshot_root.lexically_normal() ==
+      operation.runtime_artifact_directory().lexically_normal()) {
+    const auto expected_identity =
+        operation.runtime_artifact_directory_identity();
+    if (root_status->device != expected_identity.device ||
+        root_status->inode != expected_identity.inode) {
+      return std::unexpected(logical_error(
+          StableErrorCode::capture_failed,
+          "runtime artifact directory identity changed before ingest", true));
+    }
+  }
   auto mount_id = required_mount_id(*root_status, "snapshot root");
   if (!mount_id) {
     return std::unexpected(mount_id.error());
   }
 
-  SnapshotIngestor ingestor{operation_, hasher_, file_operations_, *mount_id};
+  SnapshotIngestor ingestor{operation, hasher_, file_operations_, *mount_id};
   auto artifacts = ingestor.run(root->get(), *root_status);
   if (!artifacts) {
     return std::unexpected(artifacts.error());

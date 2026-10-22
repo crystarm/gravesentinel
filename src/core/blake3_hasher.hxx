@@ -9,7 +9,7 @@ namespace gravesentinel::ccm {
 
 class Blake3Hasher final : public IHasher {
 public:
-  [[nodiscard]] ChunkHash
+  [[nodiscard]] CheckpointResult<ChunkHash>
   hash(std::span<const std::byte> bytes) const noexcept override;
 };
 

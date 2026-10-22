@@ -485,6 +485,63 @@ TEST(FilesystemStorageTest, RetriesInterruptedFileAndDirectoryFsync) {
   ASSERT_TRUE((*second)->publish_chunk(test_hash(std::byte{0x43}), chunk));
 }
 
+TEST(FilesystemStorageTest,
+     CreatesDedicatedEmptyRuntimeArtifactDirectoryWithStableIdentity) {
+  TemporaryDirectory root;
+  auto storage = open_storage(root.path());
+  auto operation = storage->begin_operation(
+      container_id(), operation_id(1), StorageOperationKind::create_checkpoint);
+  ASSERT_TRUE(operation);
+
+  const auto staging_path = (*operation)->staging_directory();
+  const auto runtime_artifact_path = (*operation)->runtime_artifact_directory();
+  EXPECT_EQ(runtime_artifact_path, staging_path / "runtime-artifact");
+  ASSERT_TRUE(std::filesystem::is_directory(runtime_artifact_path));
+  EXPECT_TRUE(std::filesystem::is_empty(runtime_artifact_path));
+  EXPECT_TRUE(std::filesystem::is_regular_file(staging_path / "state"));
+  EXPECT_FALSE(std::filesystem::exists(runtime_artifact_path / "state"));
+  EXPECT_NE((*operation)->runtime_artifact_directory_identity(),
+            (*operation)->staging_directory_identity());
+
+  struct stat status{};
+  ASSERT_EQ(::stat(runtime_artifact_path.c_str(), &status), 0);
+  EXPECT_EQ((*operation)->runtime_artifact_directory_identity().device,
+            static_cast<std::uint64_t>(status.st_dev));
+  EXPECT_EQ((*operation)->runtime_artifact_directory_identity().inode,
+            static_cast<std::uint64_t>(status.st_ino));
+
+  ASSERT_TRUE((*operation)->cleanup());
+  EXPECT_FALSE(std::filesystem::exists(runtime_artifact_path));
+  EXPECT_FALSE(std::filesystem::exists(staging_path));
+}
+
+TEST(FilesystemStorageTest,
+     FailedOperationInitializationRemovesNewStagingBestEffort) {
+  TemporaryDirectory root;
+  auto injected = std::make_shared<FaultInjectingFileOperations>(
+      make_posix_file_operations());
+  auto storage = open_storage(root.path(), injected);
+  const auto container = container_id();
+
+  auto initial = storage->begin_operation(
+      container, operation_id(1), StorageOperationKind::create_checkpoint);
+  ASSERT_TRUE(initial);
+  const auto staging_parent = (*initial)->staging_directory().parent_path();
+  ASSERT_TRUE((*initial)->cleanup());
+  initial->reset();
+
+  injected->arm(FaultPoint::create_file, EIO);
+  const auto failed = storage->begin_operation(
+      container, operation_id(2), StorageOperationKind::create_checkpoint);
+  ASSERT_FALSE(failed);
+  EXPECT_EQ(failed.error().code, StableErrorCode::storage_error);
+  EXPECT_TRUE(std::filesystem::is_empty(staging_parent));
+
+  const auto retry = storage->begin_operation(
+      container, operation_id(2), StorageOperationKind::create_checkpoint);
+  ASSERT_TRUE(retry);
+}
+
 TEST(FilesystemStorageTest, EnforcesExclusiveContainerLockAcrossInstances) {
   TemporaryDirectory root;
   auto first = open_storage(root.path());
@@ -500,6 +557,11 @@ TEST(FilesystemStorageTest, EnforcesExclusiveContainerLockAcrossInstances) {
   EXPECT_EQ(contended.error().code, StableErrorCode::conflict);
 
   ASSERT_TRUE((*first_operation)->cleanup());
+  const auto contended_after_cleanup = second->begin_operation(
+      container, operation_id(2), StorageOperationKind::restore);
+  ASSERT_FALSE(contended_after_cleanup);
+  EXPECT_EQ(contended_after_cleanup.error().code, StableErrorCode::conflict);
+
   first_operation->reset();
   const auto acquired = second->begin_operation(container, operation_id(2),
                                                 StorageOperationKind::restore);

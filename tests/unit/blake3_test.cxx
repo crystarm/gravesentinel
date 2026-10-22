@@ -16,6 +16,7 @@ static_assert(std::is_base_of_v<IHasher, Blake3Hasher>);
 static_assert(!std::is_abstract_v<Blake3Hasher>);
 static_assert(std::is_final_v<Blake3Hasher>);
 static_assert(noexcept(blake3_hash(std::span<const std::byte>{})));
+static_assert(noexcept(Blake3Hasher{}.hash(std::span<const std::byte>{})));
 
 [[nodiscard]] std::string to_hex(std::span<const std::byte> bytes) {
   constexpr std::array hex_digits{'0', '1', '2', '3', '4', '5', '6', '7',
@@ -76,8 +77,10 @@ TEST(Blake3HasherTest, IsDeterministicAndDelegatesToOneShotHash) {
   const auto first = interface.hash(input);
   const auto second = interface.hash(input);
 
-  EXPECT_EQ(first, second);
-  EXPECT_EQ(first, blake3_hash(input));
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(*first, *second);
+  EXPECT_EQ(*first, blake3_hash(input));
 }
 
 } // namespace

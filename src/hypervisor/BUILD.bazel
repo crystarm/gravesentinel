@@ -1,6 +1,43 @@
-load("//build_defs:cc.bzl", "gravesentinel_cc_binary")
+load(
+    "//build_defs:cc.bzl",
+    "gravesentinel_cc_binary",
+    "gravesentinel_cc_library",
+)
 
 package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_library(
+    name = "linux_runtime",
+    srcs = [
+        "linux_affinity_controller.cxx",
+        "posix_process_runner.cxx",
+    ],
+    hdrs = [
+        "linux_affinity_controller.hxx",
+        "posix_process_runner.hxx",
+    ],
+    deps = ["//src/core:ccm_core"],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/integration:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+gravesentinel_cc_library(
+    name = "podman_adapter",
+    srcs = ["podman_adapter.cxx"],
+    hdrs = ["podman_adapter.hxx"],
+    deps = [
+        "//src/core:ccm_core",
+        "@nlohmann_json//:json",
+    ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/integration:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
 
 gravesentinel_cc_binary(
     name = "gravesentinel_hypervisor",
@@ -11,6 +48,14 @@ gravesentinel_cc_binary(
 
 filegroup(
     name = "format_sources",
-    srcs = ["main.cxx"],
+    srcs = [
+        "linux_affinity_controller.cxx",
+        "linux_affinity_controller.hxx",
+        "main.cxx",
+        "podman_adapter.cxx",
+        "podman_adapter.hxx",
+        "posix_process_runner.cxx",
+        "posix_process_runner.hxx",
+    ],
     visibility = ["//scripts:__pkg__"],
 )

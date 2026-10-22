@@ -1,0 +1,24 @@
+load("//build_defs:cc.bzl", "gravesentinel_cc_library")
+
+package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_library(
+    name = "protocol",
+    srcs = ["types.cxx"],
+    hdrs = ["types.hpp"],
+    visibility = [
+        "//src/core:__pkg__",
+        "//src/hypervisor:__pkg__",
+        "//src/scheduler_client:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = [
+        "types.cxx",
+        "types.hpp",
+    ],
+    visibility = ["//scripts:__pkg__"],
+)

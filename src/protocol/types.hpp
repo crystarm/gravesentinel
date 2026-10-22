@@ -1,0 +1,211 @@
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace gravesentinel::ccm {
+
+enum class ValidationErrorCode : std::uint8_t {
+  empty_value,
+  embedded_nul,
+  invalid_interval,
+  invalid_keep_last,
+  invalid_cpu_pair,
+  duplicate_cpu_assignment,
+  too_many_registrations,
+  invalid_cold_start_spec,
+  invalid_runtime_fingerprint,
+};
+
+struct ValidationError {
+  ValidationErrorCode code;
+  std::string_view field;
+  std::string diagnostic;
+
+  bool operator==(const ValidationError &) const = default;
+};
+
+namespace detail {
+
+struct ContainerIdTag {
+  static constexpr std::string_view field_name = "container_id";
+};
+
+struct CheckpointIdTag {
+  static constexpr std::string_view field_name = "checkpoint_id";
+};
+
+struct RequestIdTag {
+  static constexpr std::string_view field_name = "request_id";
+};
+
+struct OperationIdTag {
+  static constexpr std::string_view field_name = "operation_id";
+};
+
+struct RuntimeContainerRefTag {
+  static constexpr std::string_view field_name = "runtime_container_ref";
+};
+
+} // namespace detail
+
+template <typename Tag> class BasicIdentifier final {
+public:
+  [[nodiscard]] static std::expected<BasicIdentifier, ValidationError>
+  create(std::string value) {
+    if (value.empty()) {
+      return std::unexpected(ValidationError{
+          .code = ValidationErrorCode::empty_value,
+          .field = Tag::field_name,
+          .diagnostic = "identifier must not be empty",
+      });
+    }
+    if (value.find('\0') != std::string::npos) {
+      return std::unexpected(ValidationError{
+          .code = ValidationErrorCode::embedded_nul,
+          .field = Tag::field_name,
+          .diagnostic = "identifier must not contain NUL bytes",
+      });
+    }
+    return BasicIdentifier(std::move(value));
+  }
+
+  [[nodiscard]] const std::string &value() const noexcept { return value_; }
+
+  auto operator<=>(const BasicIdentifier &) const = default;
+
+private:
+  explicit BasicIdentifier(std::string value) : value_(std::move(value)) {}
+
+  std::string value_;
+};
+
+using ContainerId = BasicIdentifier<detail::ContainerIdTag>;
+using CheckpointId = BasicIdentifier<detail::CheckpointIdTag>;
+using RequestId = BasicIdentifier<detail::RequestIdTag>;
+using OperationId = BasicIdentifier<detail::OperationIdTag>;
+using RuntimeContainerRef = BasicIdentifier<detail::RuntimeContainerRefTag>;
+
+class ChunkHash final {
+public:
+  static constexpr std::size_t digest_size = 32;
+  using Bytes = std::array<std::byte, digest_size>;
+
+  explicit constexpr ChunkHash(Bytes bytes) : bytes_(bytes) {}
+
+  [[nodiscard]] constexpr const Bytes &bytes() const noexcept { return bytes_; }
+
+  auto operator<=>(const ChunkHash &) const = default;
+
+private:
+  Bytes bytes_;
+};
+
+struct CheckpointConfig {
+  std::chrono::seconds interval{60};
+  std::size_t keep_last{3};
+  std::uint32_t container_cpu{};
+  std::uint32_t checkpoint_cpu{};
+
+  bool operator==(const CheckpointConfig &) const = default;
+};
+
+struct EnvironmentVariable {
+  std::string name;
+  std::string value;
+
+  bool operator==(const EnvironmentVariable &) const = default;
+};
+
+struct MountSpec {
+  std::string source;
+  std::string target;
+  bool read_only{true};
+
+  bool operator==(const MountSpec &) const = default;
+};
+
+struct ColdStartSpec {
+  std::string image_reference;
+  std::vector<std::string> argv;
+  std::vector<EnvironmentVariable> environment;
+  std::vector<MountSpec> mounts;
+  std::vector<std::string> runtime_options;
+
+  bool operator==(const ColdStartSpec &) const = default;
+};
+
+struct RuntimeFingerprint {
+  std::string runtime_name;
+  std::string runtime_version;
+  std::string architecture;
+
+  bool operator==(const RuntimeFingerprint &) const = default;
+};
+
+struct ContainerRegistration {
+  ContainerId container_id;
+  RuntimeContainerRef runtime_container;
+  CheckpointConfig checkpoint;
+  std::optional<ColdStartSpec> cold_start;
+  std::optional<RuntimeFingerprint> runtime_fingerprint;
+
+  bool operator==(const ContainerRegistration &) const = default;
+};
+
+enum class StableErrorCode : std::uint8_t {
+  invalid_argument,
+  not_found,
+  already_exists,
+  resource_exhausted,
+  conflict,
+  permission_denied,
+  capture_failed,
+  storage_error,
+  corrupted_snapshot,
+  incompatible_runtime,
+  restore_failed,
+  cold_start_failed,
+  unavailable,
+  internal,
+};
+
+enum class OperationState : std::uint8_t {
+  queued,
+  running,
+  succeeded,
+  failed,
+  indeterminate,
+};
+
+struct OperationStatus {
+  OperationId operation_id;
+  OperationState state;
+  std::optional<StableErrorCode> error;
+
+  bool operator==(const OperationStatus &) const = default;
+};
+
+[[nodiscard]] bool is_standard_cpu_pair(std::uint32_t container_cpu,
+                                        std::uint32_t checkpoint_cpu) noexcept;
+
+[[nodiscard]] std::expected<void, ValidationError>
+validate_checkpoint_config(const CheckpointConfig &config);
+
+[[nodiscard]] std::expected<void, ValidationError>
+validate_container_registration(const ContainerRegistration &registration);
+
+[[nodiscard]] std::expected<void, ValidationError>
+validate_cpu_assignments(std::span<const ContainerRegistration> registrations);
+
+} // namespace gravesentinel::ccm

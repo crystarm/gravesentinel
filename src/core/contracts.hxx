@@ -75,6 +75,10 @@ public:
   staging_directory() const noexcept = 0;
   [[nodiscard]] virtual StorageDirectoryIdentity
   staging_directory_identity() const noexcept = 0;
+  [[nodiscard]] virtual const std::filesystem::path &
+  runtime_artifact_directory() const noexcept = 0;
+  [[nodiscard]] virtual StorageDirectoryIdentity
+  runtime_artifact_directory_identity() const noexcept = 0;
   [[nodiscard]] virtual CheckpointResult<std::vector<std::byte>>
   read_chunk(const ChunkHash &hash) = 0;
   [[nodiscard]] virtual CheckpointResult<void>
@@ -157,7 +161,7 @@ class IHasher {
 public:
   virtual ~IHasher() = default;
 
-  [[nodiscard]] virtual ChunkHash
+  [[nodiscard]] virtual CheckpointResult<ChunkHash>
   hash(std::span<const std::byte> bytes) const = 0;
 };
 

@@ -12,17 +12,26 @@
 
 namespace gravesentinel::ccm {
 
-class SnapshotChunker final {
+class ISnapshotChunker {
 public:
-  SnapshotChunker(IStorageOperation &operation, const IHasher &hasher);
-  SnapshotChunker(IStorageOperation &operation, const IHasher &hasher,
+  virtual ~ISnapshotChunker() = default;
+
+  [[nodiscard]] virtual CheckpointResult<std::vector<ManifestArtifactV1>>
+  ingest(IStorageOperation &operation,
+         const std::filesystem::path &snapshot_root) = 0;
+};
+
+class SnapshotChunker final : public ISnapshotChunker {
+public:
+  explicit SnapshotChunker(const IHasher &hasher);
+  SnapshotChunker(const IHasher &hasher,
                   std::shared_ptr<IFileOperations> file_operations);
 
   [[nodiscard]] CheckpointResult<std::vector<ManifestArtifactV1>>
-  ingest(const std::filesystem::path &snapshot_root);
+  ingest(IStorageOperation &operation,
+         const std::filesystem::path &snapshot_root) override;
 
 private:
-  IStorageOperation &operation_;
   const IHasher &hasher_;
   std::shared_ptr<IFileOperations> file_operations_;
 };

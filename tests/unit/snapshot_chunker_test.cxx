@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,24 @@ namespace {
       .storage_side_effect = StorageSideEffect::none,
   };
 }
+
+class FaultingHasher final : public IHasher {
+public:
+  explicit FaultingHasher(CheckpointErrorDetail error)
+      : error_(std::move(error)) {}
+
+  [[nodiscard]] CheckpointResult<ChunkHash>
+  hash(std::span<const std::byte>) const override {
+    return std::unexpected(error_);
+  }
+
+private:
+  CheckpointErrorDetail error_;
+};
+
+static_assert(std::is_abstract_v<ISnapshotChunker>);
+static_assert(std::is_base_of_v<ISnapshotChunker, SnapshotChunker>);
+static_assert(!std::is_abstract_v<SnapshotChunker>);
 
 class TemporaryDirectory final {
 public:
@@ -169,6 +188,16 @@ public:
         .device = static_cast<std::uint64_t>(attributes.st_dev),
         .inode = static_cast<std::uint64_t>(attributes.st_ino),
     };
+  }
+
+  [[nodiscard]] const std::filesystem::path &
+  runtime_artifact_directory() const noexcept override {
+    return staging_directory_;
+  }
+
+  [[nodiscard]] StorageDirectoryIdentity
+  runtime_artifact_directory_identity() const noexcept override {
+    return staging_directory_identity();
   }
 
   [[nodiscard]] CheckpointResult<std::vector<std::byte>>
@@ -498,8 +527,8 @@ TEST(SnapshotChunkerTest, IngestsBoundariesAndReassemblesByteIdenticalModes) {
       storage, container_id(), StorageOperationKind::create_checkpoint,
       temporary.path() / "unused-create-staging"};
   Blake3Hasher hasher;
-  SnapshotChunker chunker{create_operation, hasher};
-  auto artifacts = chunker.ingest(source);
+  SnapshotChunker chunker{hasher};
+  auto artifacts = chunker.ingest(create_operation, source);
   ASSERT_TRUE(artifacts) << artifacts.error().diagnostic;
   ASSERT_EQ(artifacts->size(), 4U);
 
@@ -534,6 +563,29 @@ TEST(SnapshotChunkerTest, IngestsBoundariesAndReassemblesByteIdenticalModes) {
   EXPECT_EQ(file_permissions(*output / "z-empty"), 0400U);
 }
 
+TEST(SnapshotChunkerTest, PropagatesHasherFailureDuringIngest) {
+  TemporaryDirectory temporary;
+  const auto source = temporary.path() / "source";
+  ASSERT_TRUE(std::filesystem::create_directory(source));
+  write_bytes(source / "artifact", bytes(32U, 0x41U));
+
+  FakeStorage storage;
+  FakeStorageOperation operation{storage, container_id(),
+                                 StorageOperationKind::create_checkpoint,
+                                 temporary.path() / "unused"};
+  const auto hash_error =
+      test_error(StableErrorCode::unavailable, "injected ingest hash failure");
+  FaultingHasher hasher{hash_error};
+  SnapshotChunker chunker{hasher};
+  ISnapshotChunker &interface = chunker;
+
+  const auto result = interface.ingest(operation, source);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error(), hash_error);
+  EXPECT_EQ(storage.publication_count(), 0U);
+}
+
 TEST(SnapshotChunkerTest, DeduplicatesOnlyWithinAContainerNamespace) {
   TemporaryDirectory temporary;
   const auto source = temporary.path() / "source";
@@ -556,15 +608,15 @@ TEST(SnapshotChunkerTest, DeduplicatesOnlyWithinAContainerNamespace) {
   FakeStorageOperation first_operation{storage, first_container,
                                        StorageOperationKind::create_checkpoint,
                                        temporary.path() / "unused-1"};
-  SnapshotChunker first_chunker{first_operation, hasher};
-  auto first = first_chunker.ingest(source);
+  SnapshotChunker first_chunker{hasher};
+  auto first = first_chunker.ingest(first_operation, source);
   ASSERT_TRUE(first);
   ASSERT_EQ(first->front().chunks.size(), 2U);
   EXPECT_EQ(first->front().chunks[0].hash, first->front().chunks[1].hash);
   EXPECT_EQ(storage.publication_count(), 1U);
   EXPECT_EQ(storage.namespace_size(first_container), 1U);
 
-  auto repeated_ingest = first_chunker.ingest(source);
+  auto repeated_ingest = first_chunker.ingest(first_operation, source);
   ASSERT_TRUE(repeated_ingest);
   EXPECT_EQ(storage.publication_count(), 1U);
 
@@ -572,8 +624,7 @@ TEST(SnapshotChunkerTest, DeduplicatesOnlyWithinAContainerNamespace) {
   FakeStorageOperation second_operation{storage, second_container,
                                         StorageOperationKind::create_checkpoint,
                                         temporary.path() / "unused-2"};
-  SnapshotChunker second_chunker{second_operation, hasher};
-  auto second = second_chunker.ingest(source);
+  auto second = first_chunker.ingest(second_operation, source);
   ASSERT_TRUE(second);
   EXPECT_EQ(storage.publication_count(), 2U);
   EXPECT_EQ(storage.namespace_size(first_container), 1U);
@@ -593,14 +644,14 @@ TEST(SnapshotChunkerTest, RejectsCorruptedExistingChunkInsteadOfReusingIt) {
   FakeStorageOperation operation{storage, container,
                                  StorageOperationKind::create_checkpoint,
                                  temporary.path() / "unused"};
-  SnapshotChunker chunker{operation, hasher};
-  auto first = chunker.ingest(source);
+  SnapshotChunker chunker{hasher};
+  auto first = chunker.ingest(operation, source);
   ASSERT_TRUE(first);
   ASSERT_EQ(first->front().chunks.size(), 1U);
   const auto hash = first->front().chunks.front().hash;
   storage.corrupt(container, hash, bytes(contents.size(), 0x7FU));
 
-  const auto second = chunker.ingest(source);
+  const auto second = chunker.ingest(operation, source);
   ASSERT_FALSE(second);
   EXPECT_EQ(second.error().code, StableErrorCode::corrupted_snapshot);
   EXPECT_EQ(storage.publication_count(), 1U);
@@ -621,8 +672,8 @@ TEST(SnapshotChunkerTest, DetectsCorruptionBeforeReturningReassembledPath) {
   FakeStorageOperation create_operation{storage, container,
                                         StorageOperationKind::create_checkpoint,
                                         temporary.path() / "unused"};
-  SnapshotChunker chunker{create_operation, hasher};
-  auto artifacts = chunker.ingest(source);
+  SnapshotChunker chunker{hasher};
+  auto artifacts = chunker.ingest(create_operation, source);
   ASSERT_TRUE(artifacts);
   const auto hash = artifacts->front().chunks.front().hash;
   storage.corrupt(container, hash, bytes(contents.size(), 0x72U));
@@ -633,6 +684,38 @@ TEST(SnapshotChunkerTest, DetectsCorruptionBeforeReturningReassembledPath) {
   const auto result = reassembler.reassemble(*artifacts);
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, StableErrorCode::corrupted_snapshot);
+  EXPECT_FALSE(std::filesystem::exists(staging / "snapshot" / "artifact"));
+}
+
+TEST(SnapshotChunkerTest, PropagatesHasherFailureDuringReassembly) {
+  TemporaryDirectory temporary;
+  const auto source = temporary.path() / "source";
+  const auto staging = temporary.path() / "restore-staging";
+  ASSERT_TRUE(std::filesystem::create_directory(source));
+  ASSERT_TRUE(std::filesystem::create_directory(staging));
+  write_bytes(source / "artifact", bytes(64U, 0x73U));
+
+  FakeStorage storage;
+  Blake3Hasher production_hasher;
+  const auto container = container_id();
+  FakeStorageOperation create_operation{storage, container,
+                                        StorageOperationKind::create_checkpoint,
+                                        temporary.path() / "unused"};
+  SnapshotChunker chunker{production_hasher};
+  auto artifacts = chunker.ingest(create_operation, source);
+  ASSERT_TRUE(artifacts);
+
+  const auto hash_error = test_error(StableErrorCode::unavailable,
+                                     "injected reassembly hash failure");
+  FaultingHasher hasher{hash_error};
+  FakeStorageOperation restore_operation{
+      storage, container, StorageOperationKind::restore, staging};
+  SnapshotReassembler reassembler{restore_operation, hasher};
+
+  const auto result = reassembler.reassemble(*artifacts);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error(), hash_error);
   EXPECT_FALSE(std::filesystem::exists(staging / "snapshot" / "artifact"));
 }
 
@@ -655,8 +738,8 @@ TEST(SnapshotChunkerTest, RetriesInterruptedAndShortReadsAndWrites) {
       make_posix_file_operations());
   ingest_io->arm_reads(
       {IoAction{.error = EINTR}, IoAction{.maximum_transfer = 3U}});
-  SnapshotChunker chunker{create_operation, hasher, ingest_io};
-  auto artifacts = chunker.ingest(source);
+  SnapshotChunker chunker{hasher, ingest_io};
+  auto artifacts = chunker.ingest(create_operation, source);
   ASSERT_TRUE(artifacts) << artifacts.error().diagnostic;
 
   FakeStorageOperation restore_operation{
@@ -690,9 +773,9 @@ TEST(SnapshotChunkerTest, RejectsArtifactChangedWhileReading) {
     const std::vector<std::byte> suffix{std::byte{0xFF}};
     append_bytes(artifact, suffix);
   });
-  SnapshotChunker chunker{operation, hasher, file_operations};
+  SnapshotChunker chunker{hasher, file_operations};
 
-  const auto result = chunker.ingest(source);
+  const auto result = chunker.ingest(operation, source);
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, StableErrorCode::capture_failed);
 }
@@ -715,9 +798,9 @@ TEST(SnapshotChunkerTest, FinalPassDetectsChangeToAnEarlierArtifact) {
       make_posix_file_operations());
   file_operations->after_successful_reads(
       2U, [early] { ASSERT_EQ(::chmod(early.c_str(), 0601), 0); });
-  SnapshotChunker chunker{operation, hasher, file_operations};
+  SnapshotChunker chunker{hasher, file_operations};
 
-  const auto result = chunker.ingest(source);
+  const auto result = chunker.ingest(operation, source);
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, StableErrorCode::capture_failed);
 }
@@ -741,9 +824,9 @@ TEST(SnapshotChunkerTest, FinalPassDetectsLateExternalHardlink) {
   file_operations->after_successful_reads(2U, [early, external_link] {
     ASSERT_EQ(::link(early.c_str(), external_link.c_str()), 0);
   });
-  SnapshotChunker chunker{operation, hasher, file_operations};
+  SnapshotChunker chunker{hasher, file_operations};
 
-  const auto result = chunker.ingest(source);
+  const auto result = chunker.ingest(operation, source);
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, StableErrorCode::capture_failed);
 }
@@ -760,8 +843,8 @@ TEST(SnapshotChunkerTest, RejectsWrongStorageOperationKinds) {
   Blake3Hasher hasher;
   FakeStorageOperation restore_operation{
       storage, container_id(), StorageOperationKind::restore, staging};
-  SnapshotChunker chunker{restore_operation, hasher};
-  const auto ingest = chunker.ingest(source);
+  SnapshotChunker chunker{hasher};
+  const auto ingest = chunker.ingest(restore_operation, source);
   ASSERT_FALSE(ingest);
   EXPECT_EQ(ingest.error().code, StableErrorCode::conflict);
 
@@ -793,8 +876,8 @@ TEST(SnapshotChunkerTest, RoundTripsThroughFilesystemStorageOperation) {
       (*storage)->begin_operation(container, operation_id("create"),
                                   StorageOperationKind::create_checkpoint);
   ASSERT_TRUE(create_operation) << create_operation.error().diagnostic;
-  SnapshotChunker chunker{**create_operation, hasher};
-  auto artifacts = chunker.ingest(source);
+  SnapshotChunker chunker{hasher};
+  auto artifacts = chunker.ingest(**create_operation, source);
   ASSERT_TRUE(artifacts) << artifacts.error().diagnostic;
   ASSERT_TRUE((*create_operation)->cleanup());
   create_operation->reset();
@@ -807,6 +890,35 @@ TEST(SnapshotChunkerTest, RoundTripsThroughFilesystemStorageOperation) {
   ASSERT_TRUE(output) << output.error().diagnostic;
   EXPECT_EQ(read_bytes(*output / "artifact"), contents);
   EXPECT_EQ(file_permissions(*output / "artifact"), 0640U);
+}
+
+TEST(SnapshotChunkerTest, RejectsReplacedRuntimeArtifactDirectory) {
+  TemporaryDirectory temporary;
+  const auto storage_root = temporary.path() / "storage";
+  ASSERT_TRUE(std::filesystem::create_directory(storage_root));
+
+  auto storage = FilesystemStorage::open(storage_root);
+  ASSERT_TRUE(storage) << storage.error().diagnostic;
+  auto operation = (*storage)->begin_operation(
+      container_id(), operation_id("replaced-runtime-artifact"),
+      StorageOperationKind::create_checkpoint);
+  ASSERT_TRUE(operation) << operation.error().diagnostic;
+
+  const auto runtime_artifact = (*operation)->runtime_artifact_directory();
+  const auto original = runtime_artifact.string() + "-original";
+  std::filesystem::rename(runtime_artifact, original);
+  ASSERT_TRUE(std::filesystem::create_directory(runtime_artifact));
+  write_bytes(runtime_artifact / "replacement", bytes(8U, 0xA6U));
+
+  Blake3Hasher hasher;
+  SnapshotChunker chunker{hasher};
+  const auto result = chunker.ingest(**operation, runtime_artifact);
+
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code, StableErrorCode::capture_failed);
+  EXPECT_TRUE(result.error().retryable);
+  EXPECT_NE(result.error().diagnostic.find("identity changed"),
+            std::string::npos);
 }
 
 TEST(SnapshotChunkerTest, PosixDirectoryListingEnforcesCallerBound) {
@@ -840,8 +952,9 @@ TEST(SnapshotChunkerTest, RejectsSymlinkInSnapshotRootPath) {
   FakeStorageOperation operation{storage, container_id(),
                                  StorageOperationKind::create_checkpoint,
                                  temporary.path() / "unused"};
-  SnapshotChunker chunker{operation, hasher};
-  const auto result = chunker.ingest(temporary.path() / "linked" / "source");
+  SnapshotChunker chunker{hasher};
+  const auto result =
+      chunker.ingest(operation, temporary.path() / "linked" / "source");
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, StableErrorCode::capture_failed);
 }
@@ -859,8 +972,8 @@ TEST(SnapshotChunkerTest, RejectsSymlinkHardlinkAndFifoEntries) {
         FakeStorageOperation operation{storage, container_id(),
                                        StorageOperationKind::create_checkpoint,
                                        temporary.path() / "unused"};
-        SnapshotChunker chunker{operation, hasher};
-        const auto result = chunker.ingest(source);
+        SnapshotChunker chunker{hasher};
+        const auto result = chunker.ingest(operation, source);
         ASSERT_FALSE(result);
         EXPECT_EQ(result.error().code, StableErrorCode::capture_failed);
       };

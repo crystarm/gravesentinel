@@ -245,6 +245,28 @@ open_directory(const std::shared_ptr<IFileOperations> &operations,
   }
 }
 
+[[nodiscard]] CheckpointResult<StorageDirectoryIdentity>
+directory_identity(const std::shared_ptr<IFileOperations> &operations, int fd,
+                   std::string_view description) {
+  while (true) {
+    auto status = operations->status(fd);
+    if (status) {
+      if (status->type != FileType::directory) {
+        return std::unexpected(
+            logical_error(StableErrorCode::storage_error,
+                          std::string{description} + " is not a directory"));
+      }
+      return StorageDirectoryIdentity{
+          .device = status->device,
+          .inode = status->inode,
+      };
+    }
+    if (status.error() != EINTR) {
+      return std::unexpected(filesystem_error(description, status.error()));
+    }
+  }
+}
+
 [[nodiscard]] CheckpointResult<UniqueFileDescriptor>
 ensure_directory(const std::shared_ptr<IFileOperations> &operations,
                  int parent_fd, std::string_view name,
@@ -824,6 +846,26 @@ remove_tree_contents(const std::shared_ptr<IFileOperations> &operations,
   return sync_directory(operations, directory_fd, "sync staging cleanup");
 }
 
+void cleanup_failed_operation_initialization_best_effort(
+    const std::shared_ptr<IFileOperations> &operations, int staging_parent_fd,
+    std::string_view operation_key, UniqueFileDescriptor &operation_directory,
+    UniqueFileDescriptor &runtime_artifact_directory) {
+  runtime_artifact_directory.reset();
+  if (operation_directory.valid()) {
+    static_cast<void>(
+        remove_tree_contents(operations, operation_directory.get()));
+    operation_directory.reset();
+  }
+
+  auto removed =
+      operations->remove_directory_at(staging_parent_fd, operation_key);
+  if (removed) {
+    static_cast<void>(sync_directory(
+        operations, staging_parent_fd,
+        "sync staging parent after failed operation initialization"));
+  }
+}
+
 struct StorageOperationData {
   StorageOperationData(std::shared_ptr<StorageContext> storage_context,
                        ContainerId logical_container_id,
@@ -837,12 +879,15 @@ struct StorageOperationData {
   std::string operation_key;
   std::filesystem::path staging_path;
   StorageDirectoryIdentity staging_identity{};
+  std::filesystem::path runtime_artifact_path;
+  StorageDirectoryIdentity runtime_artifact_identity{};
   UniqueFileDescriptor lock_fd;
   UniqueFileDescriptor container_fd;
   UniqueFileDescriptor manifests_fd;
   UniqueFileDescriptor chunks_fd;
   UniqueFileDescriptor staging_parent_fd;
   UniqueFileDescriptor operation_fd;
+  UniqueFileDescriptor runtime_artifact_fd;
   std::mutex mutex;
   std::size_t pins{0};
   bool manifest_finalized{false};
@@ -860,6 +905,7 @@ cleanup_operation_locked(StorageOperationData &state) {
         StableErrorCode::conflict,
         "cannot clean a storage operation while manifest pins are active"));
   }
+  state.runtime_artifact_fd.reset();
   if (auto result = remove_tree_contents(state.context->operations,
                                          state.operation_fd.get());
       !result) {
@@ -951,6 +997,16 @@ public:
   [[nodiscard]] StorageDirectoryIdentity
   staging_directory_identity() const noexcept override {
     return state_->staging_identity;
+  }
+
+  [[nodiscard]] const std::filesystem::path &
+  runtime_artifact_directory() const noexcept override {
+    return state_->runtime_artifact_path;
+  }
+
+  [[nodiscard]] StorageDirectoryIdentity
+  runtime_artifact_directory_identity() const noexcept override {
+    return state_->runtime_artifact_identity;
   }
 
   [[nodiscard]] CheckpointResult<std::vector<std::byte>>
@@ -1308,21 +1364,75 @@ FilesystemStorage::begin_operation(const ContainerId &container_id,
         StableErrorCode::conflict, "operation_id refers to existing incomplete "
                                    "staging and cannot be resumed"));
   }
+
+  UniqueFileDescriptor operation_directory;
+  UniqueFileDescriptor runtime_artifact_directory;
+  const auto fail_initialization = [&](CheckpointErrorDetail error)
+      -> CheckpointResult<std::unique_ptr<IStorageOperation>> {
+    cleanup_failed_operation_initialization_best_effort(
+        implementation_->context_->operations, directories->staging.get(),
+        *operation_key, operation_directory, runtime_artifact_directory);
+    static_cast<void>(
+        implementation_->context_->operations->unlock(lock_fd->get()));
+    return std::unexpected(std::move(error));
+  };
+
   if (auto result = sync_directory(implementation_->context_->operations,
                                    directories->staging.get(),
                                    "sync new operation staging directory");
       !result) {
-    static_cast<void>(
-        implementation_->context_->operations->unlock(lock_fd->get()));
-    return std::unexpected(result.error());
+    return fail_initialization(result.error());
   }
-  auto operation_directory = open_directory(
+  auto opened_operation = open_directory(
       implementation_->context_->operations, directories->staging.get(),
       *operation_key, "open new operation staging directory");
-  if (!operation_directory) {
-    static_cast<void>(
-        implementation_->context_->operations->unlock(lock_fd->get()));
-    return std::unexpected(operation_directory.error());
+  if (!opened_operation) {
+    return fail_initialization(opened_operation.error());
+  }
+  operation_directory = std::move(*opened_operation);
+
+  FileOperationResult<bool> runtime_artifact_created = std::unexpected(EINTR);
+  while (!runtime_artifact_created &&
+         runtime_artifact_created.error() == EINTR) {
+    runtime_artifact_created =
+        implementation_->context_->operations->create_directory_at(
+            operation_directory.get(), "runtime-artifact", kDirectoryMode);
+  }
+  if (!runtime_artifact_created) {
+    return fail_initialization(filesystem_error(
+        "create runtime artifact directory", runtime_artifact_created.error()));
+  }
+  if (!*runtime_artifact_created) {
+    return fail_initialization(logical_error(
+        StableErrorCode::conflict,
+        "runtime artifact directory already exists in new operation staging"));
+  }
+  if (auto result = sync_directory(implementation_->context_->operations,
+                                   operation_directory.get(),
+                                   "sync runtime artifact directory creation");
+      !result) {
+    return fail_initialization(result.error());
+  }
+
+  auto opened_runtime_artifact = open_directory(
+      implementation_->context_->operations, operation_directory.get(),
+      "runtime-artifact", "open runtime artifact directory");
+  if (!opened_runtime_artifact) {
+    return fail_initialization(opened_runtime_artifact.error());
+  }
+  runtime_artifact_directory = std::move(*opened_runtime_artifact);
+
+  auto staging_identity = directory_identity(
+      implementation_->context_->operations, operation_directory.get(),
+      "inspect operation staging directory");
+  if (!staging_identity) {
+    return fail_initialization(staging_identity.error());
+  }
+  auto runtime_artifact_identity = directory_identity(
+      implementation_->context_->operations, runtime_artifact_directory.get(),
+      "inspect runtime artifact directory");
+  if (!runtime_artifact_identity) {
+    return fail_initialization(runtime_artifact_identity.error());
   }
 
   const auto state_text = "format_version=1\noperation_key=" + *operation_key +
@@ -1331,45 +1441,26 @@ FilesystemStorage::begin_operation(const ContainerId &container_id,
   const auto state_bytes = bytes_from_text(state_text);
   if (auto result =
           durable_publish(implementation_->context_->operations,
-                          operation_directory->get(), "state", state_bytes);
+                          operation_directory.get(), "state", state_bytes);
       !result) {
-    static_cast<void>(
-        implementation_->context_->operations->unlock(lock_fd->get()));
-    return std::unexpected(result.error());
-  }
-
-  auto operation_status =
-      implementation_->context_->operations->status(operation_directory->get());
-  while (!operation_status && operation_status.error() == EINTR) {
-    operation_status = implementation_->context_->operations->status(
-        operation_directory->get());
-  }
-  if (!operation_status || operation_status->type != FileType::directory) {
-    static_cast<void>(
-        implementation_->context_->operations->unlock(lock_fd->get()));
-    return std::unexpected(
-        !operation_status
-            ? filesystem_error("inspect operation staging directory",
-                               operation_status.error())
-            : logical_error(StableErrorCode::storage_error,
-                            "operation staging object is not a directory"));
+    return fail_initialization(result.error());
   }
 
   auto state = std::make_shared<StorageOperationData>(implementation_->context_,
                                                       container_id, kind);
   state->operation_key = *operation_key;
-  state->staging_identity = StorageDirectoryIdentity{
-      .device = operation_status->device,
-      .inode = operation_status->inode,
-  };
+  state->staging_identity = *staging_identity;
   state->staging_path = implementation_->context_->root / "containers" /
                         directories->key / "staging" / *operation_key;
+  state->runtime_artifact_identity = *runtime_artifact_identity;
+  state->runtime_artifact_path = state->staging_path / "runtime-artifact";
   state->lock_fd = std::move(*lock_fd);
   state->container_fd = std::move(directories->container);
   state->manifests_fd = std::move(directories->manifests);
   state->chunks_fd = std::move(directories->chunks);
   state->staging_parent_fd = std::move(directories->staging);
-  state->operation_fd = std::move(*operation_directory);
+  state->operation_fd = std::move(operation_directory);
+  state->runtime_artifact_fd = std::move(runtime_artifact_directory);
 
   return std::unique_ptr<IStorageOperation>{
       std::make_unique<FilesystemStorageOperation>(std::move(state))};

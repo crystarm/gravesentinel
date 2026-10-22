@@ -186,7 +186,8 @@ host filesystem that changed after parsing.
 - `ManifestResult<T>` is `std::expected<T, ManifestError>` with stable structured
   `ManifestErrorCode`, field path, and internal diagnostic.
 - `blake3_hash` computes the production 32-byte digest; `Blake3Hasher` exposes the
-  same implementation through `IHasher`.
+  same implementation as a successful `CheckpointResult<ChunkHash>` through the
+  fallible `IHasher` contract.
 
 Codec errors are converted to the public `StableErrorCode` only at a higher-level
 core boundary. A malformed stored manifest normally becomes

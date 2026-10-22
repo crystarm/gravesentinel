@@ -2,11 +2,12 @@
 
 ## Scope and support profile
 
-`//src/storage:filesystem_storage` is the stage-04 durable backend for CCM. It
+`//src/storage:filesystem_storage` is the durable filesystem backend for CCM. It
 implements storage transactions, immutable file publication, bounded reads,
-per-container locks, operation staging, and manifest pins. Chunking, chunk hash
-verification, create/restore orchestration, retention, and garbage collection
-remain separate stages.
+per-container locks, operation staging, runtime artifact directories, and
+manifest pins. Chunking, chunk hash verification, and the implemented create
+transaction remain separate layers; restore orchestration, retention, and garbage
+collection are deferred to later stages.
 
 The supported MVP profile is a local Linux filesystem that provides:
 
@@ -41,6 +42,7 @@ root/
         <operation-key>/
           state
           pin-<20-digit-generation>
+          runtime-artifact/
   locks/
     <container-key>.lock
   tmp/
@@ -78,9 +80,11 @@ growth.
 
 Storage-generated names are single safe components. The implementation does not
 use `weakly_canonical`, an `exists`-then-open check, or raw identifier path
-concatenation. The absolute staging path exposed by `IStorageOperation` is for
-the trusted runtime adapter; all storage-owned metadata remains accessed through
-the descriptor boundary.
+concatenation. The absolute staging and `runtime-artifact` paths exposed by
+`IStorageOperation` are for the trusted runtime adapter; all storage-owned
+metadata remains accessed through the descriptor boundary. Storage retains open
+directory descriptors for both paths and captures each path's device/inode
+identity before returning the operation.
 
 ## Durable immutable publication
 
@@ -125,16 +129,25 @@ is held for the lifetime of the move-only `IStorageOperation` and any pin that
 outlives its operation owner.
 
 Each operation must use a fresh `OperationId`. It creates a unique staging
-directory and durably publishes non-secret `state` metadata. Reusing an ID whose
-staging directory survived a crash returns `conflict`; mutable snapshots are
-never resumed implicitly.
+directory and a durable, initially empty `runtime-artifact/` child dedicated to
+runtime-produced snapshot data. Non-secret `state` metadata and pin files remain
+in the operation staging root, outside `runtime-artifact/`. The runtime artifact
+path and its captured device/inode identity are exposed separately so adapters
+can verify that the directory they use is the one storage created. Reusing an ID
+whose staging directory survived a crash returns `conflict`; mutable snapshots
+are never resumed implicitly. Ordinary initialization failures after staging
+creation attempt to close descriptors and remove the new tree without replacing
+the primary error if cleanup also fails.
 
 `pin_manifest` first proves that the selected generation exists, then durably
 publishes pin metadata. The returned RAII pin removes and syncs that metadata on
 release. Explicit operation cleanup is rejected while pins remain. Normal
-cleanup recursively removes staging without following symlinks and syncs the
-staging parent. If cleanup fails or the process crashes, the staging directory
-remains incomplete and is ignored by committed-manifest listing. Conservative
+cleanup closes the runtime artifact descriptor, recursively removes staging
+without following symlinks, and syncs the staging parent. The per-container
+lease remains held until the operation object is destroyed (or an outliving pin
+releases its final reference). If cleanup fails or the process crashes, the
+staging directory remains incomplete and is ignored by committed-manifest
+listing. Conservative
 stale cleanup and GC policy are intentionally deferred to stage 11.
 
 ## Internal API and errors
@@ -148,11 +161,14 @@ caller cannot bypass the required lease:
 - `list_manifests`, returning generations in descending order;
 - bounded `read_manifest(container, generation)`.
 
-`IStorageOperation` exposes its bound container identity and operation kind, plus
-the staging path and its captured device/inode identity, lock-bound chunk reads,
-immutable chunk publication, final manifest publication,
-manifest pinning, and cleanup. Algorithm layers use that identity rather than a
-second caller-supplied `ContainerId`, preventing cross-namespace read/publish
+`IStorageOperation` exposes its bound container identity and operation kind, the
+staging path and its captured device/inode identity, and the dedicated runtime
+artifact path and identity through `runtime_artifact_directory()` and
+`runtime_artifact_directory_identity()`. It also provides lock-bound chunk
+reads, immutable chunk publication, final manifest publication, manifest
+pinning, and cleanup. Algorithm layers use the bound container identity rather
+than a second caller-supplied `ContainerId`, preventing cross-namespace
+read/publish
 mismatches. Once manifest
 publication succeeds—or reaches the rename-but-directory-fsync indeterminate
 state—the operation rejects further chunk or manifest publication.
@@ -170,5 +186,6 @@ read/write, file `fsync`, no-replace rename, directory `fsync`, `ENOSPC`,
 permission errors, re-confirmation after failed directory sync, stale temporary
 files and staging after reopen, opaque mapping of traversal-like IDs, symlink and
 FIFO substitution, missing mandatory namespace entries, generation/body
-binding, tolerance of an older corrupt manifest, immutable chunks, and RAII
-pins. These tests require neither root, Podman, nor CRIU.
+binding, tolerance of an older corrupt manifest, immutable chunks, dedicated
+runtime artifact layout and identity, initialization rollback, cleanup, lease
+lifetime, and RAII pins. These tests require neither root, Podman, nor CRIU.

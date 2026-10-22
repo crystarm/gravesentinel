@@ -10,7 +10,8 @@ wrapper is `//src/crypto:blake3`, and `//src/core:blake3_hasher` adapts it to
 Manifest v1 describes an immutable checkpoint as an ordered set of regular-file
 artifacts and their ordered fixed-size chunks. It does not publish files, read
 chunks, follow filesystem links, invoke Podman, or decide runtime compatibility.
-Those operations belong to later storage, chunking, and adapter stages.
+Those operations belong to [filesystem storage](filesystem-storage.md),
+[fixed-size chunking and reassembly](chunking.md), and adapter stages.
 
 ## Data model
 
@@ -68,27 +69,96 @@ stderr belongs in either field.
 ## Canonical JSON profile
 
 Manifest v1 uses a narrow project-defined canonical JSON profile, not a claim of
-full RFC 8785 conformance:
+full RFC 8785 conformance. The encoder uses the repository-pinned
+`nlohmann_json` implementation with its ordered object representation and strict
+UTF-8 serializer. The following rules are part of the persisted v1 format:
 
-1. UTF-8 without BOM, comments, control characters, trailing bytes, or trailing
-   newline.
-2. No insignificant whitespace.
-3. Object keys are emitted in lexicographic order by the pinned
-   `nlohmann_json` implementation.
+1. The document is UTF-8 without BOM, comments, control characters, trailing
+   bytes, or trailing newline.
+2. There is no insignificant whitespace.
+3. Object keys are emitted in the exact sequences specified below. These
+   sequences are the lexicographic order produced by the pinned implementation,
+   but consumers must treat the explicit sequences, rather than a dependency's
+   future ordering behavior, as the v1 contract.
 4. The root and every nested object contain exactly the fields defined by v1;
    missing, unknown, or duplicate keys are rejected.
 5. Versions, timestamps, modes, and sizes are unsigned decimal integer literals.
    Negative, floating-point, exponent, or out-of-range alternatives are rejected.
 6. Hashes and checksums contain exactly 64 lowercase hexadecimal characters.
-7. Artifact and chunk arrays preserve model order.
+7. Artifact and chunk arrays preserve model order. The codec never sorts either
+   array.
 8. Strings are valid UTF-8 and are not Unicode-normalized. Byte-distinct strings
-   remain distinct identifiers.
+   remain distinct identifiers. The serializer emits non-ASCII UTF-8 directly
+   and uses its canonical compact escaping for JSON syntax characters.
 9. The decoder re-encodes the validated model and requires byte-for-byte equality
    with the input. Pretty-printed JSON, alternate key order, alternate escapes,
    and otherwise equivalent noncanonical documents are rejected.
 
-Changing this schema, key set, integer representation, checksum algorithm, or
-canonicalization rules requires a new manifest version.
+The complete top-level object uses this exact key order:
+
+```text
+artifacts
+checkpoint_id
+checksum
+container_id
+created_at_unix_nanoseconds
+format_version
+generation
+runtime_fingerprint
+source_image_identity
+```
+
+The checksum payload uses the same order with `checksum` omitted. Each artifact
+object uses `chunks`, `mode`, `path`, `size`; each chunk object uses `hash`,
+`size`. The runtime fingerprint object uses this exact order:
+
+```text
+apparmor_profile
+architecture
+capability_profile
+cgroup_controllers
+cgroup_manager
+cgroup_version
+command_profile
+criu_version
+kernel_release
+oci_runtime_commit
+oci_runtime_features
+oci_runtime_name
+oci_runtime_version
+privilege_mode
+runtime_build_origin
+runtime_name
+runtime_version
+seccomp_profile
+selinux_mode
+user_namespace_mode
+```
+
+### Decoder acceptance order
+
+`decode_manifest_v1` applies checks in this order:
+
+1. reject an empty encoding or an encoding larger than 16 MiB;
+2. run the bounded SAX preflight pass;
+3. build the JSON DOM and require one root object;
+4. require and parse `format_version`, reject unsupported versions, then require
+   the exact v1 root key set;
+5. parse the exact nested schemas and unsigned/string field types;
+6. construct the model and run all Manifest v1 semantic validation;
+7. parse the checksum, reconstruct the canonical payload, and compare BLAKE3-256;
+8. encode the complete canonical document and require byte-for-byte equality with
+   the original input.
+
+Consequently, a schema or semantic error can be reported before checksum
+validation. A semantically valid document with a matching checksum but
+noncanonical whitespace, key order, or escapes reaches the final comparison and
+is rejected as `non_canonical_encoding`. A checksum mismatch is rejected before
+such a document could be accepted, but checksum checking is not the first decode
+step.
+
+Changing this schema, key set or order, integer representation, checksum
+algorithm, or canonicalization rules requires a new manifest version.
 
 ## Checksum
 
@@ -149,11 +219,22 @@ The v1 parser applies these limits before accepting untrusted input:
 | Relative artifact path | 4096 UTF-8 bytes |
 | One path component | 255 UTF-8 bytes |
 
-A SAX preflight pass enforces nesting, node, object, array, duplicate-key, and
-string limits before the DOM parser allocates the full JSON tree. The typed parse
-then enforces the exact schema, numeric ranges, aggregate chunk count, and total
-sizes, implied directory count, and path component depth before constructing the
-accepted model.
+The encoded-size limit is applied before parsing. A SAX preflight pass then
+enforces nesting, node, object-field, array, duplicate-key, artifact-count, and
+aggregate chunk-count limits before the DOM parser allocates the full JSON tree.
+For scalar JSON string values, the preflight applies the 4096-byte relative-path
+ceiling as a general early bound; the typed parse later applies the smaller
+field-specific limits from the table.
+
+The current SAX implementation does not apply that 4096-byte per-string bound to
+object keys. A key is still bounded by the 16 MiB encoded-document limit and the
+32-fields-per-object limit, and every accepted object must later match an exact
+small v1 key set. This is an implementation resource-bound limitation, not a
+permission for extensions or oversized keys in an accepted manifest.
+
+The typed parse enforces the exact schema, numeric ranges, aggregate chunk count,
+total sizes, implied directory count, and path component depth before
+constructing the accepted model.
 
 ## Path safety boundary
 
@@ -165,12 +246,17 @@ into a different accepted value.
 
 `join_within_root` performs a lexical join beneath an absolute root and returns a
 normalized path. That is not proof of physical filesystem containment: a path
-component can later be replaced with a symlink. Storage and chunking code must
-open relative to a trusted directory descriptor using Linux no-follow/beneath
-semantics, such as `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
-`RESOLVE_NO_MAGICLINKS`, or an equivalent component-by-component `openat` design.
-It must also verify the actual file type with `fstat`. `weakly_canonical` or a
+component can later be replaced with a symlink. Filesystem users must open
+relative to trusted directory descriptors using Linux no-follow semantics and
+must verify actual file types with `fstat`; `weakly_canonical` or a
 check-then-open path comparison is insufficient because of TOCTOU races.
+
+The concrete boundaries are documented separately. The
+[chunker and reassembler](chunking.md#filesystem-and-mount-boundary) additionally
+require Linux mount IDs and reject mount crossings. The
+[FilesystemStorage descriptor boundary](filesystem-storage.md#directory-descriptor-boundary)
+uses no-follow descriptor-relative access but does not currently enforce mount-ID
+containment inside the administrator-trusted storage root.
 
 Manifest-declared mode validation and filesystem no-follow validation are both
 required: the former rejects malicious metadata, while the latter rejects a

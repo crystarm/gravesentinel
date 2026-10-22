@@ -2,16 +2,29 @@
 
 ## Qualification status
 
+### Dated recorded evidence
+
 **QUALIFIED on 2026-10-21.** The complete rootful checkpoint/export/restore
 smoke passed twice on the target host. Both runs proved `--leave-running`
 progress, removal of the original container before restore, in-memory state
 continuity after import, CPU affinity, negative-restore cleanup, cgroup cleanup,
 and idempotent resource cleanup.
 
-Qualification applies only to the exact runtime profile and command boundary in
-this document. A `+CRIU` feature in `crun --version` means that the OCI runtime
-was compiled with CRIU integration; the successful smoke, not that feature flag,
-is the evidence that the complete workflow works.
+This is a historical qualification record for the measured host on that date,
+not a statement that the current host or current runtime installation has been
+rechecked. Qualification applies only to the exact runtime profile and command
+boundary in this document. A `+CRIU` feature in `crun --version` means that the
+OCI runtime was compiled with CRIU integration; the successful smoke, not that
+feature flag, is the evidence that the complete workflow works.
+
+### Current verification boundary
+
+A deployment is currently verified only after the prerequisite gate and the
+appropriate complete destructive smoke have been rerun in that deployment's
+rootful execution context. This repository retains the dated observations and
+success markers below, but it does not retain a raw qualification log, a signed
+or checksummed host report, checkpoint hashes, or a CI evidence bundle from the
+recorded runs.
 
 ## Accepted runtime profile
 
@@ -25,19 +38,60 @@ is the evidence that the complete workflow works.
 | Cgroups | unified cgroup v2 managed by systemd |
 | Available controllers | `cpuset cpu io memory hugetlb pids rdma misc` |
 | Effective cpuset | `0-11` |
-| Podman | local rootful Podman `5.4.2`, uid 0 |
+| Podman | local rootful Podman `5.4.2`, Debian build origin, uid 0 |
 | OCI runtime | `crun 1.21`, commit `10269840aa07fb7e6b7e1acff6198692d8ff5c88` |
-| OCI runtime features | includes `+CRIU`, `+APPARMOR`, `+SELINUX`, `+SECCOMP` |
+| OCI runtime features | includes `+APPARMOR`, `+CAP`, `+CRIU`, `+SECCOMP`, `+SELINUX` |
 | CRIU | `4.1.1` at `/usr/sbin/criu` |
 | Qualification process capabilities | `CapEff=000001ffffffffff`, `NoNewPrivs=0` |
 | Podman security | AppArmor enabled, SELinux disabled, seccomp enabled with `/usr/share/containers/seccomp.json` |
 | Host LSM list | `lockdown,capability,landlock,yama,apparmor,tomoyo,bpf,ipe,ima,evm` |
 | Workload | static C++23 CPU-only fixture in a `scratch` image |
 
+The production `PodmanAdapter` enforces a stricter machine-readable profile than
+the prerequisite script. It requires all of the following observations:
+
+- Podman client version `5.4.2`, `OsArch=linux/amd64`, `BuildOrigin=Debian`, and
+  Podman info version `5.4.2`;
+- Podman host distribution `debian`, version `13`, codename `trixie`, architecture
+  `amd64`, and kernel `6.12.111+deb13-amd64`;
+- a local, non-rootless service, null uid/gid mappings, cgroup v2 with the
+  `systemd` manager, and exactly the controller set
+  `cpu cpuset hugetlb io memory misc pids rdma`;
+- AppArmor enabled, SELinux disabled, seccomp enabled with
+  `/usr/share/containers/seccomp.json`, and the qualified Podman capability set;
+- `crun` with first version line `crun version 1.21`, commit
+  `10269840aa07fb7e6b7e1acff6198692d8ff5c88`, and the required `+APPARMOR`,
+  `+CAP`, `+CRIU`, `+SECCOMP`, and `+SELINUX` feature tokens;
+- CRIU with first version line `Version: 4.1.1` and command profile
+  `podman-criu-rootful-v1`.
+
 The host must make `/usr/sbin` available in `PATH`, and `criu check` must pass in
-the same rootful execution context that will invoke Podman. The smoke container
-itself runs as uid/gid `65532`, drops every capability, enables
-`no-new-privileges`, has no network, and has a read-only root filesystem.
+the same rootful execution context that will invoke Podman. The adapter itself
+checks `criu --version` but does not run `criu check`; the gate must therefore be
+run separately. The adapter checks AppArmor/SELinux/seccomp state and the seccomp
+path, but it does not fingerprint the contents of AppArmor policy or the seccomp
+file. The smoke container itself runs as uid/gid `65532`, drops every capability,
+enables `no-new-privileges`, has no network, and has a read-only root filesystem.
+
+## Implementation and gate boundaries
+
+The runtime libraries are built as `//src/hypervisor:linux_runtime` and
+`//src/hypervisor:podman_adapter`, but the production
+`//src/hypervisor:gravesentinel_hypervisor` binary is not wired to them yet. Its
+current `main` is a fail-fast placeholder, so the integration helper exercises
+the production libraries directly and is not an end-to-end test of the shipped
+hypervisor process, IPC, storage, or service composition.
+
+`scripts/check_testbed.sh` is a prerequisite screen, not an exact implementation
+of the adapter fingerprint. It checks Linux/x86-64, the exact kernel, CPU
+availability, cgroup v2/systemd and cpuset, Podman 5.4.2/amd64/local environment,
+rootful uid 0, a `crun 1.21` version prefix with `+CRIU`, and a successful
+`criu check`. It does not enforce the exact Debian release/codename or Podman
+build origin, CRIU 4.1.1, the crun commit and full required feature set, the exact
+controller set, or the adapter's AppArmor/SELinux/seccomp/capability profile.
+Consequently, the direct smoke can pass outside the exact adapter profile; the
+adapter-mode smoke closes this gap by executing the adapter's strict profile
+validation.
 
 ## Reproducing the qualification
 
@@ -106,6 +160,11 @@ podman container checkpoint --compress=none --leave-running \
 podman container restore --import CHECKPOINT_TAR --name RESTORED_NAME
 ```
 
+The production adapter validates the snapshot's immutable source image identity
+with `podman image inspect` before restore. The corresponding image must therefore
+remain available in the local Podman image store even though the original
+container has been removed.
+
 The negative path uses the same restore form with an invalid archive and a unique
 negative-test name. Production code must invoke these as argv through a process
 runner, never by concatenating a shell command.
@@ -146,6 +205,12 @@ In both runs:
 8. containers, image, checkpoint archive, temporary files, and observed cgroups
    were removed. The second run therefore started without leftovers from the
    first.
+
+The direct stage-02 shell flow proves absence with ordinary
+`podman container exists` checks only; it does not issue
+`podman container exists --external`. Ordinary and external Podman-object
+absence is proved only by the production adapter path used by the stage-06
+adapter smoke.
 
 ## Observed opaque artifact
 
@@ -260,9 +325,40 @@ RESULT: QUALIFIED production PodmanAdapter smoke passed
 ```
 
 The run exercised production cold start, capture with `--leave-running`, exact
-incarnation stop/remove, invalid-restore cleanup and absence proof, valid import
-restore, state continuity, container/checkpoint CPU isolation, cgroup cleanup and
-final resource cleanup.
+incarnation stop/remove, invalid-restore cleanup and ordinary/external absence
+proof, valid import restore, state continuity, container/checkpoint CPU
+isolation, cgroup cleanup and final resource cleanup.
+
+The adapter smoke's `ColdStartSpec` contains no workload environment variables.
+It therefore does not exercise the transient `0600` env-file against real
+Podman. Non-privileged scripted unit tests cover env-file construction, mode,
+secret exclusion from Podman's process environment/argv, and successful-path
+removal; an underlying unlink failure still produces an operation error and only
+a best-effort destructor retry.
+
+## Adapter operation limits
+
+The default production adapter limits are:
+
+- profile and inspection timeout: 10 seconds each;
+- checkpoint/restore/cold-start timeout: 5 minutes;
+- stop/remove cleanup timeout: 30 seconds;
+- TERM-to-KILL grace period: 2 seconds;
+- JSON and stdout capture: 1 MiB each; stderr capture: 64 KiB;
+- at most 256 adapter-supplied arguments excluding the executable, 16 KiB per
+  argument;
+- at most 256 environment entries, 64 KiB per value.
+
+The 256-argument process limit includes the fixed Podman command-profile
+arguments and image reference. It leaves at most 241 workload arguments without
+an env-file and 239 with an env-file. Higher-level registration validation may
+impose smaller per-string and aggregate limits.
+
+These deadlines apply to commands invoked through `PosixProcessRunner`. The
+direct qualification shell does not wrap each `podman build`, inspect,
+checkpoint, restore, stop, or remove command in a per-command timeout. A Bazel
+smoke target has an overall `timeout = "long"`, but a direct invocation can still
+block in an individual host command.
 
 ## Unsupported modes and requalification limits
 

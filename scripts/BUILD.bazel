@@ -8,6 +8,7 @@ sh_test(
         "$(locations //src/hypervisor:format_sources)",
         "$(locations //src/protocol:format_sources)",
         "$(locations //src/scheduler_client:format_sources)",
+        "$(locations //tests/integration/fixture:format_sources)",
         "$(locations //tests/unit:format_sources)",
     ],
     data = [
@@ -16,13 +17,23 @@ sh_test(
         "//src/hypervisor:format_sources",
         "//src/protocol:format_sources",
         "//src/scheduler_client:format_sources",
+        "//tests/integration/fixture:format_sources",
         "//tests/unit:format_sources",
     ],
     size = "small",
     visibility = ["//:__pkg__"],
 )
 
+sh_binary(
+    name = "check_testbed",
+    srcs = ["check_testbed.sh"],
+    visibility = ["//tests/integration:__pkg__"],
+)
+
 filegroup(
     name = "scripts",
-    srcs = ["check_clang_format.sh"],
+    srcs = [
+        "check_clang_format.sh",
+        "check_testbed.sh",
+    ],
 )

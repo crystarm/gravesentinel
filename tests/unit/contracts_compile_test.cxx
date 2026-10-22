@@ -17,6 +17,8 @@ namespace gravesentinel::ccm {
 namespace {
 
 static_assert(std::is_abstract_v<IStorage>);
+static_assert(std::is_abstract_v<IStorageOperation>);
+static_assert(std::is_abstract_v<IStoragePin>);
 static_assert(std::is_abstract_v<IPodmanAdapter>);
 static_assert(std::is_abstract_v<IClock>);
 static_assert(std::is_abstract_v<IHasher>);
@@ -28,6 +30,8 @@ static_assert(std::is_abstract_v<ICheckpointService>);
 static_assert(std::is_abstract_v<IHypervisorClient>);
 
 static_assert(std::has_virtual_destructor_v<IStorage>);
+static_assert(std::has_virtual_destructor_v<IStorageOperation>);
+static_assert(std::has_virtual_destructor_v<IStoragePin>);
 static_assert(std::has_virtual_destructor_v<IPodmanAdapter>);
 static_assert(std::has_virtual_destructor_v<ICheckpointService>);
 static_assert(std::has_virtual_destructor_v<IHypervisorClient>);
@@ -39,11 +43,14 @@ TEST(ContractTest, InternalErrorsRemainStructured) {
       .diagnostic = "manifest publication failed",
       .retryable = true,
       .correlation_id = request_id,
+      .storage_side_effect = StorageSideEffect::publication_may_be_visible,
   });
 
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, StableErrorCode::storage_error);
   EXPECT_TRUE(result.error().retryable);
+  EXPECT_EQ(result.error().storage_side_effect,
+            StorageSideEffect::publication_may_be_visible);
   ASSERT_TRUE(result.error().correlation_id.has_value());
   EXPECT_EQ(result.error().correlation_id->value(), "request-42");
 }

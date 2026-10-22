@@ -1,4 +1,4 @@
-#include "src/crypto/blake3.hpp"
+#include "src/crypto/blake3.hxx"
 
 #include <blake3.h>
 

@@ -5,7 +5,7 @@ package(default_visibility = ["//visibility:private"])
 gravesentinel_cc_library(
     name = "blake3",
     srcs = ["blake3.cxx"],
-    hdrs = ["blake3.hpp"],
+    hdrs = ["blake3.hxx"],
     deps = [
         "//src/protocol:protocol",
         "@blake3//:blake3",
@@ -21,7 +21,7 @@ filegroup(
     name = "format_sources",
     srcs = [
         "blake3.cxx",
-        "blake3.hpp",
+        "blake3.hxx",
     ],
     visibility = ["//scripts:__pkg__"],
 )

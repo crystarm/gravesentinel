@@ -1,6 +1,6 @@
-#include "src/manifest/codec.hpp"
+#include "src/manifest/codec.hxx"
 
-#include "src/crypto/blake3.hpp"
+#include "src/crypto/blake3.hxx"
 
 #include <nlohmann/json.hpp>
 

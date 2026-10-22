@@ -1,6 +1,6 @@
 #pragma once
 
-#include "src/core/contracts.hpp"
+#include "src/core/contracts.hxx"
 
 #include <cstddef>
 #include <span>

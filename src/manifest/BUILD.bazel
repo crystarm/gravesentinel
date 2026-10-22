@@ -9,8 +9,8 @@ gravesentinel_cc_library(
         "types.cxx",
     ],
     hdrs = [
-        "codec.hpp",
-        "types.hpp",
+        "codec.hxx",
+        "types.hxx",
     ],
     deps = [
         "//src/crypto:blake3",
@@ -28,9 +28,9 @@ filegroup(
     name = "format_sources",
     srcs = [
         "codec.cxx",
-        "codec.hpp",
+        "codec.hxx",
         "types.cxx",
-        "types.hpp",
+        "types.hxx",
     ],
     visibility = ["//scripts:__pkg__"],
 )

@@ -1,4 +1,4 @@
-#include "src/protocol/types.hpp"
+#include "src/protocol/types.hxx"
 
 #include <array>
 #include <cstdint>

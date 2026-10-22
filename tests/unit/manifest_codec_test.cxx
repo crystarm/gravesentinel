@@ -1,4 +1,4 @@
-#include "src/manifest/codec.hpp"
+#include "src/manifest/codec.hxx"
 
 #include <gtest/gtest.h>
 

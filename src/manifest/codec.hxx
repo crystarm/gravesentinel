@@ -1,6 +1,6 @@
 #pragma once
 
-#include "src/manifest/types.hpp"
+#include "src/manifest/types.hxx"
 
 #include <cstddef>
 #include <span>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "src/protocol/types.hpp"
+#include "src/protocol/types.hxx"
 
 #include <compare>
 #include <cstddef>

@@ -1,4 +1,4 @@
-#include "tests/integration/fixture/counter_fixture.hpp"
+#include "tests/integration/fixture/counter_fixture.hxx"
 
 #include <charconv>
 #include <cstdint>

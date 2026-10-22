@@ -8,7 +8,9 @@ gravesentinel_cc_library(
     hdrs = ["types.hpp"],
     visibility = [
         "//src/core:__pkg__",
+        "//src/crypto:__pkg__",
         "//src/hypervisor:__pkg__",
+        "//src/manifest:__pkg__",
         "//src/scheduler_client:__pkg__",
         "//tests/unit:__pkg__",
     ],

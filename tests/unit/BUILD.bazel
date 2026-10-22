@@ -98,6 +98,17 @@ gravesentinel_cc_test(
 )
 
 gravesentinel_cc_test(
+    name = "checkpoint_service_test",
+    srcs = ["checkpoint_service_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/core:checkpoint_service",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+gravesentinel_cc_test(
     name = "restore_coordinator_test",
     srcs = ["restore_coordinator_test.cxx"],
     size = "small",
@@ -149,6 +160,7 @@ test_suite(
     tests = [
         ":blake3_test",
         ":checkpoint_creator_test",
+        ":checkpoint_service_test",
         ":config_validation_test",
         ":contracts_compile_test",
         ":filesystem_storage_test",
@@ -168,6 +180,7 @@ filegroup(
     srcs = [
         "blake3_test.cxx",
         "checkpoint_creator_test.cxx",
+        "checkpoint_service_test.cxx",
         "config_validation_test.cxx",
         "contracts_compile_test.cxx",
         "filesystem_storage_test.cxx",

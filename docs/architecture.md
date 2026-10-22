@@ -1,86 +1,114 @@
-# Checkpoint Cache Manager: архитектура MVP
+# Checkpoint Cache Manager: MVP Architecture
 
-## Назначение этого документа
+## Purpose and Current Status
 
-Документ фиксирует общие архитектурные контракты MVP и обновляется по мере
-завершения этапов. Реальный runtime profile, Manifest v1, crash-safe
-FilesystemStorage, fixed-size chunking/reassembly, Linux process/affinity layer,
-production Podman adapter, crash-safe create transaction и безопасная restore /
-fallback / cold-start orchestration уже реализованы, но service core и IPC ещё не
-реализованы.
-Бинарный target `//src/hypervisor:gravesentinel_hypervisor` собирается, но при
-запуске явно завершается с ошибкой до появления сервера в этапе 10.
+This document describes the CCM components **actually present in the repository**,
+their boundaries, and integration that has not yet been implemented. Normative details
+of formats and algorithms are provided in the related documents listed in the
+[documentation index](README.md).
 
-## Граница процессов
+The current code already includes:
 
-Scheduler и CCM не разделяют адресное пространство. Scheduler владеет desired
-registrations и использует только библиотеку `//src/scheduler_client`. Отдельный
-Linux-процесс `gravesentinel_hypervisor` будет владеть алгоритмическим core,
-Podman/CRIU adapter, хранилищем, рабочими потоками, периодическими checkpoint,
-retention и GC.
+| Area | Implementation | Status |
+| --- | --- | --- |
+| Common types and validation | `//src/protocol:protocol` | implemented, unit-tested |
+| Manifest v1 and BLAKE3 | `//src/manifest:manifest`, `//src/crypto:blake3` | implemented, unit-tested |
+| Crash-safe storage | `//src/storage:filesystem_storage` | implemented, unit-tested |
+| Chunking/reassembly | `//src/chunking:snapshot_chunker` | implemented, unit-tested |
+| Linux process/affinity boundary | `//src/hypervisor:linux_runtime` | implemented, unit-tested |
+| Podman/CRIU adapter | `//src/hypervisor:podman_adapter` | implemented, unit-tested, includes an opt-in smoke test |
+| Create orchestration | `//src/core:checkpoint_creator` | implemented, unit-tested |
+| Restore/fallback/cold start | `//src/core:restore_coordinator` | implemented, unit-tested |
+| Registration/scheduling service core | `//src/core:checkpoint_service` | implemented, unit-tested |
+| Production composition | `//src/hypervisor:gravesentinel_hypervisor` | **not implemented**: the binary is a stub |
+| Scheduler client implementation and IPC | interfaces/design only | **not implemented** |
+| Async operation journal/recovery | protocol types/design only | **not implemented** |
+| Retention and garbage collection | operation kinds are reserved | **not implemented** |
+
+`gravesentinel_hypervisor` currently does not create storage, a chunker, an adapter, a
+creator, a restore coordinator, or a service. Its `main()` prints a message about the
+missing IPC server and returns `EXIT_FAILURE`. The project should therefore be treated
+as a set of complete and tested library layers, but not as a complete daemon/service.
+
+## Process Boundary: Current and Planned
+
+The Scheduler and CCM must not share an address space. The Scheduler owns the desired
+set of registrations and sees only `IHypervisorClient` from the public
+`//src/scheduler_client:scheduler_client`. This target currently contains only an
+abstract synchronous `bool` interface; no concrete client exists.
+
+The planned process boundary is:
 
 ```mermaid
 flowchart TB
     Scheduler[Scheduler process]
-    Client[Scheduler client]
-    Socket[Versioned bounded JSON over AF_UNIX SOCK_SEQPACKET]
-    Hypervisor[gravesentinel_hypervisor process]
-    Core[CCM core]
-    Runtime[Podman and CRIU adapter]
-    Storage[Filesystem storage]
+    Client[Concrete scheduler client - not implemented]
+    Socket[Versioned bounded JSON over AF_UNIX SOCK_SEQPACKET - not implemented]
+    Hypervisor[gravesentinel_hypervisor composition - not implemented]
+    Service[CheckpointService - implemented library]
+    Create[CheckpointCreator - implemented]
+    Restore[RestoreCoordinator - implemented]
+    Runtime[PodmanAdapter and Linux runtime - implemented]
+    Storage[FilesystemStorage and chunking - implemented]
 
-    Scheduler --> Client
-    Client -. stage 10 .-> Socket
-    Socket -. stage 10 .-> Hypervisor
-    Hypervisor --> Core
-    Core --> Runtime
-    Core --> Storage
+    Scheduler -. planned .-> Client
+    Client -. planned .-> Socket
+    Socket -. planned .-> Hypervisor
+    Hypervisor -. planned wiring .-> Service
+    Service --> Create
+    Service --> Restore
+    Create --> Runtime
+    Create --> Storage
+    Restore --> Runtime
+    Restore --> Storage
 ```
 
-Только hypervisor вправе запускать runtime-команды. `IProcessRunner` принимает
-исполняемый файл и массив аргументов; контракт не допускает shell-команду,
-собранную конкатенацией строк. Scheduler не зависит от `ccm_core`, storage или
-Podman adapter.
+Only the hypervisor process should be permitted to run rootful Podman/CRIU.
+`IProcessRunner` accepts an executable and a separate `argv`; the production
+`PosixProcessRunner` uses `execve` rather than shell concatenation. Scheduler-facing
+code does not depend on storage, Podman, CRIU, or Linux APIs.
 
-## Граф Bazel targets и visibility
+## Actual Bazel Target Graph
+
+It is important to distinguish the existence of a library target from its inclusion
+in an executable. The actual direct dependencies of the main project targets are:
 
 ```mermaid
 flowchart TD
-    SchedulerConsumer[Scheduler consumer]
-    SchedulerClient[//src/scheduler_client:scheduler_client]
-    Protocol[//src/protocol:protocol]
-    Hypervisor[//src/hypervisor:gravesentinel_hypervisor]
-    LinuxRuntime[//src/hypervisor:linux_runtime]
-    Podman[//src/hypervisor:podman_adapter]
-    Core[//src/core:ccm_core]
-    Creator[//src/core:checkpoint_creator]
-    Restorer[//src/core:restore_coordinator]
-    Hasher[//src/core:blake3_hasher]
-    Manifest[//src/manifest:manifest]
-    Chunking[//src/chunking:snapshot_chunker]
-    Storage[//src/storage:filesystem_storage]
-    Crypto[//src/crypto:blake3]
-    Blake3[@blake3//:blake3]
-    Json[@nlohmann_json//:json]
-    Unit[//tests/unit]
+    SchedulerClient["//src/scheduler_client:scheduler_client"]
+    Protocol["//src/protocol:protocol"]
+    Binary["//src/hypervisor:gravesentinel_hypervisor"]
+    Core["//src/core:ccm_core"]
+    Service["//src/core:checkpoint_service"]
+    Creator["//src/core:checkpoint_creator"]
+    Restorer["//src/core:restore_coordinator"]
+    Hasher["//src/core:blake3_hasher"]
+    LinuxRuntime["//src/hypervisor:linux_runtime"]
+    Podman["//src/hypervisor:podman_adapter"]
+    Chunking["//src/chunking:snapshot_chunker"]
+    Storage["//src/storage:filesystem_storage"]
+    Manifest["//src/manifest:manifest"]
+    Crypto["//src/crypto:blake3"]
+    Json["@nlohmann_json//:json"]
+    Blake3["@blake3//:blake3"]
 
-    SchedulerConsumer --> SchedulerClient
     SchedulerClient --> Protocol
-    Hypervisor --> Core
-    Hypervisor --> Creator
-    Hypervisor --> Restorer
-    Hypervisor --> LinuxRuntime
-    Hypervisor --> Podman
-    Hypervisor --> Chunking
+    Binary --> Core
+    Core --> Protocol
+    Service --> Core
+    Service --> Creator
+    Service --> Restorer
     Creator --> Core
     Creator --> Chunking
     Creator --> Manifest
     Restorer --> Core
     Restorer --> Chunking
     Restorer --> Manifest
-    Core --> Protocol
     Hasher --> Core
     Hasher --> Crypto
+    LinuxRuntime --> Core
+    Podman --> Core
+    Podman --> Json
     Chunking --> Core
     Chunking --> Manifest
     Chunking --> Storage
@@ -92,199 +120,348 @@ flowchart TD
     Manifest --> Json
     Crypto --> Protocol
     Crypto --> Blake3
-    Podman --> Core
-    Podman --> Json
-    LinuxRuntime --> Core
-    Unit --> SchedulerClient
-    Unit --> Core
-    Unit --> Creator
-    Unit --> Restorer
-    Unit --> Hasher
-    Unit --> Chunking
-    Unit --> Manifest
-    Unit --> Storage
 ```
 
-`//src/core:ccm_core` виден только package гипервизора, внутренним chunking и
-storage, а также unit tests.
-Scheduler-facing библиотека публична, но её единственная проектная зависимость —
-`//src/protocol:protocol`. Общие типы protocol не содержат storage, runtime или
-Linux API.
+A key limitation of the current graph is that the binary depends only on `ccm_core`;
+there are currently no edges from the binary to the service, runtime, storage, or
+orchestration libraries.
 
-BLAKE3, nlohmann JSON и GoogleTest закреплены точными версиями в `MODULE.bazel`.
-`//src/crypto:blake3` использует настоящий BLAKE3 C API, а
-`//src/manifest:manifest` — pinned nlohmann JSON для strict canonical Manifest v1.
-Эти зависимости остаются за внутренней hypervisor/core границей и не попадают в
-scheduler-facing target.
+`ccm_core` contains contracts and structured errors, but not workflow implementations.
+The Scheduler client depends only on the protocol. BLAKE3 `1.8.2.bcr.1`, nlohmann JSON
+`3.12.0.bcr.2`, and GoogleTest `1.18.0.bcr.1` are pinned in `MODULE.bazel` and do not
+appear in the public scheduler-facing target. `//tests/unit:unit_tests` is an
+aggregating test suite, not a library node in this dependency graph.
 
-## Типы и валидация
+## Identities and Configuration
 
-`ContainerId`, `CheckpointId`, `RequestId`, `OperationId` и
-`RuntimeContainerRef` — разные strong types. Фабрика отклоняет пустые значения и
-встроенный NUL. `ChunkHash` всегда содержит 32 байта BLAKE3 digest.
+`ContainerId`, `CheckpointId`, `RequestId`, `OperationId`, and
+`RuntimeContainerRef` are distinct strong types. Their underlying factory rejects only
+an empty value and an embedded NUL. Stricter constraints are imposed at other layers:
 
-`CheckpointConfig` имеет defaults `interval = 60s`, `keep_last = 3`. Валидация
-требует положительный interval, `keep_last` в диапазоне 1..3 и одну из пар
-`(0,1)`, `(2,3)`, `(4,5)`, `(6,7)`. Набор регистраций дополнительно ограничен
-четырьмя элементами и не может повторно назначать logical CPU.
+- Manifest v1 and `FilesystemStorage` limit container/checkpoint/storage IDs to 256
+  bytes;
+- manifest metadata must be valid UTF-8 without control characters;
+- the runtime adapter applies its own constraints to Podman names, image references,
+  argv, and the environment.
 
-`ColdStartSpec` отделён от изменчивого runtime container ID. Environment в нём
-может содержать секреты: hypervisor не персистирует эти значения, не передаёт их
-в диагностические логи, argv или environment rootful-процесса Podman. Adapter
-создаёт приватный transient env-file `0600` под доверенным staging root, передаёт
-только его путь через `--env-file` и удаляет файл сразу после синхронного вызова.
-Command profile v1 отклоняет CR/LF в значениях, mounts и произвольные
-`runtime_options`, поскольку их безопасная форма не была квалифицирована.
+As a result, an identifier may be created successfully at the protocol layer but later
+be rejected at the manifest/storage boundary. Until unified ingress validation is
+introduced, the caller is responsible for checking this.
 
-`RuntimeFingerprint` содержит отдельные поля kernel, Podman/runtime build, CRIU,
-OCI runtime/commit/features, cgroup, privilege/user namespace,
-capability/SELinux/AppArmor/seccomp и command profile. Manifest v1 персистирует
-их вместе с source image identity и отклоняет неполный fingerprint.
+`CheckpointConfig` has defaults of `interval = 60s` and `keep_last = 3`. Registration
+validation requires:
 
-`RelativeSnapshotPath`, ordered artifacts/chunks, canonical JSON, parser limits и
-BLAKE3 checksum определены в `docs/manifest-v1.md`. Лексический join пути не
-заменяет реализованный в storage/chunking descriptor-relative no-follow
-filesystem boundary.
+- a positive interval;
+- `keep_last` in the range `1..3`;
+- one of the CPU pairs `(0,1)`, `(2,3)`, `(4,5)`, `(6,7)`;
+- no more than four registrations, with no duplicate CPU assignments;
+- a bounded and syntactically valid `ColdStartSpec`;
+- non-empty fields in the registration-level `RuntimeFingerprint`, if specified.
 
-## Внутренние контракты
+Two fields currently do not affect the workflow after validation:
 
-`//src/core:ccm_core` объявляет:
+- `keep_last`, because retention is not implemented;
+- `ContainerRegistration::runtime_fingerprint`, because create stores the fingerprint
+  measured by the adapter, while restore uses the fingerprint from the manifest.
 
-- `ICheckpointService` — синхронные register/unregister/create/restore и
-  детерминированный shutdown внутреннего service core; async submit/poll и
-  `OperationStatus` принадлежат будущей IPC-границе этапа 10;
-- `IStorage` — начало exclusive per-container operation, bounded чтение chunk и
-  manifest, перечисление manifest по generation;
-- `IStorageOperation`/`IStoragePin` — bound `ContainerId`/operation kind, RAII
-  lease, lock-bound chunk reads, inode-bound уникальные staging и отдельный
-  runtime-artifact каталог, атомарная публикация immutable chunk/manifest,
-  durable pin metadata и cleanup;
-- `IPodmanAdapter` — runtime/image compatibility, capture, stop/remove ожидаемой
-  incarnation, недеструктивное подтверждение absence, restore, cold start и cleanup
-  собственной неудачной restore-попытки;
-- `IClock`, fallible `IHasher`, `IIdGenerator` — детерминируемые зависимости
-  core;
-- `ILogger` — диагностическое логирование без секретных полей;
-- `IAffinityController`/`IThreadAffinityBinding` — проверка allowed logical CPU,
-  привязка только текущего worker thread и RAII-восстановление прежней mask;
-- `IProcessRunner` — exact argv/environment без shell, bounded stdout/stderr,
-  typed exit/signal/timeout, child process group и явная child affinity;
-- `CheckpointResult<T>` — `std::expected<T, CheckpointErrorDetail>` со стабильным
-  кодом, retryability, optional correlation ID, storage side effect
-  `publication_may_be_visible` и runtime side effect `incarnation_may_exist`.
+`ColdStartSpec` is separate from the mutable runtime ID. Command profile v1 prohibits
+mounts and arbitrary runtime options. The production adapter passes the environment
+through a transient mode-`0600` env-file rather than through Podman argv or the process
+environment. Names and values are validated further; NUL, CR, and LF are prohibited.
 
-`//src/storage:filesystem_storage` отображает недоверенные ID в domain-separated
-BLAKE3 keys, работает относительно доверенных directory descriptors с
-no-follow/type checks и возвращает success публикации только после file `fsync`,
-no-replace rename и directory `fsync`. Полный persisted layout, lock/staging/pin
-semantics и поддерживаемый filesystem profile зафиксированы в
-`docs/filesystem-storage.md`.
+## Internal Interfaces and Concrete Guarantees
 
-`//src/chunking:snapshot_chunker` детерминированно преобразует immutable дерево
-regular files в 4 MiB BLAKE3 chunks с per-container deduplication и собирает его
-обратно в отдельный `staging/snapshot`, проверяя chunk size/hash и file mode до
-передачи runtime adapter. Fallible hash/read/publication errors распространяются
-как structured failures. Полный контракт и ограничения описаны в
-`docs/chunking.md`.
+`//src/core:ccm_core` declares:
 
-`//src/core:checkpoint_creator` под exclusive per-container storage lease выдаёт
-новый `CheckpointId`, вычисляет `max(committed generation)+1`, выполняет capture в
-отдельный `runtime-artifact`, chunking и атомарную публикацию Manifest v1 строго
-последней. Переходы `IDLE -> CAPTURING -> CHUNKING -> COMMITTING -> COMMITTED` и
-`FAILED/INCOMPLETE` структурированно логируются; ordinary paths очищают staging,
-а прежние версии не удаляются. Ошибка directory `fsync` после manifest rename
-классифицируется как `INCOMPLETE`, потому что publication может быть уже видна.
-Полный контракт описан в `docs/checkpoint-create.md`.
+- `ICheckpointService` — synchronous register/unregister/create/restore/shutdown;
+- `IStorage` and `IStorageOperation` — namespace reads, operation leases,
+  publication, pinning, and cleanup;
+- `IPodmanAdapter` — compatibility, capture, absence, restore, cold start, and cleanup;
+- `IClock`, `ITimer`, `IHasher`, `IIdGenerator` — injectable dependencies;
+- `ILogger` — structured diagnostic sink;
+- `IAffinityController` and `IThreadAffinityBinding` — CPU validation/binding;
+- `IProcessRunner` — exact argv/environment, bounded output, and typed termination;
+- `CheckpointResult<T>` — `std::expected<T, CheckpointErrorDetail>`.
 
-`//src/core:restore_coordinator` под тем же exclusive storage lease перебирает
-committed Manifest v1 строго по убыванию generation, pin-ит кандидата до завершения
-runtime call/cleanup, проверяет checksum/schema/fingerprint/image и BLAKE3 каждого
-chunk до restore. Fallback разрешён только после подтверждённого absence; cold start
-выполняется единожды при наличии явного `ColdStartSpec`. Отдельные
-`snapshot-<generation>` staging trees позволяют сохранить lease между попытками.
-Полный контракт описан в `docs/checkpoint-restore.md`.
+The shape of an interface does not prove all operational properties. For example, an
+arbitrary `IStorage` implementation is not necessarily crash-safe or cross-process,
+and an arbitrary collaborator may return diagnostics containing sensitive data. The
+following properties apply to the production classes:
 
-`//src/core:checkpoint_service` владеет максимум четырьмя регистрациями и одним
-привязанным к `checkpoint_cpu` worker на регистрацию. Синхронные операции одного
-`ContainerId` сериализованы, разные слоты выполняются параллельно, а periodic tick
-имеет mailbox capacity один и пропускается при занятом слоте без catch-up backlog.
-Unregister и shutdown закрывают приём, отменяют pending periodic работу и
-дожидаются уже принятой/активной операции. Injectable generation timer делает
-периодику и гонки lifecycle детерминированно тестируемыми. Полный контракт описан в
-`docs/service-core.md`.
+| Property | Implementing boundary |
+| --- | --- |
+| Cross-process per-container `flock` | `FilesystemStorage` |
+| Temp + file `fsync` + no-replace publish + directory `fsync` | `FilesystemStorage` |
+| Descriptor-relative no-follow reads | `FilesystemStorage`, chunker/reassembler |
+| Mount-ID containment for the snapshot tree | `SnapshotChunker`/`SnapshotReassembler`, not storage as a whole |
+| BLAKE3 verification of chunk contents | chunker/reassembler, not the raw storage API |
+| Exact Podman/CRIU profile and ownership checks | `PodmanAdapter` |
+| Shell-free child execution and process-group timeout | `PosixProcessRunner` |
+| Same-container serialization within one service | `CheckpointService` |
 
-`//src/hypervisor:linux_runtime` реализует Linux-only boundary: `fork`/`execve`
-без shell, закрытие посторонних child file descriptors, одновременное bounded
-чтение stdout/stderr, TERM→KILL всей process group по deadline и affinity child.
-`LinuxAffinityController` меняет mask только вызывающего thread; binding должен
-быть восстановлен и уничтожен тем же thread.
+All injected implementations must follow the calling layer's thread-safety and
+sanitization rules. Core passes collaborator diagnostics to the logger without
+universal secret redaction.
 
-`//src/hypervisor:podman_adapter` принимает только профиль
-`podman-criu-rootful-v1`, проверяет exact runtime fingerprint, ownership labels,
-container cpuset и immutable image ID. Logical `ContainerId`, стабильная
-`RuntimeContainerRef` и конкретный 64-hex `RuntimeIncarnation::runtime_id` не
-смешиваются. Stop/remove требует ожидаемую incarnation и не удаляет replacement.
-Absence считается доказанным лишь когда и обычный `podman container exists`, и
-`podman container exists --external` возвращают documented not-found status.
-`confirm_absence` выполняет только эти read-only probes и никогда не удаляет
-неожиданный live container. Failed restore до доказанного cleanup сохраняет
-`incarnation_may_exist` и не даёт права на fallback; destructive cleanup допустим
-только после собственной restore/cold-start попытки, начатой при подтверждённом
-absence под непрерывным lease.
+## Create Data Flow
 
-Подробный `diagnostic` остаётся внутри hypervisor. Будущий wire response содержит
-только стабильный error code, request/correlation ID и однозначный status.
+A direct `CheckpointCreator::create` call returns a rich `CreatedCheckpoint`; the
+service wraps it in `CheckpointResult<void>` and stores only the runtime incarnation
+for the next restore.
 
-## Синхронный bool и асинхронная операция
+```mermaid
+sequenceDiagram
+    participant S as CheckpointService worker
+    participant C as CheckpointCreator
+    participant F as FilesystemStorage
+    participant P as PodmanAdapter
+    participant H as SnapshotChunker
 
-Scheduler-facing `IHypervisorClient` сохраняет исходную семантику `bool`:
-`true` означает подтверждённое завершение операции, `false` — любой конечный или
-неопределённый неуспех. Он не должен возвращать `true` сразу после принятия
-длительной операции.
+    S->>C: create(request, caller IDs)
+    C->>F: begin_operation(create_checkpoint)
+    F-->>C: exclusive per-container lease and staging
+    C->>C: new CheckpointId and max committed generation + 1
+    C->>P: capture(runtime-artifact, CPU assignment)
+    P-->>C: opaque artifact, image identity, fingerprint, incarnation
+    C->>H: ingest(runtime-artifact tree)
+    H->>F: validate/reuse or publish chunks
+    H-->>C: ordered artifact descriptors
+    C->>C: encode canonical Manifest v1
+    C->>F: publish_manifest
+    Note over C,F: confirmed publication is the commit point
+    C->>F: cleanup staging
+    C-->>S: CreatedCheckpoint or structured error
+```
 
-На wire длительный вызов будет двухфазным:
+The manifest is published last. Before that, published chunks are orphan candidates
+and do not constitute a committed checkpoint. A directory-`fsync` failure after the
+manifest rename produces `publication_may_be_visible`: the operation returns failure,
+but the manifest may already appear in the next listing and occupy the generation.
 
-1. submit с `RequestId` быстро возвращает accepted и стабильный `OperationId`;
-2. `GetOperation` возвращает `queued`, `running`, `succeeded`, `failed` или
+Core does not maintain a journal/idempotency table. Unique `RequestId` and
+`OperationId` values for a new attempt are the caller's responsibility. Production
+storage rejects only a conflict with retained staging for the same operation key; a
+retry after successful cleanup is not an idempotent replay.
+
+Full details: [checkpoint-create.md](checkpoint-create.md).
+
+## Restore Data Flow
+
+A direct `RestoreCoordinator` call returns a `RestoredContainer` with an outcome,
+incarnation, checkpoint metadata, and cleanup flags. Externally,
+`ICheckpointService` returns only success/error and uses the incarnation as an internal
+fence.
+
+```mermaid
+flowchart TD
+    Start[Begin one restore operation and lease]
+    List[List committed generations descending]
+    Candidate[Pin and decode next candidate]
+    Compatible[Validate exact runtime and image compatibility]
+    Reassemble[Verify chunks and reassemble snapshot-generation]
+    Fence[Stop expected source or prove absence]
+    Restore[Attempt Podman restore]
+    CleanupProof[Cleanup failed attempt or prove absence]
+    Cold[Attempt one explicit cold start]
+    Success[Return runtime success]
+    Failure[Return structured failure]
+
+    Start --> List
+    List --> Candidate
+    Candidate -->|corrupt, incompatible, or not found| Candidate
+    Candidate --> Compatible
+    Compatible -->|skippable code| Candidate
+    Compatible --> Reassemble
+    Reassemble -->|skippable code| Candidate
+    Reassemble --> Fence
+    Fence --> Restore
+    Restore -->|success| Success
+    Restore -->|failure| CleanupProof
+    CleanupProof -->|absence proven| Candidate
+    CleanupProof -->|uncertain| Failure
+    Candidate -->|no candidates| Cold
+    Cold -->|success| Success
+    Cold -->|failure| Failure
+```
+
+The fallback decision currently depends on the stable error code: `not_found`,
+`corrupted_snapshot`, and `incompatible_runtime` are skippable regardless of which
+collaborator produced them. Collaborators must therefore not mask a control-plane
+failure with one of these codes.
+
+The first suitable candidate is fully reassembled before the known source incarnation
+is stopped. After a failed restore and confirmed cleanup, older candidates are checked
+during downtime. This is important when estimating worst-case recovery latency.
+
+Full details: [checkpoint-restore.md](checkpoint-restore.md).
+
+## Service Core: Concurrency and Scheduling
+
+`CheckpointService` supports at most four registration slots. Each slot has a separate
+persistent worker pinned to `checkpoint_cpu` and a mailbox with capacity one. The
+control caller thread is not rebound.
+
+Guarantees within a single service instance:
+
+- create and restore for the same `ContainerId` are serialized;
+- operations in different slots may run concurrently;
+- a second synchronous caller waits for the slot to become available;
+- a periodic tick is skipped if the slot is busy, with no catch-up burst;
+- unregister closes the slot to new work and waits for accepted/active manual work;
+- shutdown closes all slots, stops the scheduler, and joins the workers;
+- a worker catches exceptions from the operation implementation and remains available.
+
+Limitations:
+
+- FIFO/fairness among multiple manual callers and the scheduler is not guaranteed;
+- operation cancellation and service-level deadlines are not implemented;
+- a hung collaborator may delay the caller, unregister, and shutdown indefinitely;
+- a periodic result is available only through `ILogger`;
+- a periodic `RequestId` is constructed as `periodic-<container>-<slot-sequence>` and
+  may repeat after unregister/re-register; `OperationId` is generated separately;
+- an exception in the scheduler loop is logged and terminates periodic scheduling
+  without a health API;
+- affinity restoration may fail, and that error is returned by explicit
+  unregister/shutdown; the destructor cannot report it to the caller.
+
+Details: [service-core.md](service-core.md).
+
+## Persistence Boundary
+
+A committed checkpoint is defined by the presence of a canonical manifest, not staging
+or a chunk. The main layout is:
+
+```text
+root/
+  containers/<container-key>/
+    identity
+    manifests/<20-digit-generation>.json
+    chunks/<two-hex-prefix>/<64-hex-blake3>
+    staging/<operation-key>/...
+  locks/<container-key>.lock
+  tmp/
+```
+
+Raw IDs do not become path components: storage uses domain-separated BLAKE3 keys and
+checks the immutable `identity`. The operation lease is held until the operation state
+is destroyed; a longer-lived pin may extend the lease. Manifest/chunk publication is
+immutable and no-replace.
+
+`FilesystemStorage` trusts a pre-created absolute root and an administrator who does
+not change the namespace under the running process. It applies descriptor-relative
+and no-follow checks, but mount-ID containment for snapshot trees is provided only by
+chunking/reassembly. NFS/FUSE/overlay and filesystems without reliable directory
+`fsync` have not been qualified.
+
+Details: [filesystem-storage.md](filesystem-storage.md),
+[chunking.md](chunking.md), [manifest-v1.md](manifest-v1.md).
+
+## Runtime Boundary
+
+`PodmanAdapter` implements only `podman-criu-rootful-v1`. It checks the exact
+fingerprint, immutable image ID, ownership labels, cpuset, and immutable 64-hex runtime
+ID. `ContainerId`, stable `RuntimeContainerRef`, and single-lifetime
+`RuntimeIncarnation` are not interchangeable.
+
+The main safety rules are:
+
+- capture uses an opaque `checkpoint.tar` and `--leave-running`;
+- the source image must remain available in the local Podman image store for restore;
+- stop/remove is permitted only for the expected incarnation;
+- `confirm_absence` performs both regular and external read-only existence probes;
+- destructive failed-restore cleanup is permitted only after its own attempt, which
+  began when absence had been proven under a continuous per-container lease;
+- an unknown fingerprint or image mismatch fails closed;
+- runtime stderr is not included in production adapter diagnostics.
+
+Qualification is tied to a specific rootful host profile and makes no general claims
+about other kernels, versions, architectures, or security policies. See
+[testbed.md](testbed.md) and
+[ADR 0001](adr/0001-podman-criu-runtime-profile.md).
+
+## Errors and Indeterminate Side Effects
+
+`CheckpointErrorDetail` contains:
+
+- a stable `StableErrorCode`;
+- an internal diagnostic;
+- `retryable`;
+- an optional correlation `RequestId`;
+- `StorageSideEffect`;
+- `RuntimeSideEffect`.
+
+The two side-effect flags cannot be inferred from the error code alone:
+
+- `publication_may_be_visible` means that an immutable publication may have become
+  visible even though durability was not confirmed;
+- `incarnation_may_exist` means that a runtime incarnation may have been created or
+  its absence was not proven.
+
+After such a result, a destructive action must not be retried automatically without
+reconciliation/absence proof. The service conservatively adds these flags to
+exceptions because the exception may have occurred after an opaque side effect.
+
+Diagnostics are currently internal. The future wire boundary should return a stable
+code/status/correlation, but not arbitrary internal diagnostics.
+
+## Future Async IPC Contract
+
+The following section is a design, not an implemented API.
+
+The scheduler-facing `IHypervisorClient` retains synchronous `bool` semantics:
+`true` must mean confirmed completion, not merely acceptance of a long-running
+operation. The planned wire flow is:
+
+1. submit with a unique `RequestId` returns accepted and an `OperationId`;
+2. `GetOperation` returns `queued`, `running`, `succeeded`, `failed`, or
    `indeterminate`;
-3. concrete SchedulerClient реализует bool wrapper как submit + bounded wait,
-   сохраняя различие operation states во внутренних результатах и логах.
+3. the concrete scheduler client implements a bounded wait over submit/poll;
+4. a disconnect does not cancel an accepted operation;
+5. repeating the same request/payload returns the previous operation, while reusing an
+   ID with a different payload is rejected.
 
-Разрыв соединения не отменяет уже принятую операцию. Повтор того же `RequestId`
-с тем же payload должен вернуть прежнюю операцию; reuse с другим payload должен
-быть отвергнут.
+Neither a journal, deduplication, nor `GetOperation` is currently implemented. The
+current synchronous service core does not itself provide the described idempotency.
 
-## Wire protocol и безопасность
+The planned transport is:
 
-Transport/server появятся только в этапе 10. Зафиксированный будущий контракт:
+- local `AF_UNIX/SOCK_SEQPACKET`;
+- a version handshake and bounded JSON envelope;
+- an exact schema that rejects unknown fields/methods/versions;
+- socket owner/group/mode and `SO_PEERCRED`;
+- repeated server-side validation of all IDs and cold-start data.
 
-- локальный `AF_UNIX/SOCK_SEQPACKET`, socket path из конфигурации;
-- version handshake и bounded JSON envelope;
-- обязательные `protocol_version`, `request_id`, `method`, `payload` и response
-  status;
-- отказ на неизвестных version/method/fields и malformed payload до побочных
-  эффектов;
-- owner/group/mode socket и проверка `SO_PEERCRED`;
-- повторная валидация всех ID, runtime references, путей и cold-start данных на
-  стороне hypervisor.
+Local IPC must not be treated as a trusted boundary.
 
-Локальный IPC не считается доверенной границей.
+## Lifecycle and Features Not Yet Implemented
 
-## Lifecycle и reconnect
+The following are still required for an operational MVP:
 
-Scheduler остаётся владельцем desired registrations. После старта или reconnect
-он выполняет version handshake и идемпотентно повторяет `Register` для желаемого
-набора. Hypervisor восстанавливает только безопасные terminal operation records и
-committed checkpoint; секретный environment cold start в journal не попадает.
-Прерванные create/restore после рестарта классифицируются как `failed` или
-`indeterminate`, но не как фиктивный успех.
+1. a composition root for storage, hashing, runtime, create/restore, and the service;
+2. configuration of the storage root, Podman/CRIU paths, socket, and logging;
+3. a Unix socket server and concrete scheduler client;
+4. a bounded async operation registry/journal and reconnect semantics;
+5. startup reconciliation for indeterminate publications and stale staging;
+6. retention according to `keep_last`, with pin-aware deletion;
+7. garbage collection of orphan chunks/temp/staging;
+8. an end-to-end test of the complete daemon flow.
 
-`Unregister` в будущей реализации остановит новые периодические задачи,
-согласует активную операцию и только затем освободит один из четырёх слотов.
+Until these layers exist, the Scheduler cannot perform registration or checkpointing
+through `gravesentinel_hypervisor`, and `keep_last` does not limit the number of
+manifests.
 
-## Сборка и проверки
+## Build and Checks
 
-Проект использует Bazel с Bzlmod и C++23:
+The project uses Bazel `8.8.2`, Bzlmod, and C++23. Project-local Starlark macros enable
+strict warnings and `-Werror` without imposing them on external repositories.
+
+The primary check is:
+
+```text
+bazel test //:checks
+```
+
+It includes the clang-format test and `//tests/unit:unit_tests`. Broader commands are:
 
 ```text
 bazel build //...
@@ -292,7 +469,13 @@ bazel test //...
 bazel test //scripts:clang_format_test
 ```
 
-Профили доступны как `--config=debug`, `--config=release`, `--config=asan`,
-`--config=ubsan` и `--config=tsan`. Sanitizer-профили запускаются отдельно друг от
-друга. Строгие warning flags применяются только через project-local Starlark
-macros и не навязываются внешним repositories.
+Unlike `//:checks`, the wildcard test also finds non-manual tests outside the unit
+suite, such as the integration fixture's unit test.
+
+Manual integration targets are excluded from `bazel test //...`. They should be run
+only in a qualified rootful environment according to the instructions in
+[testbed.md](testbed.md). `bazel build //:hypervisor` successfully builds the current
+stub, but running it intentionally returns failure.
+
+Independent profiles `--config=debug`, `--config=release`, `--config=asan`,
+`--config=ubsan`, and `--config=tsan` are available.

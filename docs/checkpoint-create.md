@@ -5,13 +5,19 @@
 `//src/core:checkpoint_creator` is the stage-07 synchronous orchestration layer.
 It connects `IPodmanAdapter`, `ISnapshotChunker`, Manifest v1, and `IStorage`
 without adding periodic scheduling, restore selection, retention, startup recovery,
-or garbage collection.
+or garbage collection. It is implemented and unit-tested as a library, but the
+current `gravesentinel_hypervisor` binary is still a stub and does not instantiate
+this layer or a production service composition. See [Checkpoint service
+core](service-core.md) for the current wiring boundary.
 
 A create request carries the already assigned `RequestId` and `OperationId`, the
 logical `ContainerId`, the stable runtime reference, and the runtime/checkpoint
-CPU assignment. A successful result identifies the immutable `CheckpointId`,
-its per-container generation, the captured runtime incarnation, and whether
-post-commit staging cleanup was confirmed.
+CPU assignment. A direct successful `CheckpointCreator::create` result identifies
+the immutable `CheckpointId`, its per-container generation, the captured runtime
+incarnation, and whether post-commit staging cleanup was confirmed. The
+`ICheckpointService::create_checkpoint` facade deliberately returns only
+`CheckpointResult<void>` and retains the source incarnation internally; it does
+not expose the checkpoint identity, generation, or cleanup-completion flag.
 
 ## State machine
 
@@ -29,16 +35,22 @@ The terminal state is `INCOMPLETE` when staging cleanup fails or manifest
 publication reports `StorageSideEffect::publication_may_be_visible`. Every
 transition is emitted through `ILogger` with container, request, operation,
 checkpoint/generation when assigned, and the stable error code and diagnostic on
-failure. Cold-start environment values and artifact contents are never logged.
+failure. The creator does not intentionally add artifact contents or secret values
+to logs, but it logs collaborator-provided `CheckpointErrorDetail::diagnostic`
+text verbatim. Storage, runtime, chunker, ID-generator, and other injected
+implementations must therefore sanitize diagnostics and must not include artifact
+contents, credentials, or environment values.
 
 ## Lease, identity, and generation
 
 Creation begins with
-`IStorage::begin_operation(..., StorageOperationKind::create_checkpoint)`. The
-returned move-only operation owns the exclusive cross-process per-container
-storage lease until the operation object is destroyed. Create, restore,
-retention, and conflicting cleanup for the same logical container therefore
-cannot overlap, while different containers have independent leases.
+`IStorage::begin_operation(..., StorageOperationKind::create_checkpoint)`. With
+production `FilesystemStorage`, the returned move-only operation owns an exclusive
+cross-process per-container storage lease until the operation object is destroyed.
+Create, restore, retention, and conflicting cleanup through that backend therefore
+cannot overlap for one logical container, while different containers have
+independent leases. An arbitrary `IStorage` implementation must provide equivalent
+semantics for this orchestration guarantee to hold.
 
 Only after acquiring the lease does the creator:
 
@@ -46,10 +58,19 @@ Only after acquiring the lease does the creator:
 2. list committed manifests;
 3. compute `max(committed generation) + 1` with overflow rejection.
 
-An `OperationId` is never resumed. A retry is a new request with a new operation
-ID, receives a new checkpoint ID, and performs a new runtime capture. A failed
-attempt does not reserve its generation because generation ordering is defined
-only by committed manifests.
+The core has no request journal, duplicate-ID table, or idempotency mechanism.
+Callers own `RequestId` and `OperationId` uniqueness and must use fresh values for
+a retry. `FilesystemStorage` rejects an `OperationId` while an incomplete staging
+directory with that ID still exists, rather than resuming it, but neither the
+creator nor the service rejects an ID merely because it was used by an earlier
+operation whose staging was removed. A fresh retry receives a new checkpoint ID
+and performs a new runtime capture.
+
+A definitely uncommitted failed attempt does not reserve its generation because
+generation ordering is defined only by manifests returned by committed-manifest
+listing. An indeterminate manifest publication is the exception: if a rename
+became visible before durability confirmation failed, that manifest can appear in
+a later listing and cause the next attempt to select the following generation.
 
 ## Capture and chunk publication
 
@@ -58,8 +79,11 @@ only by committed manifests.
 `state` and pin metadata. The creator passes only this directory to
 `IPodmanAdapter::capture`. The production Podman adapter exports a complete
 opaque checkpoint with `--leave-running`, so the source container resumes after
-the runtime capture boundary. The returned artifact must be a normalized
-regular file below the dedicated directory.
+the runtime capture boundary. The returned artifact must be an absolute,
+lexically normalized regular file below the dedicated directory. The production storage, adapter, and
+chunker additionally bind and re-check directory/file identities; the abstract
+`IPodmanAdapter` contract alone does not provide that filesystem containment
+guarantee.
 
 After capture, the creator records the wall-clock timestamp for diagnostics and
 passes the complete dedicated directory to `ISnapshotChunker`. The production
@@ -84,10 +108,14 @@ with:
 - ordered artifact metadata and chunk references returned by the chunker.
 
 The canonical manifest is serialized before any manifest publication call. The
-single `IStorageOperation::publish_manifest` call is the commit point and is
-strictly the last publication in the transaction. No chunks can be published
-through a filesystem operation after manifest publication succeeds or reaches
-an indeterminate rename-completed outcome.
+creator itself makes a single `IStorageOperation::publish_manifest` call;
+that call is the commit point and is strictly the last publication made by the
+creator. The production `SnapshotChunker` publishes only chunks, and
+`FilesystemStorage` rejects further chunk publication after manifest publication
+succeeds or reaches an indeterminate rename-completed outcome. A custom
+`ISnapshotChunker` receives the full `IStorageOperation` interface, so it must obey
+the same manifest-last rule; the type system does not restrict it to chunk-only
+methods.
 
 Only confirmed manifest publication transitions to `COMMITTED`. Previous
 manifests are not removed or modified by this stage. Retention is deferred to
@@ -121,6 +149,12 @@ its crash durability was not confirmed. The creator reports failure and
 possibly observed immutable manifest. Existing committed checkpoints remain
 valid. A later recovery layer must reconcile this outcome.
 
+`StorageSideEffect::publication_may_be_visible` describes a storage side effect,
+not by itself a committed-checkpoint outcome. The same flag can accompany a chunk
+publication failure; in that case the creator reports definite checkpoint failure
+and logs `FAILED`, because no manifest was committed, while preserving the flag to
+report that an orphan chunk may be visible.
+
 ## Verification
 
 `//tests/unit:checkpoint_creator_test` uses fake runtime/storage/clock/ID/logger
@@ -132,4 +166,9 @@ checked against three pre-existing canonical checkpoints whose referenced chunks
 are reassembled byte-for-byte with the production reassembler.
 
 The lower-level production storage, chunker, Manifest v1 codec, and Podman adapter
-retain their own unit and opt-in rootful integration tests.
+retain their own unit and opt-in rootful integration tests. These tests do not
+constitute production service wiring: there is currently no end-to-end binary
+composition of `CheckpointService`, `CheckpointCreator`, `FilesystemStorage`, and
+`PodmanAdapter`. The creator tests also do not cover every possible collaborator
+contract violation, such as a foreign pre-populated correlation ID or a mismatched
+source-incarnation reference.

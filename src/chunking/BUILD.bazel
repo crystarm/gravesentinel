@@ -1,0 +1,27 @@
+load("//build_defs:cc.bzl", "gravesentinel_cc_library")
+
+package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_library(
+    name = "snapshot_chunker",
+    srcs = ["snapshot_chunker.cxx"],
+    hdrs = ["snapshot_chunker.hxx"],
+    deps = [
+        "//src/core:ccm_core",
+        "//src/manifest:manifest",
+        "//src/storage:filesystem_storage",
+    ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = [
+        "snapshot_chunker.cxx",
+        "snapshot_chunker.hxx",
+    ],
+    visibility = ["//scripts:__pkg__"],
+)

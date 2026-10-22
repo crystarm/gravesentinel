@@ -25,6 +25,12 @@ filegroup(
 )
 
 filegroup(
+    name = "checkpoint_restore",
+    srcs = ["checkpoint-restore.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "filesystem_storage",
     srcs = ["filesystem-storage.md"],
     visibility = ["//visibility:public"],

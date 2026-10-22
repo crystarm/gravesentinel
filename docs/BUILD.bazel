@@ -1,6 +1,12 @@
 package(default_visibility = ["//visibility:private"])
 
 filegroup(
+    name = "index",
+    srcs = ["README.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "architecture",
     srcs = ["architecture.md"],
     visibility = ["//visibility:public"],
@@ -46,6 +52,23 @@ filegroup(
     name = "testbed",
     srcs = [
         "adr/0001-podman-criu-runtime-profile.md",
+        "testbed.md",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "all_docs",
+    srcs = [
+        "README.md",
+        "adr/0001-podman-criu-runtime-profile.md",
+        "architecture.md",
+        "checkpoint-create.md",
+        "checkpoint-restore.md",
+        "chunking.md",
+        "filesystem-storage.md",
+        "manifest-v1.md",
+        "service-core.md",
         "testbed.md",
     ],
     visibility = ["//visibility:public"],

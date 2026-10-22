@@ -13,6 +13,12 @@ filegroup(
 )
 
 filegroup(
+    name = "filesystem_storage",
+    srcs = ["filesystem-storage.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "testbed",
     srcs = [
         "adr/0001-podman-criu-runtime-profile.md",

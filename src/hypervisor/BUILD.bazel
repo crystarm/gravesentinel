@@ -1,0 +1,16 @@
+load("//build_defs:cc.bzl", "gravesentinel_cc_binary")
+
+package(default_visibility = ["//visibility:private"])
+
+gravesentinel_cc_binary(
+    name = "gravesentinel_hypervisor",
+    srcs = ["main.cxx"],
+    deps = ["//src/core:ccm_core"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = ["main.cxx"],
+    visibility = ["//scripts:__pkg__"],
+)

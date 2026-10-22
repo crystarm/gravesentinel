@@ -14,7 +14,8 @@ exported checkpoint belongs to the runtime and is not a CCM-defined file format.
 The stage 02 fixture and smoke were executed twice end to end on the target host.
 Both runs passed checkpoint with `--leave-running`, source removal, import under a
 new name, in-memory state continuity, CPU-affinity checks, negative restore, and
-bounded cleanup. Detailed observations are recorded in `docs/testbed.md`.
+bounded cleanup. Detailed observations are recorded in
+[testbed.md](../testbed.md).
 
 Rootless setup was investigated but is not viable for this version: Podman 5.4.2
 rejects the actual checkpoint operation with `checkpointing a container requires
@@ -39,6 +40,35 @@ The accepted MVP runtime profile is:
 Rootless Podman, remote Podman, and any version or host-profile variation are
 unsupported until independently requalified. Stage 06 may implement real Podman
 support only for this accepted profile and must fail closed for unknown profiles.
+
+## Implementation and verification notes
+
+These notes record the current implementation boundary without changing the
+accepted decision or the historical qualification result.
+
+The successful stage-02 runs on 2026-10-21 and the production adapter run on
+2026-10-22 are dated recorded evidence for the measured host. They are not a
+claim that a current deployment has been rechecked. This repository retains the
+observations and success markers, but not raw qualification logs, signed or
+checksummed host reports, checkpoint hashes, or a CI evidence bundle from those
+runs. A current deployment is verified only by rerunning the prerequisite gate
+and the applicable complete destructive smoke in its intended rootful context.
+
+The production libraries exist as `//src/hypervisor:linux_runtime` and
+`//src/hypervisor:podman_adapter`, but
+`//src/hypervisor:gravesentinel_hypervisor` is not wired to them. Its current
+entry point fails immediately, so the adapter smoke exercises the production
+libraries through a purpose-built integration helper rather than through the
+production hypervisor process, IPC, storage, or service composition.
+
+The prerequisite gate is intentionally less exact than the adapter profile. It
+checks the main host capabilities and runs `criu check`, but it does not enforce
+the exact Debian release/codename and Podman build origin, CRIU version, crun
+commit and complete required feature set, exact cgroup controller set, or the
+adapter's AppArmor/SELinux/seccomp/capability observations. The direct smoke can
+therefore pass outside the exact adapter profile. The adapter-mode smoke also
+executes the adapter's strict validation and is the relevant gate for the
+implemented production library.
 
 ## Qualified command boundary
 
@@ -85,11 +115,14 @@ checkpoint/restore commands above, its cold-start argv is:
 ```
 
 The optional environment file is created under the private adapter staging root
-with mode `0600`, is never logged or persisted, and is removed immediately after
-the synchronous Podman invocation. Workload environment values are never placed
-in Podman's own process environment or command-line arguments. Values containing
-NUL, CR, or LF are rejected. Mounts and arbitrary runtime options are rejected by
-v1 instead of being mapped to an unqualified command form.
+with mode `0600`. Its contents are not logged or copied into manifests/storage
+metadata, Podman's process environment, or command-line arguments; only the file
+path is passed through `--env-file`. After the synchronous Podman invocation the
+adapter attempts to unlink the file, and an unlink failure makes the operation
+fail. The destructor retries best-effort, but if both unlink attempts fail the
+file can remain and requires trusted staging cleanup. Values containing NUL, CR,
+or LF are rejected. Mounts and arbitrary runtime options are rejected by v1
+instead of being mapped to an unqualified command form.
 
 Operational inspection and cleanup use these exact argv forms:
 
@@ -105,13 +138,61 @@ Operational inspection and cleanup use these exact argv forms:
 ["podman", "container", "exists", "--external", RUNTIME_NAME]
 ```
 
-The adapter requires the qualified Podman/CRIU/kernel/cgroup/crun versions,
-rootful local mode and the recorded controller/security profile: Podman AppArmor
-and seccomp enabled, SELinux disabled, with crun AppArmor support present. It
-records a canonical fingerprint and requires exact equality before restore. The
-production adapter-mode smoke qualified these stage-06 assumptions on the rootful
-host on 2026-10-22 and ended with
-`RESULT: QUALIFIED production PodmanAdapter smoke passed`.
+The adapter's implemented acceptance checks require:
+
+- Podman client version `5.4.2`, `OsArch=linux/amd64`, `BuildOrigin=Debian`, and
+  Podman info version `5.4.2`;
+- Podman host distribution `debian`, version `13`, codename `trixie`, architecture
+  `amd64`, and kernel `6.12.111+deb13-amd64`;
+- local rootful mode, null uid/gid mappings, cgroup v2 with the `systemd` manager,
+  and exactly `cpu cpuset hugetlb io memory misc pids rdma` controllers;
+- AppArmor enabled, SELinux disabled, seccomp enabled with
+  `/usr/share/containers/seccomp.json`, and the qualified Podman capability set;
+- `crun` with first version line `crun version 1.21`, commit
+  `10269840aa07fb7e6b7e1acff6198692d8ff5c88`, and required `+APPARMOR`, `+CAP`,
+  `+CRIU`, `+SECCOMP`, and `+SELINUX` tokens;
+- CRIU with first version line `Version: 4.1.1` and command profile
+  `podman-criu-rootful-v1`.
+
+It records a canonical fingerprint and requires exact equality before restore.
+The adapter invokes `criu --version` but does not run `criu check`; the separate
+prerequisite gate remains required. It validates the enabled/disabled security
+state and seccomp path, but does not fingerprint AppArmor policy contents, the
+contents of the seccomp file, or the host LSM policy set. Such policy changes
+still require explicit requalification even when the canonical fingerprint is
+unchanged.
+
+Restore also performs `podman image inspect` on the snapshot's immutable source
+image identity. The source image must remain available in the local Podman image
+store after the original container is removed and until restore validation has
+completed.
+
+The production adapter-mode smoke qualified these stage-06 assumptions on the
+rootful host on 2026-10-22 and ended with
+`RESULT: QUALIFIED production PodmanAdapter smoke passed`. This remains dated
+recorded evidence under the verification boundary above.
+
+### Implemented limits and test coverage boundary
+
+The default adapter limits are 10 seconds for profile and inspection commands,
+5 minutes for checkpoint/restore/cold-start, 30 seconds for cleanup, and a
+2-second TERM-to-KILL grace period. JSON and stdout are limited to 1 MiB each,
+stderr to 64 KiB, adapter-supplied argv to 256 entries excluding the executable
+with 16 KiB per entry, and process environment to 256 entries with 64 KiB per
+value. Because the argv limit includes
+the fixed Podman profile arguments and image reference, at most 241 workload
+arguments fit without an env-file and 239 with an env-file. Higher-level
+registration validation may impose smaller string and aggregate limits.
+
+The direct stage-02 shell checks ordinary Podman container absence but does not
+probe `podman container exists --external`. Ordinary and external absence is
+proved by the production adapter path used in the stage-06 adapter smoke. The
+adapter smoke uses an empty workload environment, so it does not exercise the
+transient env-file against real Podman. Scripted unit tests cover creation, mode,
+argument/process-environment exclusion, and successful removal; they do not turn
+an underlying unlink failure into a guaranteed cleanup. The direct shell also has no per-command timeout
+around each Podman build/inspect/checkpoint/restore/cleanup invocation; Bazel
+provides only an overall long test timeout for the corresponding test target.
 
 ## Artifact decision
 

@@ -1,0 +1,9 @@
+/bazel-*
+/.cache/
+/AGENTS.md
+/.dev/notes/
+
+/.clangd/
+/compile_commands.json
+*.profraw
+*.profdata

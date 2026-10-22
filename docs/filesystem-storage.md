@@ -5,78 +5,175 @@
 `//src/storage:filesystem_storage` is the durable filesystem backend for CCM. It
 implements storage transactions, immutable file publication, bounded reads,
 per-container locks, operation staging, runtime artifact directories, and
-manifest pins. Chunking, chunk hash verification, and the implemented create
-transaction remain separate layers; restore orchestration, retention, and garbage
-collection are deferred to later stages.
+manifest pins. [Manifest encoding and validation](manifest-v1.md),
+[chunking, chunk hash verification, and reassembly](chunking.md), and the
+implemented create/restore orchestration remain separate layers. Retention,
+garbage collection, and startup recovery are not implemented.
 
 The supported MVP profile is a local Linux filesystem that provides:
 
 - atomic same-filesystem `renameat2(RENAME_NOREPLACE)` or hard-link publication;
 - working file and directory `fsync`;
 - `flock` locks shared by all hypervisor processes using the storage root;
-- Linux `openat2` with `RESOLVE_NO_SYMLINKS`/`RESOLVE_NO_MAGICLINKS` and
-  `statx` mount IDs;
+- Linux `openat2` with `RESOLVE_NO_SYMLINKS`/`RESOLVE_NO_MAGICLINKS`;
 - accessible Linux `/proc/self/fd` for reopening an already type-checked inode;
+- for callers using the same file-operations adapter for snapshot ingest or
+  reassembly, Linux `statx` mount IDs as required by the
+  [chunking-layer mount boundary](chunking.md#filesystem-and-mount-boundary);
 - normal POSIX behavior for `openat`, `mkdirat`, `unlinkat`, and regular files.
 
 NFS, FUSE, overlay mounts, or filesystems that reject directory `fsync` are not
 silently treated as durable. A directory-sync failure is an operation failure.
 The configured root must already exist, be absolute, and be trusted by the
-hypervisor administrator. Its final component is opened with `O_NOFOLLOW`.
+hypervisor administrator. The production backend opens the absolute path with
+`openat2(RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`, which rejects symlinks in
+any component and is stronger than checking only the final component. The public
+`FilesystemStorage::open` validation does not currently reject an embedded NUL in
+the C++ `filesystem::path`; callers must not supply one, because a POSIX syscall
+would interpret only the prefix before that byte while the retained path object
+would still contain the suffix.
+
+`FilesystemStorage` itself does not require or compare mount IDs for directories
+beneath that root and therefore does not reject a nested bind mount or another
+mount crossing in `containers/`, `locks/`, or their descendants. Mount-ID
+containment is enforced by `SnapshotChunker` and `SnapshotReassembler`, not by the
+storage namespace implementation. The administrator must keep the trusted storage
+layout free of unintended nested mounts. This is an implementation boundary, not
+a storage guarantee.
 
 ## Layout and path mapping
 
 The on-disk layout is internal and versioned by its metadata rather than exposed
-to Scheduler:
+to Scheduler. The complete current layout includes storage-owned entries,
+algorithm-owned reassembly output, and possible hidden publication temporaries:
 
 ```text
 root/
   containers/
     <container-key>/
       identity
+      .tmp-<32-lowercase-hex>                 # transient or stale identity temp
       manifests/
         <20-digit-generation>.json
+        .tmp-<32-lowercase-hex>               # transient or stale manifest temp
       chunks/
-        <two-hex-prefix>/<64-hex-blake3>
+        <two-hex-prefix>/
+          <64-lowercase-hex-blake3>
+          .tmp-<32-lowercase-hex>             # transient or stale chunk temp
       staging/
         <operation-key>/
           state
           pin-<20-digit-generation>
           runtime-artifact/
+            ... runtime-produced entries ...
+          snapshot/                            # default reassembly output
+            ... reassembled regular files ...
+          <caller-selected-output>/            # e.g. snapshot-9
+            ... reassembled regular files ...
+          .tmp-<32-lowercase-hex>              # transient state or pin temp
   locks/
     <container-key>.lock
-  tmp/
+  tmp/                                         # reserved; currently unused
 ```
 
-`container-key` and `operation-key` are lowercase hex BLAKE3 values over
-separate domain tags and the original identifier bytes. Raw identifiers are
-never path components, so values containing `/`, `.` or `..` cannot escape the
-root. The immutable `identity` file binds a container key back to the logical
-`ContainerId` and makes a key mismatch fail closed. Identifiers used by storage
-are limited to 256 bytes.
+Only `state`, pin files, and hidden publication temporaries are storage metadata
+inside an operation directory. `runtime-artifact/` is the dedicated create-side
+runtime export directory. `snapshot/` and a strict caller-selected
+`[A-Za-z0-9_-]+` alternative are created by the
+[reassembler](chunking.md#reassembly-contract) as siblings, not children, of
+`runtime-artifact/`. Failed operations may leave partial contents in staging;
+committed-manifest listing never traverses staging.
 
-Manifest names contain only their fixed-width decimal generation. This permits
-newest-to-oldest listing even when a manifest body is corrupted and must be
-rejected later by the strict Manifest v1 decoder. A successful publication
-requires a canonical, checksum-valid Manifest v1 whose container and checkpoint
-identities match the operation. A generation must be greater than every
-previously committed generation. Reads additionally bind the body container and
-generation back to the requested storage reference. A corrupt old body remains
-a listed fallback candidate and does not block publication of a newer
-generation; valid old bodies are still checked for namespace binding and
-CheckpointId reuse. Published manifests are never replaced or removed by this
-stage.
+The root-level `tmp/` directory is created, opened, and retained by
+`FilesystemStorage::open`, but the current implementation does not use it.
+Immutable publication creates its hidden temporary in the final destination
+directory so the no-replace operation is necessarily same-filesystem. Consumers
+must not infer a GC or scratch-file contract from the reserved `tmp/` entry.
+
+### Derived keys
+
+Keys are unkeyed BLAKE3-256 digests encoded as exactly 64 lowercase hexadecimal
+characters. The byte derivations are exact:
+
+```text
+container-key = hex(BLAKE3("container" || 0x00 || ContainerId bytes))
+operation-key = hex(BLAKE3("operation" || 0x00 || OperationId bytes))
+```
+
+The domain strings contain no terminator other than the single explicit `0x00`
+separator shown above. Identifiers must contain 1 through 256 bytes and must not
+contain NUL. Storage does not require identifier bytes to be UTF-8; the stricter
+[Manifest v1 text rules](manifest-v1.md#validation-invariants) apply before an ID
+can be persisted in a manifest. Raw identifiers are never path components, so
+values containing `/`, `.` or `..` cannot escape the root.
+
+The immutable `identity` file contains exactly the original `ContainerId` bytes,
+with no header or newline. It binds a container key back to the logical identity
+and makes a key collision or mismatch fail closed with `conflict`. There is no
+corresponding operation identity file: a surviving directory under the derived
+operation key makes reuse fail closed with `conflict`.
+
+### Metadata files
+
+A newly initialized operation publishes `state` with this exact newline-terminated
+format:
+
+```text
+format_version=1
+operation_key=<64-lowercase-hex-operation-key>
+kind=<create_checkpoint|restore|retention|garbage_collection>
+state=active
+```
+
+A manifest pin is named `pin-<20-digit-generation>` and contains:
+
+```text
+format_version=1
+generation=<unpadded-positive-decimal-generation>
+```
+
+The pin body is newline-terminated. The lock file is an empty regular file named
+`<container-key>.lock`. Storage-created regular files request mode `0600`, and
+storage-created directories request mode `0700`; POSIX `openat`/`mkdirat` apply
+the process `umask`, which may remove bits. The implementation does not promise
+exact generated modes under an arbitrary `umask`.
+
+### Manifests
+
+Manifest names contain only their zero-padded 20-digit decimal generation and the
+`.json` suffix. This permits newest-to-oldest listing even when a manifest body is
+corrupted and must be rejected later by the strict
+[Manifest v1 decoder](manifest-v1.md#decoder-acceptance-order). Files with other
+names, including generation zero and hidden temporaries, are ignored by listing.
+A regular file with a valid manifest name but a size greater than 16 MiB causes
+listing to fail as corrupted storage rather than being silently skipped.
+
+A successful publication requires a canonical, checksum-valid Manifest v1 whose
+container and checkpoint identities match the operation. A generation must be
+greater than every previously committed generation name, including a generation
+whose body is no longer decodable. Reads additionally bind the body container and
+generation back to the requested storage reference. A bounded regular old body
+that is malformed, noncanonical, or checksum-invalid remains a listed fallback
+candidate and does not block publication of a strictly newer generation; valid
+old bodies are still checked for namespace binding and `CheckpointId` reuse.
+Published manifests are never replaced or removed by this stage.
 
 ## Directory-descriptor boundary
 
 After opening the trusted root, storage operations are relative to already-open
-directory descriptors. Components are opened with `O_NOFOLLOW`. A final object
-is first opened as `O_PATH`, checked as a regular file with `fstat`, then reopened
-through its stable `/proc/self/fd` handle and checked again for the same inode.
-A FIFO, device, socket, directory, or symlink is therefore rejected before it is
-opened for data I/O. Reads use recorded-size limits, retry `EINTR`, handle short
-reads, reject early EOF, and perform an extra EOF read to detect concurrent
-growth.
+directory descriptors. Generated child names are single components, and child
+directories are opened with `O_NOFOLLOW`. A final object is first opened as
+`O_PATH`, checked as a regular file with `fstat`, then reopened through its stable
+`/proc/self/fd` handle and checked again for the same device and inode. A FIFO,
+device, socket, directory, or symlink is therefore rejected before it is opened
+for data I/O. Reads use recorded-size limits, retry `EINTR`, handle short reads,
+reject early EOF, and perform an extra EOF read to detect concurrent growth.
+
+These checks prevent symlink traversal and final-object type substitution, but
+they do not establish mount containment. Storage directory status may contain an
+optional `statx` mount ID, yet `FilesystemStorage` does not compare it when
+opening the container layout. This differs from the explicit mount-ID checks in
+the [chunker and reassembler](chunking.md#filesystem-and-mount-boundary).
 
 Storage-generated names are single safe components. The implementation does not
 use `weakly_canonical`, an `exists`-then-open check, or raw identifier path
@@ -113,11 +210,26 @@ Read/list/reuse paths and an idempotent publication retry re-`fsync` the relevan
 directory before reporting the visible object as durable, providing an explicit
 reconciliation path.
 
-Creating every new directory is followed by `fsync` of its parent. Existing
-directories are also re-synced before use, so retry after a failed parent sync
-cannot convert a merely visible directory entry into false durable success. The
-random temporary namespace does not repeat after process restart; stale hidden
-temporary files remain ignored until conservative GC.
+Chunk publication first reads an existing final name. If it is absent, storage
+uses the no-replace primitive. When that primitive loses with `already_exists`,
+storage rereads the winning object: equal bytes are accepted only after directory
+`fsync`. If the bytes differ, or the reread fails, the current implementation
+returns the original publication failure, normally `already_exists`; it does not
+remap that race outcome to `corrupted_snapshot` or to the reread error. The
+winning object is never overwritten. A differing object found by the initial
+pre-publication read does produce `corrupted_snapshot`. The per-container lock
+prevents a no-replace race between conforming operations, so this limitation is
+principally relevant to external interference or nonconforming writers.
+
+Every directory created or reopened through the storage `ensure_directory`
+primitive is followed by `fsync` of its parent, so retry after a failed parent
+sync cannot convert a merely visible directory entry into false durable success.
+Public read/list paths and chunk reuse additionally sync the relevant data
+directory before reporting durable success. This is not a guarantee that every
+existing regular-file entry is re-synced on every open: in particular, reopening
+an existing permanent lock file does not re-`fsync` the lock file or `locks/`.
+The random temporary namespace does not repeat after process restart; stale
+hidden temporary files remain ignored until conservative GC.
 
 ## Locks, staging, and pins
 
@@ -141,14 +253,30 @@ the primary error if cleanup also fails.
 
 `pin_manifest` first proves that the selected generation exists, then durably
 publishes pin metadata. The returned RAII pin removes and syncs that metadata on
-release. Explicit operation cleanup is rejected while pins remain. Normal
-cleanup closes the runtime artifact descriptor, recursively removes staging
-without following symlinks, and syncs the staging parent. The per-container
-lease remains held until the operation object is destroyed (or an outliving pin
-releases its final reference). If cleanup fails or the process crashes, the
-staging directory remains incomplete and is ignored by committed-manifest
-listing. Conservative
-stale cleanup and GC policy are intentionally deferred to stage 11.
+release. Explicit operation cleanup is rejected while pins remain.
+
+Normal cleanup closes the runtime artifact descriptor, recursively removes
+operation contents without following symlinks, `fsync`s the operation directory,
+closes its descriptor, removes the operation directory, and then `fsync`s the
+staging parent. The per-container lease remains held until the operation object
+is destroyed, or until an outliving pin releases its final shared operation
+state.
+
+Cleanup is not a transactional rollback. If recursive removal fails early, some
+staging entries may remain. If removal of the operation directory fails after its
+contents were removed, the now-empty directory may remain. If the
+operation-directory unlink succeeds but the final parent `fsync` fails, the
+pathname may already be absent even though deletion durability was not confirmed.
+In the latter two post-close cases, `cleaned` remains false while the
+operation-directory descriptor has already been closed; the current
+implementation does not guarantee that a second `cleanup()` call can reconcile
+the failure. Therefore callers must retain the cleanup error as the authoritative
+outcome and must not assume either that staging remains present or that its
+deletion is durable.
+
+A process crash or any surviving staging entry is ignored by committed-manifest
+listing. Conservative stale cleanup and GC policy are intentionally deferred to
+stage 11.
 
 ## Internal API and errors
 
@@ -168,15 +296,17 @@ artifact path and identity through `runtime_artifact_directory()` and
 reads, immutable chunk publication, final manifest publication, manifest
 pinning, and cleanup. Algorithm layers use the bound container identity rather
 than a second caller-supplied `ContainerId`, preventing cross-namespace
-read/publish
-mismatches. Once manifest
-publication succeeds—or reaches the rename-but-directory-fsync indeterminate
-state—the operation rejects further chunk or manifest publication.
+read/publish mismatches. Once manifest publication succeeds—or reaches the
+rename-but-directory-fsync indeterminate state—the operation rejects further
+chunk or manifest publication.
 
-Filesystem errors are mapped to stable internal codes: space exhaustion,
-permission denial, not found, conflict, or generic storage failure. Diagnostics
-include the failed phase and `errno` text but no payload, environment value, or
-cold-start secret.
+Filesystem errors are mapped to stable internal codes: `ENOSPC` and `EDQUOT` to
+`resource_exhausted`; `EACCES`, `EPERM`, and `EROFS` to `permission_denied`;
+`ENOENT` to `not_found`; `EEXIST` to `already_exists`; and `EAGAIN` or
+`EWOULDBLOCK` to `conflict`. Other filesystem errors become `storage_error`.
+Failures caused by `EINTR`, `EAGAIN`, `EBUSY`, or `EIO` are marked retryable when
+they escape the local retry loops. Diagnostics include the failed phase and
+`errno` text but no payload, environment value, or cold-start secret.
 
 ## Verification boundary
 
@@ -187,5 +317,12 @@ permission errors, re-confirmation after failed directory sync, stale temporary
 files and staging after reopen, opaque mapping of traversal-like IDs, symlink and
 FIFO substitution, missing mandatory namespace entries, generation/body
 binding, tolerance of an older corrupt manifest, immutable chunks, dedicated
-runtime artifact layout and identity, initialization rollback, cleanup, lease
-lifetime, and RAII pins. These tests require neither root, Podman, nor CRIU.
+runtime artifact layout and identity, initialization rollback, ordinary cleanup,
+lease lifetime, and RAII pins. These tests require neither root, Podman, nor CRIU.
+
+The current unit suite does not establish mount-ID containment for storage,
+post-unlink cleanup retry behavior, a differing winner in the chunk no-replace
+race, exact generated directory modes under an arbitrary `umask`, embedded-NUL
+root rejection, or execution of the `linkat` publication fallback. Those are
+implementation limitations or untested paths described above, not guarantees
+inferred from the covered cases.

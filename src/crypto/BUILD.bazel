@@ -13,6 +13,7 @@ gravesentinel_cc_library(
     visibility = [
         "//src/core:__pkg__",
         "//src/manifest:__pkg__",
+        "//src/storage:__pkg__",
         "//tests/unit:__pkg__",
     ],
 )

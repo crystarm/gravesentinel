@@ -148,7 +148,24 @@ struct ColdStartSpec {
 struct RuntimeFingerprint {
   std::string runtime_name;
   std::string runtime_version;
+  std::string runtime_build_origin;
   std::string architecture;
+  std::string kernel_release;
+  std::string criu_version;
+  std::string oci_runtime_name;
+  std::string oci_runtime_version;
+  std::string oci_runtime_commit;
+  std::string oci_runtime_features;
+  std::string cgroup_version;
+  std::string cgroup_manager;
+  std::string cgroup_controllers;
+  std::string privilege_mode;
+  std::string user_namespace_mode;
+  std::string capability_profile;
+  std::string selinux_mode;
+  std::string apparmor_profile;
+  std::string seccomp_profile;
+  std::string command_profile;
 
   bool operator==(const RuntimeFingerprint &) const = default;
 };

@@ -76,14 +76,26 @@ validate_container_registration(const ContainerRegistration &registration) {
 
   if (registration.runtime_fingerprint.has_value()) {
     const auto &fingerprint = *registration.runtime_fingerprint;
-    if (!is_nonempty_without_nul(fingerprint.runtime_name) ||
-        !is_nonempty_without_nul(fingerprint.runtime_version) ||
-        !is_nonempty_without_nul(fingerprint.architecture)) {
-      return std::unexpected(make_error(
-          ValidationErrorCode::invalid_runtime_fingerprint,
-          "runtime_fingerprint",
-          "runtime name, version, and architecture must be nonempty and "
-          "contain no NUL"));
+    const std::string *fields[]{
+        &fingerprint.runtime_name,         &fingerprint.runtime_version,
+        &fingerprint.runtime_build_origin, &fingerprint.architecture,
+        &fingerprint.kernel_release,       &fingerprint.criu_version,
+        &fingerprint.oci_runtime_name,     &fingerprint.oci_runtime_version,
+        &fingerprint.oci_runtime_commit,   &fingerprint.oci_runtime_features,
+        &fingerprint.cgroup_version,       &fingerprint.cgroup_manager,
+        &fingerprint.cgroup_controllers,   &fingerprint.privilege_mode,
+        &fingerprint.user_namespace_mode,  &fingerprint.capability_profile,
+        &fingerprint.selinux_mode,         &fingerprint.apparmor_profile,
+        &fingerprint.seccomp_profile,      &fingerprint.command_profile,
+    };
+    for (const auto *field : fields) {
+      if (!is_nonempty_without_nul(*field)) {
+        return std::unexpected(make_error(
+            ValidationErrorCode::invalid_runtime_fingerprint,
+            "runtime_fingerprint",
+            "all runtime fingerprint fields must be nonempty and contain no "
+            "NUL"));
+      }
     }
   }
 

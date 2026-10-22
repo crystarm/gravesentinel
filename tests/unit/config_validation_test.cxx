@@ -12,6 +12,31 @@
 namespace gravesentinel::ccm {
 namespace {
 
+[[nodiscard]] RuntimeFingerprint make_runtime_fingerprint() {
+  return RuntimeFingerprint{
+      .runtime_name = "podman",
+      .runtime_version = "5.4.2",
+      .runtime_build_origin = "Debian 13",
+      .architecture = "amd64",
+      .kernel_release = "6.12.111+deb13-amd64",
+      .criu_version = "4.1.1",
+      .oci_runtime_name = "crun",
+      .oci_runtime_version = "1.21",
+      .oci_runtime_commit = "10269840aa07fb7e6b7e1acff6198692d8ff5c88",
+      .oci_runtime_features = "+APPARMOR +CAP +CRIU +SECCOMP +SELINUX",
+      .cgroup_version = "v2",
+      .cgroup_manager = "systemd",
+      .cgroup_controllers = "cpu cpuset hugetlb io memory misc pids rdma",
+      .privilege_mode = "rootful",
+      .user_namespace_mode = "host",
+      .capability_profile = "CapEff=000001ffffffffff",
+      .selinux_mode = "disabled",
+      .apparmor_profile = "host-default",
+      .seccomp_profile = "default",
+      .command_profile = "podman-criu-rootful-v1",
+  };
+}
+
 [[nodiscard]] ContainerRegistration
 make_registration(std::string suffix, std::uint32_t container_cpu,
                   std::uint32_t checkpoint_cpu) {
@@ -99,13 +124,18 @@ TEST(ContainerRegistrationTest, RejectsEmptyColdStartImage) {
   EXPECT_EQ(result.error().code, ValidationErrorCode::invalid_cold_start_spec);
 }
 
+TEST(ContainerRegistrationTest, AcceptsCompleteRuntimeFingerprint) {
+  auto registration = make_registration("one", 0, 1);
+  registration.runtime_fingerprint = make_runtime_fingerprint();
+
+  EXPECT_TRUE(validate_container_registration(registration));
+}
+
 TEST(ContainerRegistrationTest, RejectsIncompleteRuntimeFingerprint) {
   auto registration = make_registration("one", 0, 1);
-  registration.runtime_fingerprint = RuntimeFingerprint{
-      .runtime_name = "podman",
-      .runtime_version = "",
-      .architecture = "x86_64",
-  };
+  registration.runtime_fingerprint = RuntimeFingerprint{};
+  registration.runtime_fingerprint->runtime_name = "podman";
+  registration.runtime_fingerprint->architecture = "x86_64";
 
   const auto result = validate_container_registration(registration);
 

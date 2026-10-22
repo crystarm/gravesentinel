@@ -8,10 +8,13 @@ The qualified MVP profile is local **rootful** Podman. Rootless Podman 5.4.2 is
 unsupported because it rejects checkpoint creation even when the CRIU and cpuset
 prerequisites pass.
 
-Build the static fixture as the normal repository user:
+Build the static fixture and production adapter smoke driver as the normal
+repository user:
 
 ```text
-bazel build //tests/integration/fixture:counter_fixture
+bazel build \
+  //tests/integration/fixture:counter_fixture \
+  //tests/integration:podman_adapter_smoke_driver
 ```
 
 Check prerequisites without creating a container:
@@ -33,6 +36,25 @@ sudo env \
   --check-script scripts/check_testbed.sh
 ```
 
+Run the stage-06 production adapter smoke with the same fixture and safety checks:
+
+```text
+sudo env \
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  tests/integration/podman_checkpoint_smoke.sh \
+  --fixture-binary bazel-bin/tests/integration/fixture/counter_fixture \
+  --containerfile tests/integration/fixture/Containerfile \
+  --check-script scripts/check_testbed.sh \
+  --adapter-helper bazel-bin/tests/integration/podman_adapter_smoke_driver
+```
+
+This mode executes cold start, checkpoint, expected-incarnation stop/remove,
+failed-restore cleanup and valid restore through the production `PodmanAdapter`,
+`PosixProcessRunner`, and `LinuxAffinityController`. It proves both ordinary and
+external Podman-object absence; the surrounding fixture checks cgroup removal and
+state continuity. Secret workload environment values are passed through a
+transient mode-`0600` env-file, never through Podman's own process environment.
+
 Do not use `sudo bazel` for the normal local workflow. It can create root-owned
 workspace/cache files and may select a different Bazel installation. The manual
 Bazel targets below are intended for CI or another process already running in the
@@ -42,9 +64,11 @@ qualified rootful environment:
 bazel test //tests/integration:testbed_check --test_output=streamed
 bazel test //tests/integration:podman_checkpoint_smoke \
   --test_output=streamed
+bazel test //tests/integration:podman_adapter_smoke \
+  --test_output=streamed
 ```
 
-The smoke builds a `scratch` image without a network pull. It creates only
+Both smoke targets build a `scratch` image without a network pull. It creates only
 uniquely named resources with the `gravesentinel-ccm-smoke-` prefix and a per-run
 ownership label. On ordinary completion and failure it removes its containers,
 image, archive, and observed Podman-managed cgroups. `--keep-artifacts` exists in
@@ -58,5 +82,12 @@ RESULT: QUALIFIED Podman/CRIU checkpoint smoke passed
 ```
 
 The accepted versions, exact argv, observed artifact entries, security limits,
-and two successful qualification runs are recorded in `docs/testbed.md` and
-`docs/adr/0001-podman-criu-runtime-profile.md`.
+and two successful stage-02 qualification runs are recorded in `docs/testbed.md`
+and `docs/adr/0001-podman-criu-runtime-profile.md`. The adapter target has a
+separate success marker:
+
+```text
+RESULT: QUALIFIED production PodmanAdapter smoke passed
+```
+
+It must pass in the rootful profile before stage 06 can be marked complete.

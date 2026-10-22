@@ -16,8 +16,14 @@ gravesentinel_cc_library(
 gravesentinel_cc_binary(
     name = "counter_fixture",
     srcs = ["main.cxx"],
-    linkopts = ["-static"],
-    linkstatic = True,
+    linkopts = select({
+        "//:sanitizer_enabled": [],
+        "//conditions:default": ["-static"],
+    }),
+    linkstatic = select({
+        "//:sanitizer_enabled": False,
+        "//conditions:default": True,
+    }),
     deps = [":counter_fixture_lib"],
     visibility = ["//tests/integration:__pkg__"],
 )

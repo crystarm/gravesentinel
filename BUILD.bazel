@@ -1,5 +1,11 @@
 package(default_visibility = ["//visibility:private"])
 
+config_setting(
+    name = "sanitizer_enabled",
+    define_values = {"gravesentinel_sanitizer": "true"},
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "distribution_files",
     srcs = [

@@ -467,10 +467,16 @@ struct CheckpointService::Implementation {
               "a checkpoint worker cannot unregister its own container",
               &request_id));
         }
-        slot->closing = true;
-        if (slot->pending.has_value() && slot->pending->periodic) {
-          slot->pending.reset();
+        if (slot->running ||
+            (slot->pending.has_value() && !slot->pending->periodic)) {
+          return std::unexpected(
+              make_error(StableErrorCode::conflict,
+                         "container has an active checkpoint operation",
+                         &request_id, true));
         }
+        slot->closing = true;
+        if (slot->pending.has_value())
+          slot->pending.reset();
       }
       slot->condition.notify_all();
       timer.interrupt();

@@ -66,6 +66,7 @@ gravesentinel_cc_binary(
         "//src/core:restore_coordinator",
         "//src/hypervisor:linux_runtime",
         "//src/hypervisor:podman_adapter",
+        "//src/hypervisor:rpc_handler",
         "//src/ipc:ipc_server",
         "//src/ipc:operation_store",
         "//src/storage:filesystem_storage",

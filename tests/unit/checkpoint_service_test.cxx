@@ -861,7 +861,7 @@ TEST(CheckpointServiceTest,
 }
 
 TEST(CheckpointServiceTest,
-     UnregisterWaitsForActiveOperationRejectsClosingIdAndFreesSlot) {
+     UnregisterRejectsActiveOperationThenFreesSlotAfterRetry) {
   TestRig rig;
   const std::array registrations{
       make_registration("unregister-0", 0U, 1U),
@@ -890,26 +890,17 @@ TEST(CheckpointServiceTest,
   });
   rig.operations.wait_for_active_calls(1U);
 
-  const auto interrupts_before_unregister = rig.time.interrupt_count();
-  std::optional<CheckpointResult<void>> unregister_result;
-  std::jthread unregister_caller([&] {
-    unregister_result = rig.service.unregister_container(
-        registrations.front().container_id, make_request("unregister-active"));
-  });
-  rig.time.wait_for_interrupt_count(interrupts_before_unregister + 1U);
-
-  const auto rejected_while_closing = rig.service.create_checkpoint(
-      registrations.front().container_id, make_request("closing-create"),
-      make_operation("closing-operation"));
-  expect_error(rejected_while_closing, StableErrorCode::unavailable);
+  const auto rejected = rig.service.unregister_container(
+      registrations.front().container_id, make_request("unregister-active"));
+  expect_error(rejected, StableErrorCode::conflict);
+  EXPECT_TRUE(rejected.error().retryable);
 
   rig.operations.release_blocked_calls();
   operation_caller.join();
-  unregister_caller.join();
   ASSERT_TRUE(operation_result.has_value());
-  ASSERT_TRUE(unregister_result.has_value());
   EXPECT_TRUE(*operation_result);
-  EXPECT_TRUE(*unregister_result);
+  EXPECT_TRUE(rig.service.unregister_container(
+      registrations.front().container_id, make_request("unregister-retry")));
 
   expect_error(
       rig.service.create_checkpoint(registrations.front().container_id,
@@ -1102,7 +1093,7 @@ TEST(CheckpointServiceTest, ContainsAffinityRestoreExceptions) {
 }
 
 TEST(CheckpointServiceTest,
-     RejectsReentrantLifecycleCallWhileUnregisterWaitsForWorker) {
+     RejectsReentrantLifecycleCallAndBusyUnregisterWithoutBlocking) {
   TestRig rig;
   const auto registration = make_registration("reentrant-container", 0U, 1U);
   ASSERT_TRUE(rig.service.register_container(
@@ -1125,23 +1116,19 @@ TEST(CheckpointServiceTest,
   });
   callback_entered.wait();
 
-  const auto interrupts_before_unregister = rig.time.interrupt_count();
-  std::optional<CheckpointResult<void>> unregister_result;
-  std::jthread unregister_caller([&] {
-    unregister_result = rig.service.unregister_container(
-        registration.container_id, make_request("unregister-reentrant"));
-  });
-  rig.time.wait_for_interrupt_count(interrupts_before_unregister + 1U);
+  const auto unregister_result = rig.service.unregister_container(
+      registration.container_id, make_request("unregister-reentrant"));
+  expect_error(unregister_result, StableErrorCode::conflict);
+  EXPECT_TRUE(unregister_result.error().retryable);
   invoke_reentrant_call.count_down();
 
   create_caller.join();
-  unregister_caller.join();
   ASSERT_TRUE(create_result.has_value());
-  ASSERT_TRUE(unregister_result.has_value());
   ASSERT_TRUE(reentrant_result.has_value());
   EXPECT_TRUE(*create_result);
-  EXPECT_TRUE(*unregister_result);
   expect_error(*reentrant_result, StableErrorCode::conflict);
+  EXPECT_TRUE(rig.service.unregister_container(
+      registration.container_id, make_request("unregister-after-reentrant")));
   EXPECT_TRUE(rig.service.shutdown());
 }
 

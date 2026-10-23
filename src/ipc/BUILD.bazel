@@ -1,7 +1,57 @@
 load("//build_defs:cc.bzl", "gravesentinel_cc_library")
+
 package(default_visibility = ["//visibility:private"])
 
-gravesentinel_cc_library(name = "ipc_codec", srcs = ["codec.cxx"], hdrs = ["codec.hxx"], deps = ["@nlohmann_json//:json"], visibility = ["//src/hypervisor:__pkg__", "//src/scheduler_client:__pkg__", "//src/client:__pkg__", "//tests/unit:__pkg__"])
-gravesentinel_cc_library(name = "operation_store", srcs = ["operation_store.cxx"], hdrs = ["operation_store.hxx"], deps = ["//src/crypto:blake3", "@nlohmann_json//:json"], visibility = ["//src/hypervisor:__pkg__", "//tests/unit:__pkg__"])
-gravesentinel_cc_library(name = "ipc_server", srcs = ["server.cxx"], hdrs = ["server.hxx"], deps = [":ipc_codec", "@nlohmann_json//:json"], visibility = ["//src/hypervisor:__pkg__", "//tests/unit:__pkg__"])
-filegroup(name = "format_sources", srcs = ["codec.cxx", "codec.hxx", "server.cxx", "server.hxx", "operation_store.cxx", "operation_store.hxx"], visibility = ["//scripts:__pkg__"])
+gravesentinel_cc_library(
+    name = "ipc_codec",
+    srcs = ["codec.cxx"],
+    hdrs = ["codec.hxx"],
+    deps = ["@nlohmann_json//:json"],
+    visibility = [
+        "//src/client:__pkg__",
+        "//src/hypervisor:__pkg__",
+        "//src/scheduler_client:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+gravesentinel_cc_library(
+    name = "operation_store",
+    srcs = ["operation_store.cxx"],
+    hdrs = ["operation_store.hxx"],
+    deps = [
+        "//src/crypto:blake3",
+        "@nlohmann_json//:json",
+    ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+gravesentinel_cc_library(
+    name = "ipc_server",
+    srcs = ["server.cxx"],
+    hdrs = ["server.hxx"],
+    deps = [
+        ":ipc_codec",
+        "@nlohmann_json//:json",
+    ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = [
+        "codec.cxx",
+        "codec.hxx",
+        "operation_store.cxx",
+        "operation_store.hxx",
+        "server.cxx",
+        "server.hxx",
+    ],
+    visibility = ["//scripts:__pkg__"],
+)

@@ -1,23 +1,48 @@
 #pragma once
 
 #include "src/protocol/types.hxx"
+
 #include <chrono>
 #include <expected>
-#include <nlohmann/json.hpp>
+#include <memory>
+#include <optional>
 #include <string>
-#include <string_view>
+#include <sys/types.h>
 
 namespace gravesentinel::ccm {
 
-struct RpcFailure {
-  std::string message;
-};
-struct RpcReply {
-  nlohmann::json payload;
+enum class RpcFailureCode {
+  invalid_argument,
+  unavailable,
+  deadline_exceeded,
+  permission_denied,
+  protocol_error,
+  server_busy,
+  request_failed,
+  internal_error,
 };
 
-// A deliberately small, privilege-free SOCK_SEQPACKET client. Calls are bounded
-// by the supplied deadline; a reconnect never changes a caller-supplied ID.
+struct RpcFailure {
+  RpcFailureCode code;
+  std::string message;
+
+  bool operator==(const RpcFailure &) const = default;
+};
+
+enum class HealthState { healthy, degraded, unhealthy };
+enum class QueueState { available, saturated };
+
+struct HealthStatus {
+  HealthState state;
+  QueueState queue;
+  unsigned protocol_version;
+
+  bool operator==(const HealthStatus &) const = default;
+};
+
+// A privilege-free SOCK_SEQPACKET client. Every transport operation is bounded
+// by rpc_timeout, while asynchronous operation polling is additionally bounded
+// by operation_timeout. The peer UID defaults to root (UID 0).
 class IHypervisorClient {
 public:
   virtual ~IHypervisorClient() = default;
@@ -32,7 +57,9 @@ class SchedulerClient final : public IHypervisorClient {
 public:
   explicit SchedulerClient(
       std::string socket_path,
-      std::chrono::milliseconds timeout = std::chrono::seconds(3));
+      std::chrono::milliseconds rpc_timeout = std::chrono::seconds(3),
+      std::chrono::milliseconds operation_timeout = std::chrono::minutes(30),
+      std::optional<uid_t> expected_server_uid = std::nullopt);
   ~SchedulerClient();
   SchedulerClient(const SchedulerClient &) = delete;
   SchedulerClient &operator=(const SchedulerClient &) = delete;
@@ -40,9 +67,6 @@ public:
   SchedulerClient &operator=(SchedulerClient &&) noexcept;
 
   [[nodiscard]] std::expected<void, RpcFailure> connect();
-  [[nodiscard]] std::expected<RpcReply, RpcFailure>
-  call(std::string_view method, std::string request_id,
-       nlohmann::json params = {});
   [[nodiscard]] bool
   register_container(const ContainerRegistration &registration,
                      const RequestId &request_id);
@@ -56,16 +80,16 @@ public:
   create_checkpoint(const ContainerId &container_id) override;
   [[nodiscard]] bool
   restore_or_restart(const ContainerId &container_id) override;
-  [[nodiscard]] std::expected<std::string, RpcFailure>
+  [[nodiscard]] std::expected<OperationId, RpcFailure>
   submit_create_checkpoint(const ContainerId &, const RequestId &);
-  [[nodiscard]] std::expected<std::string, RpcFailure>
+  [[nodiscard]] std::expected<OperationId, RpcFailure>
   submit_restore_or_restart(const ContainerId &, const RequestId &);
-  [[nodiscard]] std::expected<RpcReply, RpcFailure>
-  get_operation(std::string_view operation_id);
-  [[nodiscard]] std::expected<RpcReply, RpcFailure> get_health();
+  [[nodiscard]] std::expected<OperationStatus, RpcFailure>
+  get_operation(const OperationId &operation_id);
+  [[nodiscard]] std::expected<HealthStatus, RpcFailure> get_health();
 
 private:
   struct Impl;
-  Impl *impl_;
+  std::unique_ptr<Impl> impl_;
 };
 } // namespace gravesentinel::ccm

@@ -52,6 +52,7 @@ gravesentinel_cc_test(
     size = "small",
     deps = [
         "//src/hypervisor:podman_adapter",
+        "//src/storage:filesystem_storage",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
@@ -181,10 +182,11 @@ test_suite(
         ":contracts_compile_test",
         ":filesystem_storage_test",
         ":hypervisor_rpc_handler_test",
-        ":linux_runtime_test",
         ":ipc_codec_test",
-        ":operation_store_test",
+        ":ipc_server_client_test",
+        ":linux_runtime_test",
         ":manifest_codec_test",
+        ":operation_store_test",
         ":manifest_types_test",
         ":podman_adapter_test",
         ":restore_coordinator_test",
@@ -204,16 +206,16 @@ filegroup(
         "contracts_compile_test.cxx",
         "filesystem_storage_test.cxx",
         "hypervisor_rpc_handler_test.cxx",
-        "linux_runtime_test.cxx",
         "ipc_codec_test.cxx",
-        "operation_store_test.cxx",
+        "ipc_server_client_test.cxx",
+        "linux_runtime_test.cxx",
         "manifest_codec_test.cxx",
+        "operation_store_test.cxx",
         "manifest_types_test.cxx",
         "podman_adapter_test.cxx",
         "restore_coordinator_test.cxx",
         "snapshot_chunker_test.cxx",
         "value_types_test.cxx",
-        "ipc_server_client_test.cxx",
     ],
     visibility = ["//scripts:__pkg__"],
 )
@@ -222,14 +224,24 @@ gravesentinel_cc_test(
     name = "ipc_codec_test",
     srcs = ["ipc_codec_test.cxx"],
     size = "small",
-    deps = ["//src/ipc:ipc_codec", "@nlohmann_json//:json", "@googletest//:gtest", "@googletest//:gtest_main"],
+    deps = [
+        "//src/ipc:ipc_codec",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+    ],
 )
 
 gravesentinel_cc_test(
     name = "operation_store_test",
     srcs = ["operation_store_test.cxx"],
     size = "small",
-    deps = ["//src/ipc:operation_store", "@nlohmann_json//:json", "@googletest//:gtest", "@googletest//:gtest_main"],
+    deps = [
+        "//src/ipc:operation_store",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+    ],
 )
 
 gravesentinel_cc_test(

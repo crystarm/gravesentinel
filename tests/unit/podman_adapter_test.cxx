@@ -1,4 +1,5 @@
 #include "src/hypervisor/podman_adapter.hxx"
+#include "src/storage/filesystem_storage.hxx"
 
 #include <gtest/gtest.h>
 
@@ -409,10 +410,17 @@ constexpr RuntimeCpuAssignment kCpuAssignment{
     .checkpoint_cpu = 1U,
 };
 
-TEST(PodmanAdapterTest, CaptureUsesQualifiedArgvAndRecordsObservedIdentity) {
+TEST(PodmanAdapterTest,
+     CaptureAcceptsFilesystemStorageArtifactDirectoryAndRecordsIdentity) {
   TemporaryDirectory temporary;
-  const auto staging = temporary.path() / "operation";
-  std::filesystem::create_directory(staging);
+  auto storage = FilesystemStorage::open(temporary.path());
+  ASSERT_TRUE(storage) << storage.error().diagnostic;
+  const auto logical_container = container_id();
+  const auto operation_id = OperationId::create("capture-operation").value();
+  auto operation = (*storage)->begin_operation(
+      logical_container, operation_id, StorageOperationKind::create_checkpoint);
+  ASSERT_TRUE(operation) << operation.error().diagnostic;
+  const auto staging = (*operation)->runtime_artifact_directory();
   const auto config = adapter_config(temporary.path());
   ScriptedProcessRunner runner;
   FakeAffinityController affinity;
@@ -437,8 +445,8 @@ TEST(PodmanAdapterTest, CaptureUsesQualifiedArgvAndRecordsObservedIdentity) {
                          inspect_json(kSourceId, true));
   PodmanAdapter adapter(runner, affinity, logger, config);
 
-  const auto captured =
-      adapter.capture(container_id(), runtime_ref(), staging, kCpuAssignment);
+  const auto captured = adapter.capture(logical_container, runtime_ref(),
+                                        staging, kCpuAssignment);
 
   ASSERT_TRUE(captured) << captured.error().diagnostic;
   EXPECT_EQ(captured->artifact_path, artifact);

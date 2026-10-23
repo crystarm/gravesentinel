@@ -5,6 +5,8 @@ sh_test(
     srcs = ["check_clang_format.sh"],
     args = [
         "$(locations //src/chunking:format_sources)",
+        "$(locations //src/client:format_sources)",
+        "$(locations //src/ipc:format_sources)",
         "$(locations //src/core:format_sources)",
         "$(locations //src/crypto:format_sources)",
         "$(locations //src/hypervisor:format_sources)",
@@ -19,6 +21,8 @@ sh_test(
     data = [
         "//:clang_format_config",
         "//src/chunking:format_sources",
+        "//src/client:format_sources",
+        "//src/ipc:format_sources",
         "//src/core:format_sources",
         "//src/crypto:format_sources",
         "//src/hypervisor:format_sources",

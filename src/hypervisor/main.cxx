@@ -4,197 +4,294 @@
 #include "src/hypervisor/linux_affinity_controller.hxx"
 #include "src/hypervisor/podman_adapter.hxx"
 #include "src/hypervisor/posix_process_runner.hxx"
-#include "src/ipc/codec.hxx"
+#include "src/hypervisor/rpc_handler.hxx"
 #include "src/ipc/operation_store.hxx"
 #include "src/ipc/server.hxx"
 #include "src/storage/filesystem_storage.hxx"
 
-#include <atomic>
+#include <array>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <span>
 #include <string>
-#include <thread>
-#include <unistd.h>
+#include <string_view>
+#include <sys/random.h>
+#include <sys/types.h>
+#include <system_error>
+#include <utility>
 
 namespace {
+
 volatile std::sig_atomic_t stop_requested = 0;
+
 void request_stop(int) { stop_requested = 1; }
 
 struct Config {
-  std::string socket{"/run/gravesentinel/hypervisor.sock"};
-  std::string storage{"/var/lib/gravesentinel"};
-  std::string log{"/var/log/gravesentinel"};
-  std::string runtime{"podman-criu"};
-  unsigned mode{0660};
+  std::string socket{std::string("/run/gravesentinel/hypervisor.sock")};
+  std::string storage{std::string("/var/lib/gravesentinel")};
+  std::string podman{std::string("/usr/bin/podman")};
+  std::string criu{std::string("/usr/sbin/criu")};
+  std::string runtime_profile{std::string("podman-criu-rootful-v1")};
+  std::optional<uid_t> scheduler_uid;
+  std::optional<gid_t> socket_gid;
+  unsigned socket_mode{0660};
 };
-bool parse(int argc, char **argv, Config &c) {
-  for (int i = 1; i < argc; ++i) {
-    const std::string arg(argv[i]);
-    if (arg == "--help") {
-      std::cout
-          << "gravesentinel_hypervisor [--socket PATH] [--storage DIR] [--log "
-             "DIR] [--runtime-profile NAME] [--socket-mode OCTAL]\n";
-      std::exit(0);
+
+enum class ParseResult { success, help, error };
+
+void print_usage(std::ostream &output) {
+  output << "Usage: gravesentinel_hypervisor [OPTIONS]\n"
+            "  --socket PATH             Unix socket path\n"
+            "  --storage DIR            Persistent storage root\n"
+            "  --podman PATH            Podman executable (default: "
+            "/usr/bin/podman)\n"
+            "  --criu PATH              CRIU executable (default: "
+            "/usr/sbin/criu)\n"
+            "  --scheduler-uid UID      Authorized scheduler UID\n"
+            "  --socket-gid GID         Group owner for the Unix socket\n"
+            "  --socket-mode OCTAL      Unix socket mode (default: 0660)\n"
+            "  --runtime-profile NAME   Must be podman-criu-rootful-v1\n"
+            "  --help                   Show this help\n";
+}
+
+[[nodiscard]] std::optional<std::uintmax_t>
+parse_unsigned(const std::string_view text, const int base) {
+  if (text.empty())
+    return std::nullopt;
+  std::uintmax_t value{};
+  const char *const end = text.data() + text.size();
+  const auto parsed = std::from_chars(text.data(), end, value, base);
+  if (parsed.ec != std::errc{} || parsed.ptr != end)
+    return std::nullopt;
+  return value;
+}
+
+[[nodiscard]] ParseResult parse_arguments(const int argc, char **const argv,
+                                          Config &config) {
+  for (int index = 1; index < argc; ++index) {
+    const std::string_view argument(argv[index]);
+    if (argument == "--help")
+      return ParseResult::help;
+    if (index + 1 >= argc)
+      return ParseResult::error;
+    const std::string value(argv[++index]);
+
+    if (argument == "--socket") {
+      config.socket = value;
+    } else if (argument == "--storage") {
+      config.storage = value;
+    } else if (argument == "--podman") {
+      config.podman = value;
+    } else if (argument == "--criu") {
+      config.criu = value;
+    } else if (argument == "--runtime-profile") {
+      config.runtime_profile = value;
+    } else if (argument == "--socket-mode") {
+      const auto mode = parse_unsigned(value, 8);
+      if (!mode || *mode > 0777U)
+        return ParseResult::error;
+      config.socket_mode = static_cast<unsigned>(*mode);
+    } else if (argument == "--scheduler-uid") {
+      const auto uid = parse_unsigned(value, 10);
+      const auto invalid_uid =
+          static_cast<std::uintmax_t>(std::numeric_limits<uid_t>::max());
+      if (!uid || *uid >= invalid_uid)
+        return ParseResult::error;
+      config.scheduler_uid = static_cast<uid_t>(*uid);
+    } else if (argument == "--socket-gid") {
+      const auto gid = parse_unsigned(value, 10);
+      const auto invalid_gid =
+          static_cast<std::uintmax_t>(std::numeric_limits<gid_t>::max());
+      if (!gid || *gid >= invalid_gid)
+        return ParseResult::error;
+      config.socket_gid = static_cast<gid_t>(*gid);
+    } else {
+      return ParseResult::error;
     }
-    if (i + 1 >= argc)
-      return false;
-    const std::string value(argv[++i]);
-    if (arg == "--socket")
-      c.socket = value;
-    else if (arg == "--storage")
-      c.storage = value;
-    else if (arg == "--log")
-      c.log = value;
-    else if (arg == "--runtime-profile")
-      c.runtime = value;
-    else if (arg == "--socket-mode") {
-      try {
-        c.mode = static_cast<unsigned>(std::stoul(value, nullptr, 8));
-      } catch (...) {
-        return false;
-      }
-    } else
-      return false;
   }
-  return !c.socket.empty() && !c.storage.empty() && !c.log.empty() &&
-         !c.runtime.empty() && (c.mode & ~0777U) == 0;
+
+  if (config.socket.empty() || config.storage.empty() ||
+      config.podman.empty() || config.criu.empty() ||
+      config.runtime_profile != "podman-criu-rootful-v1") {
+    return ParseResult::error;
+  }
+  return ParseResult::success;
+}
+
+[[nodiscard]] bool ensure_directory(const std::filesystem::path &path,
+                                    const std::string_view purpose) {
+  if (path.empty())
+    return true;
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  if (!error)
+    return true;
+  std::cerr << "cannot create " << purpose << ": " << error.message() << '\n';
+  return false;
 }
 
 class SystemClock final : public gravesentinel::ccm::IClock {
 public:
-  WallTime wall_now() const noexcept override {
+  [[nodiscard]] WallTime wall_now() const noexcept override {
     return std::chrono::system_clock::now();
   }
-  MonotonicTime monotonic_now() const noexcept override {
+
+  [[nodiscard]] MonotonicTime monotonic_now() const noexcept override {
     return std::chrono::steady_clock::now();
   }
 };
+
 class IdGenerator final : public gravesentinel::ccm::IIdGenerator {
 public:
+  [[nodiscard]]
   gravesentinel::ccm::CheckpointResult<gravesentinel::ccm::CheckpointId>
   new_checkpoint_id() override {
-    auto result =
-        gravesentinel::ccm::CheckpointId::create("checkpoint-" + next());
-    if (!result) {
-      return std::unexpected(gravesentinel::ccm::CheckpointErrorDetail{
-          gravesentinel::ccm::StableErrorCode::internal,
-          "generated invalid checkpoint id",
-          false,
-          {}});
-    }
-    return *result;
+    return generate<gravesentinel::ccm::CheckpointId>("checkpoint-");
   }
+
+  [[nodiscard]]
   gravesentinel::ccm::CheckpointResult<gravesentinel::ccm::OperationId>
   new_operation_id() override {
-    auto result =
-        gravesentinel::ccm::OperationId::create("operation-" + next());
-    if (!result) {
-      return std::unexpected(gravesentinel::ccm::CheckpointErrorDetail{
-          gravesentinel::ccm::StableErrorCode::internal,
-          "generated invalid operation id",
-          false,
-          {}});
-    }
-    return *result;
+    return generate<gravesentinel::ccm::OperationId>("operation-");
   }
 
 private:
-  std::string next() {
-    return std::to_string(::getpid()) + "-" + std::to_string(++counter_);
+  template <typename Identifier>
+  [[nodiscard]] gravesentinel::ccm::CheckpointResult<Identifier>
+  generate(const std::string_view prefix) {
+    std::array<unsigned char, 16> bytes{};
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+      const auto count =
+          ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
+      if (count < 0 && errno == EINTR)
+        continue;
+      if (count <= 0) {
+        return std::unexpected(gravesentinel::ccm::CheckpointErrorDetail{
+            .code = gravesentinel::ccm::StableErrorCode::unavailable,
+            .diagnostic = "secure random ID generation is unavailable",
+            .retryable = true,
+            .correlation_id = std::nullopt,
+            .storage_side_effect = gravesentinel::ccm::StorageSideEffect::none,
+            .runtime_side_effect = gravesentinel::ccm::RuntimeSideEffect::none,
+        });
+      }
+      offset += static_cast<std::size_t>(count);
+    }
+
+    constexpr char digits[] = "0123456789abcdef";
+    std::string text(prefix);
+    text.reserve(prefix.size() + bytes.size() * 2U);
+    for (const auto byte : bytes) {
+      text.push_back(digits[byte >> 4U]);
+      text.push_back(digits[byte & 0x0fU]);
+    }
+    auto identifier = Identifier::create(std::move(text));
+    if (!identifier) {
+      return std::unexpected(gravesentinel::ccm::CheckpointErrorDetail{
+          .code = gravesentinel::ccm::StableErrorCode::internal,
+          .diagnostic = "secure random ID has an invalid representation",
+          .retryable = false,
+          .correlation_id = std::nullopt,
+          .storage_side_effect = gravesentinel::ccm::StorageSideEffect::none,
+          .runtime_side_effect = gravesentinel::ccm::RuntimeSideEffect::none,
+      });
+    }
+    return std::move(*identifier);
   }
-  std::atomic<unsigned long long> counter_{0};
 };
+
 class StderrLogger final : public gravesentinel::ccm::ILogger {
 public:
-  void log(gravesentinel::ccm::LogLevel level, std::string_view message,
+  void log(const gravesentinel::ccm::LogLevel level,
+           const std::string_view message,
            std::span<const gravesentinel::ccm::LogField>) noexcept override {
-    const char *prefix =
+    const char *const prefix =
         level == gravesentinel::ccm::LogLevel::error     ? "ERROR"
         : level == gravesentinel::ccm::LogLevel::warning ? "WARN"
         : level == gravesentinel::ccm::LogLevel::debug   ? "DEBUG"
                                                          : "INFO";
-    std::cerr << "[" << prefix << "] " << message << '\n';
+    const std::lock_guard lock(mutex_);
+    std::cerr << '[' << prefix << "] " << message << '\n';
   }
+
+private:
+  std::mutex mutex_;
 };
 
-std::string error_text(const gravesentinel::ccm::CheckpointErrorDetail &error) {
-  return std::string("service_") +
-         std::to_string(static_cast<unsigned>(error.code)) + ":" +
-         error.diagnostic;
-}
-std::expected<gravesentinel::ccm::ContainerId, std::string>
-container_id(const nlohmann::json &params) {
-  if (!params.is_object() || !params.contains("container_id") ||
-      !params["container_id"].is_string())
-    return std::unexpected("container_id must be a string");
-  auto id = gravesentinel::ccm::ContainerId::create(
-      params["container_id"].get<std::string>());
-  if (!id || !gravesentinel::ipc::valid_identifier(id->value()))
-    return std::unexpected("invalid container_id");
-  return *id;
-}
 } // namespace
 
-int main(int argc, char **argv) {
+int main(const int argc, char **const argv) {
   Config config;
-  if (!parse(argc, argv, config)) {
+  switch (parse_arguments(argc, argv, config)) {
+  case ParseResult::help:
+    print_usage(std::cout);
+    return 0;
+  case ParseResult::error:
     std::cerr << "invalid arguments (use --help)\n";
     return 2;
+  case ParseResult::success:
+    break;
   }
-  if (config.runtime != "podman-criu" &&
-      config.runtime != "podman-criu-rootful-v1") {
-    std::cerr << "unsupported runtime profile\n";
-    return 2;
-  }
-  std::error_code ec;
-  for (const auto &path : {std::filesystem::path(config.socket).parent_path(),
-                           std::filesystem::path(config.storage),
-                           std::filesystem::path(config.log)}) {
-    if (!path.empty())
-      std::filesystem::create_directories(path, ec);
-    if (ec) {
-      std::cerr << "cannot create configured directory: " << ec.message()
-                << '\n';
-      return 3;
-    }
-  }
-  std::filesystem::create_directories(config.storage + "/checkpoint-data", ec);
-  if (ec) {
-    std::cerr << "cannot create storage data directory: " << ec.message()
-              << '\n';
-    return 3;
-  }
-  std::filesystem::create_directories(config.storage + "/staging", ec);
-  if (ec) {
-    std::cerr << "cannot create staging directory: " << ec.message() << '\n';
+
+  const std::filesystem::path socket_path(config.socket);
+  const std::filesystem::path storage_root(config.storage);
+  const auto checkpoint_data = storage_root / "checkpoint-data";
+  if (!ensure_directory(socket_path.parent_path(), "socket directory") ||
+      !ensure_directory(storage_root, "storage directory")) {
     return 3;
   }
 
+  gravesentinel::ipc::ServerConfig server;
+  server.socket_path = config.socket;
+  server.lock_path = (storage_root / "hypervisor.lock").string();
+  server.mode = config.socket_mode;
+  server.allowed_uid = config.scheduler_uid;
+  server.socket_gid = config.socket_gid;
+  server.peer_io_timeout = std::chrono::seconds(3);
+  server.worker_count = 4;
+  server.peer_queue_capacity = 32;
+  server.max_requests_per_connection = 64;
+
+  auto server_lock = gravesentinel::ipc::ServerLock::acquire(server.lock_path);
+  if (!server_lock) {
+    std::cerr << "cannot acquire hypervisor process lock\n";
+    return 4;
+  }
+  if (!ensure_directory(checkpoint_data, "checkpoint data directory"))
+    return 5;
+
   using namespace gravesentinel::ccm;
-  auto storage_result =
-      FilesystemStorage::open(config.storage + "/checkpoint-data");
+  auto storage_result = FilesystemStorage::open(checkpoint_data);
   if (!storage_result) {
     std::cerr << "cannot initialize checkpoint storage: "
               << storage_result.error().diagnostic << '\n';
-    return 4;
+    return 6;
   }
   auto storage = std::move(*storage_result);
+
   SystemClock clock;
   SteadyTimer timer;
   IdGenerator ids;
   StderrLogger logger;
   LinuxAffinityController affinity;
   PosixProcessRunner runner;
-  PodmanAdapterConfig runtime_config;
-  runtime_config.podman_executable = "/usr/bin/podman";
-  runtime_config.criu_executable = "/usr/bin/criu";
-  runtime_config.staging_root = config.storage + "/staging";
+  PodmanAdapterConfig runtime_config{
+      .podman_executable = config.podman,
+      .criu_executable = config.criu,
+      .staging_root = checkpoint_data,
+      .environment = {},
+  };
   PodmanAdapter podman(runner, affinity, logger, std::move(runtime_config));
   Blake3Hasher hasher;
   SnapshotChunker chunker(hasher);
@@ -203,136 +300,34 @@ int main(int argc, char **argv) {
   CheckpointOperations operations(creator, restore);
   CheckpointService service(operations, clock, timer, ids, affinity, logger);
 
+  gravesentinel::ipc::OperationStoreOptions store_options;
+  store_options.worker_count = 4;
+  auto operation_store_result = gravesentinel::ipc::OperationStore::create(
+      (storage_root / "operations.jsonl").string(),
+      gravesentinel::hypervisor::make_operation_executor(service),
+      store_options);
+  if (!operation_store_result) {
+    std::cerr << "cannot initialize operation journal ("
+              << gravesentinel::ipc::error_code_name(
+                     operation_store_result.error().code)
+              << "): " << operation_store_result.error().message << '\n';
+    (void)service.shutdown();
+    return 7;
+  }
+  auto operation_store = std::move(*operation_store_result);
+  gravesentinel::hypervisor::RpcHandler rpc_handler(service, *operation_store);
+  const gravesentinel::ipc::Handler handler =
+      [&rpc_handler](const nlohmann::json &request) {
+        return rpc_handler(request);
+      };
+
   std::signal(SIGTERM, request_stop);
   std::signal(SIGINT, request_stop);
-  gravesentinel::ipc::OperationStore operation_store(
-      config.storage + "/operations.jsonl",
-      [&service](const gravesentinel::ipc::OperationView &operation)
-          -> std::expected<std::string, gravesentinel::ipc::StoreError> {
-        auto request = RequestId::create(operation.request_id);
-        auto container = ContainerId::create(operation.container_id);
-        auto op = OperationId::create(operation.operation_id);
-        if (!request || !container || !op)
-          return std::unexpected(gravesentinel::ipc::StoreError{
-              "invalid persisted operation identifiers"});
-        CheckpointResult<void> result = std::unexpected(CheckpointErrorDetail{
-            StableErrorCode::internal, "unsupported operation", false, {}});
-        if (operation.method == "SubmitCreateCheckpoint")
-          result = service.create_checkpoint(*container, *request, *op);
-        else if (operation.method == "SubmitRestoreOrRestart")
-          result = service.restore_or_restart(*container, *request, *op);
-        if (!result)
-          return std::unexpected(gravesentinel::ipc::StoreError{
-              std::string("service_error_code_") +
-              std::to_string(static_cast<unsigned>(result.error().code))});
-        return std::string("ok");
-      });
-
-  const auto handler = [&service, &operation_store](
-                           const nlohmann::json &request) -> nlohmann::json {
-    const auto method = request.at("method").get<std::string>();
-    const auto request_id_text = request.at("request_id").get<std::string>();
-    const auto params = request.at("params");
-    if (method == "Handshake")
-      return {{"protocol_version", gravesentinel::ipc::protocol_version},
-              {"service", "gravesentinel_hypervisor"}};
-    if (method == "GetHealth")
-      return {{"status", "healthy"},
-              {"queue", "available"},
-              {"protocol_version", gravesentinel::ipc::protocol_version}};
-    if (method == "GetOperation") {
-      if (!params.is_object() || !params.contains("operation_id") ||
-          !params["operation_id"].is_string())
-        return {{"ok", false}, {"error", "operation_id must be a string"}};
-      auto found =
-          operation_store.get(params["operation_id"].get<std::string>());
-      if (!found)
-        return {{"ok", false}, {"error", found.error().message}};
-      return {{"operation_id", found->operation_id},
-              {"request_id", found->request_id},
-              {"method", found->method},
-              {"container_id", found->container_id},
-              {"state", gravesentinel::ipc::state_name(found->state)},
-              {"result", found->result}};
-    }
-    auto request_id = RequestId::create(request_id_text);
-    if (!request_id || !gravesentinel::ipc::valid_identifier(request_id_text))
-      return {{"ok", false}, {"error", "invalid request_id"}};
-    if (method == "Register") {
-      auto container = container_id(params);
-      if (!container || !params.contains("runtime_container") ||
-          !params["runtime_container"].is_string() ||
-          !params.contains("interval_seconds") ||
-          !params["interval_seconds"].is_number_integer() ||
-          !params.contains("keep_last") ||
-          !params["keep_last"].is_number_unsigned() ||
-          !params.contains("container_cpu") ||
-          !params["container_cpu"].is_number_unsigned() ||
-          !params.contains("checkpoint_cpu") ||
-          !params["checkpoint_cpu"].is_number_unsigned())
-        return {{"ok", false}, {"error", "invalid Register parameters"}};
-      auto runtime = RuntimeContainerRef::create(
-          params["runtime_container"].get<std::string>());
-      const auto interval = params["interval_seconds"].get<std::int64_t>();
-      const auto keep = params["keep_last"].get<std::uint64_t>();
-      const auto cpu = params["container_cpu"].get<std::uint64_t>();
-      const auto checkpoint_cpu = params["checkpoint_cpu"].get<std::uint64_t>();
-      if (!runtime || interval <= 0 || interval > 86400 * 365 || keep == 0 ||
-          keep > 1000 || cpu > UINT32_MAX || checkpoint_cpu > UINT32_MAX)
-        return {{"ok", false}, {"error", "Register values out of range"}};
-      ContainerRegistration registration{
-          *container,
-          *runtime,
-          CheckpointConfig{std::chrono::seconds{interval},
-                           static_cast<std::size_t>(keep),
-                           static_cast<std::uint32_t>(cpu),
-                           static_cast<std::uint32_t>(checkpoint_cpu)},
-          {},
-          {}};
-      auto valid = validate_container_registration(registration);
-      if (!valid)
-        return {{"ok", false}, {"error", valid.error().diagnostic}};
-      auto result = service.register_container(registration, *request_id);
-      if (!result)
-        return {{"ok", false}, {"error", error_text(result.error())}};
-      return {{"ok", true}};
-    }
-    if (method == "Unregister") {
-      auto container = container_id(params);
-      if (!container)
-        return {{"ok", false}, {"error", container.error()}};
-      auto result = service.unregister_container(*container, *request_id);
-      if (!result)
-        return {{"ok", false}, {"error", error_text(result.error())}};
-      return {{"ok", true}};
-    }
-    if (method == "SubmitCreateCheckpoint" ||
-        method == "SubmitRestoreOrRestart") {
-      auto container = container_id(params);
-      if (!container)
-        return {{"ok", false}, {"error", container.error()}};
-      // Only public, non-secret operation parameters enter the durable request
-      // digest.
-      const auto canonical = nlohmann::json{
-          {"method", method},
-          {"container_id",
-           container->value()}}.dump();
-      auto submitted = operation_store.submit(request_id_text, method,
-                                              container->value(), canonical);
-      if (!submitted)
-        return {{"ok", false}, {"error", submitted.error().message}};
-      return {{"operation_id", submitted->operation_id},
-              {"duplicate", submitted->duplicate}};
-    }
-    return {{"ok", false}, {"error", "unknown method"}};
-  };
-  std::cerr << "gravesentinel_hypervisor: listening on " << config.socket
-            << '\n';
-  gravesentinel::ipc::ServerConfig server{
-      config.socket, config.storage + "/hypervisor.lock", config.mode, true};
-  const int result =
-      gravesentinel::ipc::serve(server, handler, &stop_requested);
-  operation_store.stop();
+  std::cerr << "gravesentinel_hypervisor: startup ready; listening on "
+            << config.socket << '\n';
+  const int result = gravesentinel::ipc::serve(
+      server, *server_lock, handler, [] { return stop_requested != 0; });
+  operation_store->stop();
   (void)service.shutdown();
   return result;
 }

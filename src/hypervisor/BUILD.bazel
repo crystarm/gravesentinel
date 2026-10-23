@@ -39,6 +39,22 @@ gravesentinel_cc_library(
     ],
 )
 
+gravesentinel_cc_library(
+    name = "rpc_handler",
+    srcs = ["rpc_handler.cxx"],
+    hdrs = ["rpc_handler.hxx"],
+    deps = [
+        "//src/core:ccm_core",
+        "//src/ipc:ipc_codec",
+        "//src/ipc:operation_store",
+        "@nlohmann_json//:json",
+    ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
 gravesentinel_cc_binary(
     name = "gravesentinel_hypervisor",
     srcs = ["main.cxx"],
@@ -50,6 +66,7 @@ gravesentinel_cc_binary(
         "//src/core:restore_coordinator",
         "//src/hypervisor:linux_runtime",
         "//src/hypervisor:podman_adapter",
+        "//src/hypervisor:rpc_handler",
         "//src/ipc:ipc_server",
         "//src/ipc:operation_store",
         "//src/storage:filesystem_storage",
@@ -68,6 +85,8 @@ filegroup(
         "podman_adapter.hxx",
         "posix_process_runner.cxx",
         "posix_process_runner.hxx",
+        "rpc_handler.cxx",
+        "rpc_handler.hxx",
     ],
     visibility = ["//scripts:__pkg__"],
 )

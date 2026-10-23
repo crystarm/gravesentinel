@@ -2,38 +2,110 @@
 
 ## Scope and API boundary
 
-`//src/core:checkpoint_service` is the stage-09 owner of registrations and the
-synchronous create/restore orchestration implemented by
+`//src/core:checkpoint_service` owns registrations and the synchronous
+create/restore orchestration implemented by
 [`CheckpointCreator`](checkpoint-create.md) and
-[`RestoreCoordinator`](checkpoint-restore.md). It is implemented and unit-tested
-as a library, but it is not yet wired into a running production service: the
-current `gravesentinel_hypervisor` binary is still a stub and does not instantiate
-`CheckpointService`, storage, chunking, hashing, affinity, or the Podman adapter.
-This component therefore describes the available in-process behavior, not a
-currently reachable IPC endpoint.
+[`RestoreCoordinator`](checkpoint-restore.md). The production
+`gravesentinel_hypervisor` composition instantiates the service together with
+filesystem storage, chunking, hashing, affinity, the Podman adapter, the durable
+operation store, RPC handler, and Unix socket server.
 
-The core does not contain Unix sockets, wire JSON, request journaling, externally
-visible asynchronous operation state, retention, or garbage collection.
+`ICheckpointService` itself remains an in-process synchronous interface with
+`register_container`, `unregister_container`, `create_checkpoint`,
+`restore_or_restart`, and `shutdown`. Direct create/restore calls supply both
+`RequestId` and `OperationId` and return `CheckpointResult<void>` only after a
+terminal result. The core does not enforce global ID uniqueness or provide replay;
+a direct retry with new IDs is a new operation.
 
-`ICheckpointService` exposes synchronous `register_container`,
-`unregister_container`, `create_checkpoint`, `restore_or_restart`, and `shutdown`
-operations. Manual create/restore calls supply their `RequestId` and `OperationId`
-and return `CheckpointResult<void>` only after the operation reaches a terminal
-result. IDs are caller-owned: the service does not enforce global uniqueness,
-deduplicate submissions, journal completion, or provide idempotent replay. A retry
-must use fresh IDs and is a new operation.
+The production RPC boundary deliberately adds different semantics around this core:
+
+- `Register` and `Unregister` call the service synchronously. They are not journaled,
+  and `SchedulerClient` does not transport-retry either mutation after an exchange
+  may already have reached the server. A false/ambiguous result requires scheduler
+  reconciliation of desired registration state.
+- `SubmitCreateCheckpoint` and `SubmitRestoreOrRestart` durably enqueue work and
+  return a deterministic `OperationId`; `GetOperation` polls `queued`, `running`,
+  `succeeded`, `failed`, or `indeterminate`.
+- the high-level synchronous client methods for create/restore are implemented as a
+  bounded submit-and-poll loop and return `true` only after confirmed success.
+
+The operation journal is outside `CheckpointService`. It deduplicates equal
+create/restore submissions by `RequestId` and canonical method/container payload,
+preserves results across restart, and passes its deterministic operation ID into the
+synchronous service call. This distinction is important: calling the core directly
+does not acquire IPC idempotency merely because the production daemon has it.
 
 The direct creator and coordinator return rich `CreatedCheckpoint` and
 `RestoredContainer` results. The service intentionally consumes those results:
 create retains only the source incarnation, restore retains only the new
-incarnation, and the caller does not receive checkpoint identity/generation,
-checkpoint-versus-cold-start outcome, or pin/staging cleanup-completion flags. A
-future IPC layer must define its own asynchronous submit/poll and result model
-rather than assuming `OperationStatus` is maintained by this core.
+incarnation, and neither the core facade nor the wire status exposes checkpoint
+identity/generation, checkpoint-versus-cold-start outcome, or pin/staging
+cleanup-completion flags.
 
 `CheckpointOperations` is the production adapter from the service to the existing
 synchronous creator and restore coordinator. Tests replace its
 `ICheckpointOperations` seam without constructing storage or Podman.
+
+## `ContainerRegistration` wire schema
+
+In protocol v2, the `Register` method carries the complete registration as its `params`
+object. The schema is exact: all keys shown below are required, no extra keys are
+accepted, and optional C++ values are encoded as `null` or a complete object.
+
+```text
+{
+  "container_id": string,
+  "runtime_container": string,
+  "checkpoint": {
+    "interval_seconds": integer,
+    "keep_last": integer,
+    "container_cpu": integer,
+    "checkpoint_cpu": integer
+  },
+  "cold_start": null | {
+    "image_reference": string,
+    "argv": [string, ...],
+    "environment": [
+      {"name": string, "value": string}, ...
+    ],
+    "mounts": [
+      {"source": string, "target": string, "read_only": boolean}, ...
+    ],
+    "runtime_options": [string, ...]
+  },
+  "runtime_fingerprint": null | {
+    "runtime_name": string,
+    "runtime_version": string,
+    "runtime_build_origin": string,
+    "architecture": string,
+    "kernel_release": string,
+    "criu_version": string,
+    "oci_runtime_name": string,
+    "oci_runtime_version": string,
+    "oci_runtime_commit": string,
+    "oci_runtime_features": string,
+    "cgroup_version": string,
+    "cgroup_manager": string,
+    "cgroup_controllers": string,
+    "privilege_mode": string,
+    "user_namespace_mode": string,
+    "capability_profile": string,
+    "selinux_mode": string,
+    "apparmor_profile": string,
+    "seccomp_profile": string,
+    "command_profile": string
+  }
+}
+```
+
+Wire identifiers are 1–128 bytes and use only ASCII letters, digits, `_`, `-`, `.`,
+or `:`. `interval_seconds` is `1..31536000`, `keep_last` is `1..3`, and the CPU
+values must form one of the standard pairs listed below. Cold-start arrays, strings,
+environment names, and aggregate content are bounded by the codec; environment names
+must be unique. A non-null runtime fingerprint must contain all 20 non-empty string
+fields. Although `mounts` and `runtime_options` are part of the complete wire schema,
+`podman-criu-rootful-v1` rejects non-empty values because those command forms are not
+qualified.
 
 ## Registration and CPU validation
 
@@ -49,17 +121,51 @@ before it becomes visible:
 6. the worker starts and successfully binds itself to `checkpoint_cpu`.
 
 The standard accepted pairs remain `(0,1)`, `(2,3)`, `(4,5)`, and `(6,7)`. A slot
-is not released while unregister is waiting for an active operation, so a fifth
-registration cannot reuse its CPUs prematurely.
+with active work rejects unregister with a retryable conflict and remains registered,
+so a fifth registration cannot reuse its CPUs prematurely.
 
 Two accepted registration fields are currently inert after validation:
 
-- `CheckpointConfig::keep_last` must be in `1..3`, but this stage has no retention
-  pass and does not use the value when creating or scheduling checkpoints;
+- `CheckpointConfig::keep_last` must be in `1..3`, but there is no retention pass
+  and the value is not used when creating or scheduling checkpoints;
 - optional `ContainerRegistration::runtime_fingerprint` must be complete when
   present, but it is not forwarded to create or restore. Creation records the
   fingerprint returned by the runtime adapter, and restore validates the
   fingerprint stored in the selected manifest.
+
+Retention and garbage collection are not implemented. Manifests, orphan chunks, and
+stale staging are not automatically reclaimed by this service.
+
+## IPC durability, bounds, and recovery
+
+The production daemon communicates with the privilege-free scheduler client using
+one bounded JSON request and one response per `AF_UNIX/SOCK_SEQPACKET` exchange. Both
+ends check `SO_PEERCRED`: the client trusts server UID 0 by default, while the server
+accepts the configured scheduler UID (or its own effective UID when none is
+configured). The socket GID is optional and its mode defaults to `0660`; filesystem
+access and the exact peer-UID check both have to pass.
+
+For create/restore, the default operation-store limits are 64 in-flight operations,
+4096 retained records, at most 8192 append-log entries before the entry limit forces
+compaction, and a 64 MiB journal. The store persists and `fsync`s acceptance as `queued` before
+returning an operation ID, persists `running` before execution, and persists the
+terminal state. The ID is `op-` plus the BLAKE3 digest of the request ID, making it
+deterministic and restart-safe while its journal record is retained. Repeating the
+same request ID and canonical payload returns the retained operation; a different
+payload is rejected.
+
+Compaction retains one current record per operation and durably replaces the journal;
+it bounds transition history but does not evict deduplication records. Consequently,
+once the 4096-record registry is full, new unique operations are rejected even if all
+existing operations are terminal. Existing duplicates and status queries remain
+available.
+
+At startup, a record left `queued` by a crash becomes `failed` with an
+interrupted-before-execution classification and is not run. A record left `running`
+becomes `indeterminate`, because its create/restore side effects cannot be inferred
+from the journal. `indeterminate` requires scheduler/operator reconciliation of
+manifest publication and runtime presence; it is not permission to submit another
+destructive attempt blindly.
 
 ## Worker and concurrency model
 
@@ -90,8 +196,9 @@ than self-deadlocking.
 
 Accepted operations are not cancellable through this API and receive no service
 stop token or service-level deadline. Subprocess adapters have their own timeouts,
-but a blocked storage/runtime/custom collaborator can block its caller and can make
-unregister or shutdown wait without a core-imposed bound.
+but a blocked storage/runtime/custom collaborator can block its caller and shutdown
+without a core-imposed bound. Unregister does not wait for active work: it returns a
+retryable conflict so the scheduler can retry after the operation finishes.
 
 After a successful create, the returned source `RuntimeIncarnation` is retained in
 memory and supplied to the next restore as the exact source fence. A successful
@@ -118,24 +225,25 @@ form `periodic-<container-id>-<slot-sequence>` and an `OperationId` from
 `IIdGenerator`. The sequence advances only for admitted periodic work and resets
 when a container is unregistered and registered again, so the periodic request ID
 is not globally unique; the generated operation ID must provide operation
-uniqueness. Periodic completion has no caller-visible status and failures are sent
-only to the injected `ILogger`. Until production wiring exists, this is not yet a
-hypervisor diagnostic log in an operational sense.
+uniqueness. Periodic completion has no caller-visible operation-journal status and
+failures are sent only to the injected `ILogger`. In the current production
+composition that logger writes the message to stderr; periodic work is not represented
+by a scheduler-submitted `GetOperation` record.
 
 An exception escaping the scheduler loop is caught and logged, but it terminates
 the scheduler thread permanently. Manual operations and registrations can remain
-available, and there is currently no health/status API that reports the loss of
-periodic scheduling.
+available, and the current health/status API does not report the loss of periodic
+scheduling.
 
 ## Unregister and shutdown
 
-`unregister_container` atomically marks its slot closing, cancels a pending periodic
-item, rejects new work, and waits for an accepted manual or active operation to
-finish. An already active periodic operation also runs to completion. The worker
-then attempts to restore its affinity and exits before the registry slot and CPU
-assignment are released. Register, unregister, and shutdown calls are globally
-serialized by the lifecycle mutex, while manual create/restore admission proceeds
-through the per-slot locks.
+`unregister_container` first examines the slot under its mutex. If manual work is
+pending or any manual/periodic item is active, it returns a retryable `conflict`
+without closing or removing the registration. Otherwise it atomically marks the slot
+closing, cancels a pending periodic item, rejects new work, and joins the idle worker.
+The worker restores its affinity and exits before the registry slot and CPU assignment
+are released. Register, unregister, and shutdown calls are globally serialized by the
+lifecycle mutex, while manual create/restore admission proceeds through per-slot locks.
 
 `shutdown` is idempotent. It marks every slot closing, cancels pending periodic
 items, stops and joins the scheduler, drains accepted/active manual operations and
@@ -168,5 +276,8 @@ registration validation, the four-slot limit, four-way parallelism, same-ID
 serialization, worker CPU assignments, unchanged control-thread affinity, missed
 periodic tick coalescing, unregister/shutdown races, exception containment, and
 source-incarnation forwarding. Linux affinity mask restoration itself remains
-covered by `//tests/unit:linux_runtime_test`. These tests use injected fakes and do
-not provide production binary wiring or an end-to-end service composition.
+covered by `//tests/unit:linux_runtime_test`. IPC codec, server/client, RPC handler,
+and operation-store tests cover the production-facing wrapper and journal semantics.
+These are still unit-level/component tests: they do not establish that the complete
+production daemon-to-Podman/CRIU flow was executed end to end in a qualified rootful
+environment.

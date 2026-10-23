@@ -6,9 +6,9 @@
 
 ## Context
 
-CCM must invoke a reproducible local Podman/CRIU workflow before implementing a
-production adapter. Podman, CRIU, the OCI runtime, kernel, cgroup mode, privilege
-mode, architecture, and security policy all influence compatibility. The
+CCM required a reproducible local Podman/CRIU workflow before accepting and
+implementing a production adapter. Podman, CRIU, the OCI runtime, kernel, cgroup
+mode, privilege mode, architecture, and security policy all influence compatibility. The
 exported checkpoint belongs to the runtime and is not a CCM-defined file format.
 
 The stage 02 fixture and smoke were executed twice end to end on the target host.
@@ -38,8 +38,9 @@ The accepted MVP runtime profile is:
   container and import restore under a new name.
 
 Rootless Podman, remote Podman, and any version or host-profile variation are
-unsupported until independently requalified. Stage 06 may implement real Podman
-support only for this accepted profile and must fail closed for unknown profiles.
+unsupported until independently requalified. The production implementation accepts
+only the profile name `podman-criu-rootful-v1` and fails closed for every other
+profile.
 
 ## Implementation and verification notes
 
@@ -55,11 +56,17 @@ runs. A current deployment is verified only by rerunning the prerequisite gate
 and the applicable complete destructive smoke in its intended rootful context.
 
 The production libraries exist as `//src/hypervisor:linux_runtime` and
-`//src/hypervisor:podman_adapter`, but
-`//src/hypervisor:gravesentinel_hypervisor` is not wired to them. Its current
-entry point fails immediately, so the adapter smoke exercises the production
-libraries through a purpose-built integration helper rather than through the
-production hypervisor process, IPC, storage, or service composition.
+`//src/hypervisor:podman_adapter`, and
+`//src/hypervisor:gravesentinel_hypervisor` now composes them with storage,
+chunking, the create/restore coordinators, `CheckpointService`, the durable
+operation journal, and the `SOCK_SEQPACKET` IPC server. The scheduler client and
+server perform peer-UID checks, and only the hypervisor side invokes rootful
+Podman/CRIU.
+
+The dated adapter smoke still exercises the production runtime libraries through a
+purpose-built integration helper. It is not evidence that the complete production
+hypervisor + IPC + journal + storage + service + Podman/CRIU flow was run end to end;
+no such production end-to-end execution is claimed here.
 
 The prerequisite gate is intentionally less exact than the adapter profile. It
 checks the main host capabilities and runs `criu check`, but it does not enforce
@@ -102,7 +109,9 @@ is never converted to success.
 
 ## Adapter command profile v1
 
-Stage 06 implements `podman-criu-rootful-v1`. In addition to the two qualified
+The production adapter implements only `podman-criu-rootful-v1`. The composed daemon
+rejects any other `--runtime-profile` value and defaults to `/usr/bin/podman` and
+`/usr/sbin/criu` for the executable paths. In addition to the two qualified
 checkpoint/restore commands above, its cold-start argv is:
 
 ```text
@@ -167,10 +176,11 @@ image identity. The source image must remain available in the local Podman image
 store after the original container is removed and until restore validation has
 completed.
 
-The production adapter-mode smoke qualified these stage-06 assumptions on the
-rootful host on 2026-10-22 and ended with
+The production adapter-mode smoke qualified these adapter assumptions on the rootful
+host on 2026-10-22 and ended with
 `RESULT: QUALIFIED production PodmanAdapter smoke passed`. This remains dated
-recorded evidence under the verification boundary above.
+recorded evidence under the verification boundary above and must not be described as
+a production daemon end-to-end test.
 
 ### Implemented limits and test coverage boundary
 
@@ -190,8 +200,9 @@ proved by the production adapter path used in the stage-06 adapter smoke. The
 adapter smoke uses an empty workload environment, so it does not exercise the
 transient env-file against real Podman. Scripted unit tests cover creation, mode,
 argument/process-environment exclusion, and successful removal; they do not turn
-an underlying unlink failure into a guaranteed cleanup. The direct shell also has no per-command timeout
-around each Podman build/inspect/checkpoint/restore/cleanup invocation; Bazel
+an underlying unlink failure into a guaranteed cleanup. The direct shell also has no
+per-command timeout around each Podman build/inspect/checkpoint/restore/cleanup
+invocation; Bazel
 provides only an overall long test timeout for the corresponding test target.
 
 ## Artifact decision
@@ -211,8 +222,8 @@ depend on an entry name or Podman's current archive organization.
 
 ## Compatibility fingerprint
 
-Every committed checkpoint must eventually retain enough non-secret metadata to
-reject an unqualified restore environment. The runtime fingerprint must cover at
+Every committed checkpoint retains enough non-secret metadata to reject an
+unqualified restore environment. The runtime fingerprint must cover at
 least:
 
 - machine architecture and kernel release;
@@ -225,8 +236,8 @@ least:
 - source image identity or digest;
 - checkpoint command-profile version, including passwd-injection policy.
 
-Exact field matching policy belongs to the adapter stage, but an unknown or
-unsupported combination must fail as incompatible rather than attempt a restore.
+The adapter requires exact fingerprint equality; an unknown or unsupported
+combination fails as incompatible rather than attempting a restore.
 Secrets, environment values, credential-bearing host paths, and arbitrary stderr
 are not fingerprint fields.
 
@@ -255,10 +266,12 @@ removal.
 
 ## Consequences
 
-- Stage 06 is unblocked for the exact accepted rootful profile only.
+- Production runtime support is limited to the exact accepted rootful
+  `podman-criu-rootful-v1` profile.
 - Deployments must deliberately provision the rootful CRIU capability model,
-  `/usr/sbin` in `PATH`, cgroup v2/systemd, and cpuset availability; repository
-  scripts do not modify the host.
+  cgroup v2/systemd, and cpuset availability; repository scripts do not modify the
+  host. The daemon defaults to `/usr/bin/podman` and `/usr/sbin/criu`, and alternate
+  executable paths do not expand the qualified runtime profile.
 - Rootless Podman 5.4.2 is explicitly unsupported for checkpoint creation.
 - Runtime, kernel, privilege, cgroup, or security-policy changes require the
   prerequisite gate and full destructive smoke to be rerun.

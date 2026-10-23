@@ -2,27 +2,31 @@
 
 ## Scope
 
-`//src/core:checkpoint_creator` is the stage-07 synchronous orchestration layer.
-It connects `IPodmanAdapter`, `ISnapshotChunker`, Manifest v1, and `IStorage`
-without adding periodic scheduling, restore selection, retention, startup recovery,
-or garbage collection. It is implemented and unit-tested as a library, but the
-current `gravesentinel_hypervisor` binary is still a stub and does not instantiate
-this layer or a production service composition. See [Checkpoint service
-core](service-core.md) for the current wiring boundary.
+`//src/core:checkpoint_creator` is the synchronous create orchestration layer. It
+connects `IPodmanAdapter`, `ISnapshotChunker`, Manifest v1, and `IStorage`; the
+creator itself does not own periodic scheduling, restore selection, retention,
+operation-journal recovery, or garbage collection. The production
+`gravesentinel_hypervisor` composition instantiates this layer through
+`CheckpointOperations` and `CheckpointService`, with asynchronous IPC submission
+provided by the outer durable operation store. See [Checkpoint service
+core](service-core.md) for that boundary.
 
 A create request carries the already assigned `RequestId` and `OperationId`, the
 logical `ContainerId`, the stable runtime reference, and the runtime/checkpoint
-CPU assignment. A direct successful `CheckpointCreator::create` result identifies
-the immutable `CheckpointId`, its per-container generation, the captured runtime
-incarnation, and whether post-commit staging cleanup was confirmed. The
-`ICheckpointService::create_checkpoint` facade deliberately returns only
-`CheckpointResult<void>` and retains the source incarnation internally; it does
-not expose the checkpoint identity, generation, or cleanup-completion flag.
+CPU assignment. In the production IPC path, `SubmitCreateCheckpoint` supplies the
+request ID and the operation store deterministically derives the operation ID before
+the synchronous service call. A direct successful `CheckpointCreator::create`
+result identifies the immutable `CheckpointId`, its per-container generation, the
+captured runtime incarnation, and whether post-commit staging cleanup was confirmed.
+The `ICheckpointService::create_checkpoint` facade deliberately returns only
+`CheckpointResult<void>` and retains the source incarnation internally; the IPC
+operation status likewise does not expose checkpoint identity, generation, or the
+cleanup-completion flag.
 
 ## State machine
 
 Each invocation owns local state; the `CheckpointCreator` object does not store
-a shared current state and can therefore be used by a later service core to run
+a shared current state and can therefore be used by `CheckpointService` to run
 independent containers concurrently when its collaborators are thread-safe.
 The transaction transitions are:
 
@@ -58,13 +62,17 @@ Only after acquiring the lease does the creator:
 2. list committed manifests;
 3. compute `max(committed generation) + 1` with overflow rejection.
 
-The core has no request journal, duplicate-ID table, or idempotency mechanism.
-Callers own `RequestId` and `OperationId` uniqueness and must use fresh values for
-a retry. `FilesystemStorage` rejects an `OperationId` while an incomplete staging
-directory with that ID still exists, rather than resuming it, but neither the
-creator nor the service rejects an ID merely because it was used by an earlier
-operation whose staging was removed. A fresh retry receives a new checkpoint ID
-and performs a new runtime capture.
+The creator and synchronous service do not themselves own a request journal or
+idempotency table. A direct in-process caller owns `RequestId` and `OperationId`
+uniqueness. `FilesystemStorage` rejects an `OperationId` while an incomplete staging
+directory with that ID still exists, rather than resuming it, but neither the creator
+nor the service rejects an ID merely because it was used by an earlier operation
+whose staging was removed.
+
+The production IPC boundary is stronger: its operation store durably deduplicates a
+journaled `RequestId` with the same create/container payload and reuses the same
+operation ID across restart. A submission with a fresh request ID is intentionally a
+new capture and receives a fresh checkpoint ID.
 
 A definitely uncommitted failed attempt does not reserve its generation because
 generation ordering is defined only by manifests returned by committed-manifest
@@ -80,8 +88,9 @@ a later listing and cause the next attempt to select the following generation.
 `IPodmanAdapter::capture`. The production Podman adapter exports a complete
 opaque checkpoint with `--leave-running`, so the source container resumes after
 the runtime capture boundary. The returned artifact must be an absolute,
-lexically normalized regular file below the dedicated directory. The production storage, adapter, and
-chunker additionally bind and re-check directory/file identities; the abstract
+lexically normalized regular file below the dedicated directory. The production
+storage, adapter, and chunker additionally bind and re-check directory/file identities;
+the abstract
 `IPodmanAdapter` contract alone does not provide that filesystem containment
 guarantee.
 
@@ -118,8 +127,7 @@ the same manifest-last rule; the type system does not restrict it to chunk-only
 methods.
 
 Only confirmed manifest publication transitions to `COMMITTED`. Previous
-manifests are not removed or modified by this stage. Retention is deferred to
-stage 11.
+manifests are not removed or modified. Retention is not implemented.
 
 ## Failures, cleanup, and crash behavior
 
@@ -132,14 +140,15 @@ The operation object is then destroyed and the lease is released.
 After confirmed manifest commit, cleanup failure cannot turn the create result
 into failure: the checkpoint is already immutable and visible. The creator
 returns success with `staging_cleanup_complete = false` and logs the cleanup
-reason, allowing conservative startup recovery/GC to handle the stale staging
-in stage 11. Returning failure here would invite a caller to create an
-unnecessary duplicate checkpoint.
+reason, leaving stale staging for future recovery/GC. Returning failure here would
+invite a caller to create an unnecessary duplicate checkpoint.
 
 If the process crashes before manifest publication, operation staging may remain
-but is never returned by committed-manifest listing and is never used for
-restore. A retry uses a fresh operation/checkpoint ID and artifact, while any
-fully published chunks can be deduplicated.
+but is never returned by committed-manifest listing and is never used for restore.
+The creator has no resume path; fully published chunks can be deduplicated by a later
+attempt. A direct caller would use a new operation/checkpoint ID. In the production
+IPC path, however, a crash after the durable `running` transition is first classified
+as `indeterminate` and must be reconciled before any new attempt.
 
 Filesystem publication has one unavoidable indeterminate boundary. If the
 manifest rename completed but the manifests directory `fsync` failed, storage
@@ -155,6 +164,37 @@ publication failure; in that case the creator reports definite checkpoint failur
 and logs `FAILED`, because no manifest was committed, while preserving the flag to
 report that an orphan chunk may be visible.
 
+## IPC submission and crash recovery
+
+Create is exposed as a bounded asynchronous operation. The server durably appends and
+`fsync`s a `queued` journal record before acknowledging `SubmitCreateCheckpoint`, and
+a worker durably records `running` before entering
+`ICheckpointService::create_checkpoint`. `GetOperation` then exposes the terminal
+`succeeded`, `failed`, or `indeterminate` state. `SchedulerClient` also provides a
+synchronous `bool` wrapper that performs submit plus polling up to its operation
+timeout; a transport disconnect does not cancel accepted work.
+
+The operation ID is `op-` plus the BLAKE3 digest of the request ID. Repeating the same
+request ID with the same canonical method/container payload returns the original
+operation without another capture, including after restart. Reusing it with a
+different payload is rejected. Journal compaction durably keeps one current record
+per operation, preserving this deduplication history.
+
+Crash recovery never silently reruns accepted work. A record still `queued` becomes a
+terminal failed-before-execution operation. A record still `running` becomes
+`indeterminate`, because capture or manifest publication may already have happened.
+The executor also maps a core error carrying any storage/runtime side-effect flag to
+`indeterminate`; this is deliberately conservative even when the only possible
+publication was an orphan chunk rather than a manifest. Scheduler/operator
+reconciliation must inspect committed manifests and relevant runtime state before a
+new destructive request.
+
+The operation registry is bounded and has no eviction policy. When its record limit is
+reached, new unique create/restore submissions are rejected even if retained records
+are terminal; known duplicate submissions and status polling continue to work.
+Checkpoint retention, operation-history pruning, and garbage collection of orphan
+chunks and stale staging are not implemented.
+
 ## Verification
 
 `//tests/unit:checkpoint_creator_test` uses fake runtime/storage/clock/ID/logger
@@ -166,9 +206,13 @@ checked against three pre-existing canonical checkpoints whose referenced chunks
 are reassembled byte-for-byte with the production reassembler.
 
 The lower-level production storage, chunker, Manifest v1 codec, and Podman adapter
-retain their own unit and opt-in rootful integration tests. These tests do not
-constitute production service wiring: there is currently no end-to-end binary
-composition of `CheckpointService`, `CheckpointCreator`, `FilesystemStorage`, and
-`PodmanAdapter`. The creator tests also do not cover every possible collaborator
+retain their own unit and opt-in rootful integration tests. `CheckpointCreator` tests
+cover the synchronous creator separately. Operation-store, RPC-handler, and
+server/client tests cover asynchronous submission, deduplication, and polling with
+fake executors or services; no test wires the real `CheckpointCreator` through the
+operation store and IPC stack. The Podman adapter capture test does obtain its artifact
+directory from a real `FilesystemStorage` operation, but this still does not establish
+that the complete production daemon-to-Podman/CRIU flow was executed end to end. The destructive runtime path still requires the qualified
+rootful environment. Creator tests also do not cover every possible collaborator
 contract violation, such as a foreign pre-populated correlation ID or a mismatched
 source-incarnation reference.

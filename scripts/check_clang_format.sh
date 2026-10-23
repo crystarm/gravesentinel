@@ -6,9 +6,14 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-if ! command -v clang-format >/dev/null 2>&1; then
-  echo "clang-format is required for this test" >&2
+CLANG_FORMAT="${CLANG_FORMAT:-clang-format}"
+
+if ! command -v "$CLANG_FORMAT" >/dev/null 2>&1; then
+  echo "$CLANG_FORMAT is required for this test" >&2
   exit 2
 fi
 
-clang-format --dry-run --Werror "$@"
+echo "PATH=$PATH" >&2
+command -v "$CLANG_FORMAT" >&2
+
+"$CLANG_FORMAT" --dry-run --Werror "$@"

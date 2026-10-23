@@ -1,16 +1,12 @@
 load("//build_defs:cc.bzl", "gravesentinel_cc_library")
-
 package(default_visibility = ["//visibility:private"])
 
-gravesentinel_cc_library(
-    name = "scheduler_client",
-    hdrs = ["hypervisor_client.hxx"],
-    deps = ["//src/protocol:protocol"],
-    visibility = ["//visibility:public"],
-)
+alias(name = "scheduler_client", actual = "//src/client:scheduler_client", visibility = ["//visibility:public"])
 
-filegroup(
-    name = "format_sources",
-    srcs = ["hypervisor_client.hxx"],
-    visibility = ["//scripts:__pkg__"],
+gravesentinel_cc_library(
+    name = "hypervisor_client",
+    hdrs = ["hypervisor_client.hxx"],
+    deps = ["//src/client:scheduler_client"],
+    visibility = ["//tests/unit:__pkg__"],
 )
+filegroup(name = "format_sources", srcs = ["hypervisor_client.hxx"], visibility = ["//scripts:__pkg__"])

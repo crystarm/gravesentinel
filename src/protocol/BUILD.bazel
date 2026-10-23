@@ -12,6 +12,7 @@ gravesentinel_cc_library(
         "//src/hypervisor:__pkg__",
         "//src/manifest:__pkg__",
         "//src/scheduler_client:__pkg__",
+        "//src/client:__pkg__",
         "//tests/unit:__pkg__",
     ],
 )

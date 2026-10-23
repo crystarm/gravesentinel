@@ -1,0 +1,208 @@
+#include "src/ipc/operation_store.hxx"
+#include "src/crypto/blake3.hxx"
+#include <cerrno>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <iomanip>
+#include <nlohmann/json.hpp>
+#include <span>
+#include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace gravesentinel::ipc {
+namespace {
+std::string digest_of(const std::string &value) {
+  const auto bytes = std::as_bytes(std::span(value.data(), value.size()));
+  const auto digest = gravesentinel::ccm::blake3_hash(bytes);
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  for (const auto byte : digest.bytes())
+    out << std::setw(2) << std::to_integer<unsigned>(byte);
+  return out.str();
+}
+std::string make_id(const std::string &request_id) {
+  return "op-" + digest_of(request_id) + "-" + std::to_string(::getpid());
+}
+[[maybe_unused]] bool terminal(OperationState s) {
+  return s == OperationState::succeeded || s == OperationState::failed ||
+         s == OperationState::indeterminate;
+}
+OperationState parse_state(const std::string &s) {
+  if (s == "running")
+    return OperationState::running;
+  if (s == "succeeded")
+    return OperationState::succeeded;
+  if (s == "failed")
+    return OperationState::failed;
+  if (s == "indeterminate")
+    return OperationState::indeterminate;
+  return OperationState::queued;
+}
+} // namespace
+const char *state_name(OperationState s) noexcept {
+  switch (s) {
+  case OperationState::queued:
+    return "queued";
+  case OperationState::running:
+    return "running";
+  case OperationState::succeeded:
+    return "succeeded";
+  case OperationState::failed:
+    return "failed";
+  case OperationState::indeterminate:
+    return "indeterminate";
+  }
+  return "failed";
+}
+OperationStore::OperationStore(std::string path, Executor executor,
+                               std::size_t limit)
+    : journal_path_(std::move(path)), executor_(std::move(executor)),
+      queue_limit_(limit) {
+  recover();
+  worker_ = std::thread([this] { worker(); });
+}
+OperationStore::~OperationStore() { stop(); }
+bool OperationStore::persist_locked(const Record &r) {
+  nlohmann::json j{{"request_id", r.view.request_id},
+                   {"operation_id", r.view.operation_id},
+                   {"method", r.view.method},
+                   {"container_id", r.view.container_id},
+                   {"state", state_name(r.view.state)},
+                   {"digest", r.digest},
+                   {"result", r.view.result}};
+  const auto line = j.dump() + "\n";
+  const int fd =
+      ::open(journal_path_.c_str(),
+             O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0)
+    return false;
+  const auto n = ::write(fd, line.data(), line.size());
+  const bool ok = n == static_cast<ssize_t>(line.size()) && ::fsync(fd) == 0;
+  ::close(fd);
+  return ok;
+}
+void OperationStore::recover() {
+  std::ifstream in(journal_path_);
+  std::string line;
+  while (std::getline(in, line)) {
+    try {
+      auto j = nlohmann::json::parse(line);
+      OperationView v{j.at("operation_id").get<std::string>(),
+                      j.at("request_id").get<std::string>(),
+                      j.at("method").get<std::string>(),
+                      j.at("container_id").get<std::string>(),
+                      parse_state(j.at("state").get<std::string>()),
+                      j.value("result", std::string{})};
+      Record r{v, j.at("digest").get<std::string>(), {}};
+      if (v.state == OperationState::running ||
+          v.state == OperationState::queued) {
+        v.state = v.method == "SubmitRestoreOrRestart"
+                      ? OperationState::indeterminate
+                      : OperationState::failed;
+        v.result = v.method == "SubmitRestoreOrRestart"
+                       ? "interrupted_restore_requires_reconciliation"
+                       : "interrupted_create_incomplete";
+        r.view = v;
+      }
+      by_operation_[v.operation_id] = r;
+      request_to_operation_[v.request_id] = v.operation_id;
+    } catch (...) { /* Ignore only a torn final journal record; valid earlier
+                       records remain usable. */
+    }
+  }
+}
+std::expected<SubmitResult, StoreError>
+OperationStore::submit(std::string request_id, std::string method,
+                       std::string container, std::string canonical) {
+  std::lock_guard lock(mutex_);
+  const auto digest = digest_of(canonical);
+  if (auto it = request_to_operation_.find(request_id);
+      it != request_to_operation_.end()) {
+    const auto &r = by_operation_.at(it->second);
+    if (r.digest != digest)
+      return std::unexpected(
+          StoreError{"request_id reused with different request payload"});
+    return SubmitResult{r.view.operation_id, true};
+  }
+  if (stopping_) {
+    return std::unexpected(StoreError{"operation store is shutting down"});
+  }
+  if (queue_.size() >= queue_limit_) {
+    return std::unexpected(StoreError{"operation queue is full"});
+  }
+  const auto id = make_id(request_id);
+  Record r{OperationView{
+               id, request_id, method, container, OperationState::queued, {}},
+           digest, canonical};
+  if (!persist_locked(r)) {
+    return std::unexpected(
+        StoreError{"cannot durably append operation journal"});
+  }
+  by_operation_[id] = r;
+  request_to_operation_[request_id] = id;
+  queue_.push_back(id);
+  condition_.notify_one();
+  return SubmitResult{id, false};
+}
+std::expected<OperationView, StoreError>
+OperationStore::get(std::string_view id) const {
+  std::lock_guard lock(mutex_);
+  auto it = by_operation_.find(std::string(id));
+  if (it == by_operation_.end())
+    return std::unexpected(StoreError{"operation not found"});
+  return it->second.view;
+}
+void OperationStore::worker() {
+  for (;;) {
+    std::string id;
+    Record snapshot;
+    {
+      std::unique_lock lock(mutex_);
+      condition_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+      if (queue_.empty() && stopping_)
+        return;
+      id = queue_.front();
+      queue_.erase(queue_.begin());
+      auto &r = by_operation_.at(id);
+      r.view.state = OperationState::running;
+      if (!persist_locked(r)) {
+        r.view.state = OperationState::failed;
+        r.view.result = "journal_write_failed";
+        continue;
+      }
+      snapshot = r;
+    }
+    auto result = executor_
+                      ? executor_(snapshot.view)
+                      : std::expected<std::string, StoreError>(
+                            std::unexpected(StoreError{"service_unavailable"}));
+    {
+      std::lock_guard lock(mutex_);
+      auto &r = by_operation_.at(id);
+      if (result) {
+        r.view.state = OperationState::succeeded;
+        r.view.result = *result;
+      } else {
+        r.view.state = OperationState::failed;
+        r.view.result = result.error().message;
+      }
+      (void)persist_locked(r);
+    }
+  }
+}
+void OperationStore::stop() {
+  {
+    std::lock_guard lock(mutex_);
+    if (stopping_)
+      return;
+    stopping_ = true;
+  }
+  condition_.notify_all();
+  if (worker_.joinable())
+    worker_.join();
+}
+} // namespace gravesentinel::ipc

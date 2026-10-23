@@ -165,6 +165,7 @@ test_suite(
         ":contracts_compile_test",
         ":filesystem_storage_test",
         ":linux_runtime_test",
+        ":ipc_codec_test",
         ":manifest_codec_test",
         ":manifest_types_test",
         ":podman_adapter_test",
@@ -185,6 +186,7 @@ filegroup(
         "contracts_compile_test.cxx",
         "filesystem_storage_test.cxx",
         "linux_runtime_test.cxx",
+        "ipc_codec_test.cxx",
         "manifest_codec_test.cxx",
         "manifest_types_test.cxx",
         "podman_adapter_test.cxx",
@@ -193,4 +195,11 @@ filegroup(
         "value_types_test.cxx",
     ],
     visibility = ["//scripts:__pkg__"],
+)
+
+gravesentinel_cc_test(
+    name = "ipc_codec_test",
+    srcs = ["ipc_codec_test.cxx"],
+    size = "small",
+    deps = ["//src/ipc:ipc_codec", "@nlohmann_json//:json", "@googletest//:gtest", "@googletest//:gtest_main"],
 )

@@ -109,6 +109,21 @@ gravesentinel_cc_test(
 )
 
 gravesentinel_cc_test(
+    name = "hypervisor_rpc_handler_test",
+    srcs = ["hypervisor_rpc_handler_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/core:ccm_core",
+        "//src/hypervisor:rpc_handler",
+        "//src/ipc:ipc_codec",
+        "//src/ipc:operation_store",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+    ],
+)
+
+gravesentinel_cc_test(
     name = "restore_coordinator_test",
     srcs = ["restore_coordinator_test.cxx"],
     size = "small",
@@ -165,6 +180,7 @@ test_suite(
         ":config_validation_test",
         ":contracts_compile_test",
         ":filesystem_storage_test",
+        ":hypervisor_rpc_handler_test",
         ":linux_runtime_test",
         ":ipc_codec_test",
         ":operation_store_test",
@@ -187,6 +203,7 @@ filegroup(
         "config_validation_test.cxx",
         "contracts_compile_test.cxx",
         "filesystem_storage_test.cxx",
+        "hypervisor_rpc_handler_test.cxx",
         "linux_runtime_test.cxx",
         "ipc_codec_test.cxx",
         "operation_store_test.cxx",

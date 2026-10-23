@@ -2,18 +2,18 @@
 
 ## Scope
 
-`//src/core:restore_coordinator` is the stage-08 synchronous restore orchestration
-layer. It selects committed Manifest v1 checkpoints newest-to-oldest, validates and
-pins each candidate, reassembles verified bytes, fences the original runtime
-incarnation, invokes `IPodmanAdapter`, and performs a cold start only after all
-checkpoint candidates are unusable or have failed with confirmed cleanup. It is
-implemented and unit-tested as a library, but the current
-`gravesentinel_hypervisor` binary is still a stub and does not instantiate a
-production restore path.
+`//src/core:restore_coordinator` is the synchronous restore orchestration layer. It
+selects committed Manifest v1 checkpoints newest-to-oldest, validates and pins each
+candidate, reassembles verified bytes, fences the original runtime incarnation,
+invokes `IPodmanAdapter`, and performs a cold start only after all checkpoint
+candidates are unusable or have failed with confirmed cleanup. The production
+`gravesentinel_hypervisor` composition instantiates this path through
+`CheckpointOperations` and `CheckpointService`; the outer operation store exposes it
+through durable asynchronous IPC submission.
 
-Periodic scheduling and registration ownership are deferred to the
-[checkpoint service core](service-core.md). Retention and garbage collection are
-separate later stages. The coordinator holds an exclusive storage operation for
+Periodic scheduling and registration ownership belong to the
+[checkpoint service core](service-core.md). Retention and garbage collection are not
+implemented. The coordinator holds an exclusive storage operation for
 the complete request, so create, restore, retention, and conflicting cleanup for
 the same `ContainerId` cannot overlap when the configured `IStorage`
 implementation provides the documented per-container lease.
@@ -24,10 +24,12 @@ A `RestoreRequest` contains the request/operation IDs, logical container ID, sta
 runtime reference, CPU assignment, optional `ColdStartSpec`, and an optional
 trusted `RuntimeIncarnation` for the source container. If a source incarnation is
 provided, its runtime reference must equal the registered target reference.
-`RequestId` and `OperationId` are caller-owned correlation values: neither the
-coordinator nor the synchronous service deduplicates them, journals results, or
-provides idempotent replay. A retry must use fresh IDs and is a new restore/cold
-start decision.
+`RequestId` and `OperationId` are caller-owned correlation values for a direct
+in-process call: neither the coordinator nor the synchronous service deduplicates
+them. In the production IPC path, `SubmitRestoreOrRestart` accepts the request ID and
+the durable operation store deterministically derives and journals the operation ID.
+The same journaled request ID and canonical restore/container payload is replayed as
+the same operation; a fresh request ID is a new restore/cold-start decision.
 
 A direct successful `RestoreCoordinator::restore_or_restart` result records whether
 the result came from a checkpoint or cold start, the new runtime incarnation, and
@@ -35,10 +37,11 @@ the selected checkpoint ID and generation when applicable. Pin-release and
 staging-cleanup completion are reported separately. The
 `ICheckpointService::restore_or_restart` facade returns only
 `CheckpointResult<void>`; it keeps the new incarnation internally and does not
-expose the outcome, selected checkpoint, or maintenance-completion flags. Once a
-runtime start succeeds, a later metadata cleanup failure does not turn that start
-into a false failure or trigger another start; the failure is logged and
-conservative stale-staging cleanup remains future recovery work.
+expose the outcome, selected checkpoint, or maintenance-completion flags. IPC
+`GetOperation` similarly exposes only operation state and a stable terminal error
+code. Once a runtime start succeeds, a later metadata cleanup failure does not turn
+that start into a false failure or trigger another start; the failure is logged and
+conservative stale-staging cleanup remains future recovery/GC work.
 
 `ColdStartSpec` environment values are used only for the synchronous adapter call
 and are not persisted by the coordinator in manifests or storage operation
@@ -159,6 +162,36 @@ cross-process per-container lease until destruction. RAII remains a final safety
 net for abrupt stack unwinding, but is not used as a substitute for observable
 ordinary-path cleanup.
 
+## IPC submission and crash recovery
+
+Restore is exposed as a bounded asynchronous operation. The server durably appends
+and `fsync`s `queued` before acknowledging `SubmitRestoreOrRestart`; a worker durably
+records `running` before invoking the synchronous service. `GetOperation` reports
+`queued`, `running`, `succeeded`, `failed`, or `indeterminate`. The high-level
+`SchedulerClient::restore_or_restart` method is a bounded submit-and-poll wrapper and
+returns `true` only for confirmed `succeeded`; disconnecting does not cancel an
+accepted restore.
+
+The operation ID is deterministically `op-` plus the BLAKE3 digest of the request ID.
+Repeating an identical request ID and canonical method/container payload returns the
+same retained operation, including after daemon restart; a different payload under
+the same request ID is rejected. Compaction keeps one durable current record per
+operation without forgetting deduplication history.
+
+If the daemon crashes while the record is still `queued`, recovery marks it failed
+before execution and does not start it. A recovered `running` restore becomes
+`indeterminate`: the old incarnation may have been removed, a restored or cold-started
+incarnation may exist, or the last durable operation transition may lag the runtime
+side effect. Core errors carrying `incarnation_may_exist` are also journaled as
+indeterminate. No automatic replay or fallback is safe at that point;
+scheduler/operator reconciliation must establish runtime presence and identity before
+another destructive action.
+
+The operation registry is bounded and does not evict terminal records. Saturation
+rejects new unique create/restore requests while preserving duplicate lookup and
+`GetOperation`. Checkpoint retention, operation-history pruning, stale-staging cleanup,
+and garbage collection are not implemented.
+
 ## Verification
 
 `//tests/unit:restore_coordinator_test` uses fake storage/runtime/logger seams with
@@ -167,6 +200,11 @@ and chunk corruption before runtime restore, incompatibility, runtime side effec
 pin lifetime, cleanup-gated fallback, cold start, source fencing, unique candidate
 staging, and same-container lease exclusion. `//tests/unit:podman_adapter_test`
 separately verifies the production read-only absence probe and confirms that
-presence never causes stop/remove commands. These tests do not provide production
-binary wiring or end-to-end service coverage; the current hypervisor executable
-does not instantiate the coordinator.
+presence never causes stop/remove commands. `RestoreCoordinator` tests cover the
+synchronous coordinator separately. Operation-store, RPC-handler, and server/client
+tests cover asynchronous submission, deduplication, polling, and crash classification
+with fake executors or services; no test wires the real `RestoreCoordinator` through
+the operation store and IPC stack. The production binary composes these components,
+but no statement here claims that the complete production daemon-to-Podman/CRIU
+restore flow was executed end to end. Restore and its destructive cleanup must be exercised only in the
+qualified rootful environment.

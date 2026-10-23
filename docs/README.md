@@ -1,41 +1,62 @@
 # GraveSentinel documentation
 
-This directory documents the implemented Checkpoint Cache Manager (CCM) libraries,
-the qualified Podman/CRIU profile, persisted formats, and the remaining integration
-work.
+This directory documents the implemented Checkpoint Cache Manager (CCM) service,
+its scheduler IPC client, the qualified Podman/CRIU profile, persisted formats, and
+remaining lifecycle work.
 
 ## Current status
 
 The repository contains tested implementations of Manifest v1, filesystem storage,
 chunking/reassembly, the Linux process and affinity layer, the Podman adapter,
-checkpoint creation, restore/fallback/cold start, and the synchronous checkpoint
-service core.
+checkpoint creation, restore/fallback/cold start, the checkpoint service core, and
+its production composition in `//src/hypervisor:gravesentinel_hypervisor`.
 
-The project is **not yet an operational end-to-end daemon**:
+The composition exposes a versioned, bounded request/response JSON protocol over a
+local `AF_UNIX/SOCK_SEQPACKET` socket. The concrete privilege-free scheduler client
+verifies the server peer UID (UID 0 by default); the server verifies the connecting
+scheduler UID with `SO_PEERCRED` and supports a configured socket GID and mode.
+Create and restore are durable asynchronous submit operations followed by
+`GetOperation` polling. Register and unregister remain synchronous and are not
+transport-retried after an exchange may have reached the server. At the core boundary,
+a busy unregister returns a retryable conflict instead of waiting; protocol v2 exposes
+all synchronous register/unregister service failures only as `request_failed`, so the
+scheduler must reconcile state before deciding whether to retry.
 
-- `//src/hypervisor:gravesentinel_hypervisor` is still a stub that exits with
-  failure;
-- the implemented libraries are not composed in that binary;
-- the Unix socket server, wire protocol, concrete scheduler client, asynchronous
-  operation journal, retention, garbage collection, and startup recovery are not
-  implemented;
-- `CheckpointConfig::keep_last` and the registration-level optional
-  `RuntimeFingerprint` are currently validated but have no operational effect.
+The operation journal is durable and bounded. It derives deterministic operation
+IDs from request IDs, deduplicates identical create/restore submissions across
+restarts, compacts its JSONL history, marks a crash-interrupted queued operation as
+failed before execution, and marks a crash-interrupted running operation as
+indeterminate. Its in-memory/recovered registry is also bounded and does not evict
+completed history: once full, it rejects new unique submissions while still serving
+known duplicates and status queries.
 
-Do not interpret a successful library build or unit-test run as proof that a
-running scheduler can use CCM through the hypervisor binary.
+The remaining important limits are:
+
+- checkpoint retention and garbage collection are not implemented;
+  `CheckpointConfig::keep_last` is validated but has no operational effect;
+- the registration-level optional `RuntimeFingerprint` is validated and carried on
+  the wire but is not forwarded into create or restore decisions;
+- an indeterminate operation requires scheduler/operator reconciliation and must not
+  be blindly resubmitted as a new destructive operation;
+- the only production runtime profile is `podman-criu-rootful-v1`, with executable
+  defaults `/usr/bin/podman` and `/usr/sbin/criu`; its destructive checkpoint and
+  restore flow must run only in a qualified rootful environment.
+
+The binary is buildable and its composed components and IPC behavior are covered by
+unit tests, but this documentation does not claim that the complete production
+daemon-to-Podman/CRIU end-to-end flow has been executed.
 
 ## Reading guide
 
 | Document | Purpose |
 | --- | --- |
-| [Architecture](architecture.md) | Current component status, process boundaries, actual Bazel graph, data flows, trust boundaries, and planned work |
+| [Architecture](architecture.md) | Current component status, process boundaries, Bazel graph, IPC/journal behavior, data flows, trust boundaries, and remaining work |
 | [Manifest v1](manifest-v1.md) | Normative persisted manifest schema, canonical JSON, checksum, validation, and limits |
 | [Chunking](chunking.md) | Fixed-size ingest, namespace-local deduplication, immutable tree checks, and verified reassembly |
 | [Filesystem storage](filesystem-storage.md) | On-disk layout, locking, staging, pins, durable publication, reads, cleanup, and known limits |
 | [Checkpoint creation](checkpoint-create.md) | Capture-to-manifest transaction, generation assignment, commit point, cleanup, and indeterminate publication |
 | [Checkpoint restore](checkpoint-restore.md) | Candidate selection, validation, pinning, absence fence, fallback, cold start, and cleanup |
-| [Service core](service-core.md) | Registration, CPU validation, workers, periodic scheduling, concurrency, shutdown, and API limitations |
+| [Service core](service-core.md) | Registration wire schema, CPU validation, workers, periodic scheduling, IPC exposure, concurrency, shutdown, and API limitations |
 | [Testbed qualification](testbed.md) | Dated Podman/CRIU qualification evidence, exact runtime profile, reproduction commands, and test scope |
 | [ADR 0001](adr/0001-podman-criu-runtime-profile.md) | Accepted rootful Podman/CRIU profile and opaque-artifact decision |
 
@@ -62,8 +83,10 @@ A useful implementation-order reading path is:
   references.
 - **generation** — positive per-container ordering number. It, not a timestamp,
   determines newest-to-oldest order.
-- **operation** — one create, restore, retention, or GC storage transaction holding
-  the per-container lease.
+- **operation** — a create or restore request tracked by the durable IPC operation
+  journal and, when admitted by the service, driving a storage transaction under the
+  per-container lease. Storage reserves operation kinds for retention and GC, but
+  those workflows are not implemented.
 - **candidate** — one committed generation considered during restore.
 - **indeterminate side effect** — an error for which publication may already be
   visible or a runtime incarnation may still exist.
@@ -79,8 +102,9 @@ The documentation deliberately separates four kinds of statements:
    but do not by themselves prove locking, durability, sanitization, or thread
    safety for arbitrary implementations.
 3. **Production implementation behavior** — guarantees attributed to
-   `FilesystemStorage`, `SnapshotChunker`, `PodmanAdapter`, and other concrete
-   classes apply to those implementations and their documented composition.
+   `FilesystemStorage`, `SnapshotChunker`, `PodmanAdapter`, `OperationStore`, the
+   IPC server/client, and other concrete classes apply to those implementations and
+   their documented composition.
 4. **Qualification evidence** — `testbed.md` records dated observations on one
    exact host/runtime profile. It is not a timeless portability claim and must be
    rerun after a relevant host or runtime change.

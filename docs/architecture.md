@@ -3,11 +3,11 @@
 ## Purpose and Current Status
 
 This document describes the CCM components **actually present in the repository**,
-their boundaries, and integration that has not yet been implemented. Normative details
-of formats and algorithms are provided in the related documents listed in the
-[documentation index](README.md).
+their process, persistence, and privilege boundaries, and the lifecycle work that is
+still absent. Normative details of formats and algorithms are provided in the related
+documents listed in the [documentation index](README.md).
 
-The current code already includes:
+The current code includes:
 
 | Area | Implementation | Status |
 | --- | --- | --- |
@@ -16,45 +16,56 @@ The current code already includes:
 | Crash-safe storage | `//src/storage:filesystem_storage` | implemented, unit-tested |
 | Chunking/reassembly | `//src/chunking:snapshot_chunker` | implemented, unit-tested |
 | Linux process/affinity boundary | `//src/hypervisor:linux_runtime` | implemented, unit-tested |
-| Podman/CRIU adapter | `//src/hypervisor:podman_adapter` | implemented, unit-tested, includes an opt-in smoke test |
+| Podman/CRIU adapter | `//src/hypervisor:podman_adapter` | implemented, unit-tested, includes an opt-in adapter smoke test |
 | Create orchestration | `//src/core:checkpoint_creator` | implemented, unit-tested |
 | Restore/fallback/cold start | `//src/core:restore_coordinator` | implemented, unit-tested |
 | Registration/scheduling service core | `//src/core:checkpoint_service` | implemented, unit-tested |
-| Production composition | `//src/hypervisor:gravesentinel_hypervisor` | **not implemented**: the binary is a stub |
-| Scheduler client implementation and IPC | interfaces/design only | **not implemented** |
-| Async operation journal/recovery | protocol types/design only | **not implemented** |
+| IPC codec and server | `//src/ipc:ipc_codec`, `//src/ipc:ipc_server` | implemented, unit-tested |
+| Durable async operation store | `//src/ipc:operation_store` | implemented, unit-tested |
+| Scheduler client | `//src/client:scheduler_client` | implemented, unit-tested |
+| Production composition | `//src/hypervisor:gravesentinel_hypervisor` | implemented and buildable |
 | Retention and garbage collection | operation kinds are reserved | **not implemented** |
 
-`gravesentinel_hypervisor` currently does not create storage, a chunker, an adapter, a
-creator, a restore coordinator, or a service. Its `main()` prints a message about the
-missing IPC server and returns `EXIT_FAILURE`. The project should therefore be treated
-as a set of complete and tested library layers, but not as a complete daemon/service.
+`gravesentinel_hypervisor` constructs filesystem storage, hashing, chunking, the
+Podman adapter, create/restore coordinators, `CheckpointService`, the durable operation
+store, RPC handler, and Unix socket server. Storage runtime-artifact paths and the
+Podman adapter share `checkpoint-data` as their trusted staging boundary; the adapter
+unit test obtains its capture directory from a real `FilesystemStorage` operation.
+This is a real production composition, not a stub. Unit tests cover its components and
+IPC behavior; there is no claim that the complete production binary-to-Podman/CRIU path
+has been executed end to end. The
+runtime remains intentionally restricted to a separately qualified destructive
+rootful profile.
 
-## Process Boundary: Current and Planned
+## Process Boundary and Privilege Separation
 
-The Scheduler and CCM must not share an address space. The Scheduler owns the desired
-set of registrations and sees only `IHypervisorClient` from the public
-`//src/scheduler_client:scheduler_client`. This target currently contains only an
-abstract synchronous `bool` interface; no concrete client exists.
+The Scheduler and CCM do not share an address space. The Scheduler owns the desired
+set of registrations and uses the concrete `SchedulerClient` through
+`IHypervisorClient` from the public `//src/scheduler_client:scheduler_client` alias.
+The client is privilege-free and depends only on protocol types plus its private IPC
+codec implementation.
 
-The planned process boundary is:
+The implemented process boundary is:
 
 ```mermaid
 flowchart TB
-    Scheduler[Scheduler process]
-    Client[Concrete scheduler client - not implemented]
-    Socket[Versioned bounded JSON over AF_UNIX SOCK_SEQPACKET - not implemented]
-    Hypervisor[gravesentinel_hypervisor composition - not implemented]
-    Service[CheckpointService - implemented library]
-    Create[CheckpointCreator - implemented]
-    Restore[RestoreCoordinator - implemented]
-    Runtime[PodmanAdapter and Linux runtime - implemented]
-    Storage[FilesystemStorage and chunking - implemented]
+    Scheduler[Unprivileged Scheduler process]
+    Client[SchedulerClient]
+    Socket[Versioned bounded JSON request and response packets]
+    Hypervisor[Rootful gravesentinel_hypervisor]
+    Journal[Durable OperationStore]
+    Service[CheckpointService]
+    Create[CheckpointCreator]
+    Restore[RestoreCoordinator]
+    Runtime[PodmanAdapter and Linux runtime]
+    Storage[FilesystemStorage and chunking]
 
-    Scheduler -. planned .-> Client
-    Client -. planned .-> Socket
-    Socket -. planned .-> Hypervisor
-    Hypervisor -. planned wiring .-> Service
+    Scheduler --> Client
+    Client -->|AF_UNIX SOCK_SEQPACKET| Socket
+    Socket --> Hypervisor
+    Hypervisor --> Journal
+    Hypervisor --> Service
+    Journal -->|execute accepted create and restore| Service
     Service --> Create
     Service --> Restore
     Create --> Runtime
@@ -63,74 +74,87 @@ flowchart TB
     Restore --> Storage
 ```
 
-Only the hypervisor process should be permitted to run rootful Podman/CRIU.
-`IProcessRunner` accepts an executable and a separate `argv`; the production
-`PosixProcessRunner` uses `execve` rather than shell concatenation. Scheduler-facing
-code does not depend on storage, Podman, CRIU, or Linux APIs.
+Both ends authenticate their peer with `SO_PEERCRED`. `SchedulerClient` expects the
+server UID to be 0 unless an explicit alternative is supplied. The server accepts
+only `--scheduler-uid` when configured; when it is omitted, the accepted peer UID is
+the server effective UID. The socket has configurable `--socket-gid` and
+`--socket-mode` (default `0660`) for filesystem access control, but group membership
+does not replace the server's exact UID check. A normal privilege-separated
+deployment therefore runs the hypervisor in the qualified rootful context, grants a
+specific scheduler UID access to the socket, and configures that same UID as the
+server's allowed peer.
+
+Only the hypervisor process invokes rootful Podman/CRIU. `IProcessRunner` accepts an
+executable and a separate `argv`; the production `PosixProcessRunner` uses `execve`
+rather than shell concatenation. The only accepted runtime profile is
+`podman-criu-rootful-v1`; the composition defaults to `/usr/bin/podman` and
+`/usr/sbin/criu`. Scheduler-facing code does not depend on storage, Podman, CRIU, or
+Linux APIs.
 
 ## Actual Bazel Target Graph
 
-It is important to distinguish the existence of a library target from its inclusion
-in an executable. The actual direct dependencies of the main project targets are:
+The condensed production dependency graph is:
 
 ```mermaid
 flowchart TD
-    SchedulerClient["//src/scheduler_client:scheduler_client"]
+    PublicClient["//src/scheduler_client:scheduler_client alias"]
+    Client["//src/client:scheduler_client"]
     Protocol["//src/protocol:protocol"]
+    Codec["//src/ipc:ipc_codec"]
+    Server["//src/ipc:ipc_server"]
+    Store["//src/ipc:operation_store"]
     Binary["//src/hypervisor:gravesentinel_hypervisor"]
-    Core["//src/core:ccm_core"]
+    Rpc["//src/hypervisor:rpc_handler"]
     Service["//src/core:checkpoint_service"]
     Creator["//src/core:checkpoint_creator"]
     Restorer["//src/core:restore_coordinator"]
-    Hasher["//src/core:blake3_hasher"]
     LinuxRuntime["//src/hypervisor:linux_runtime"]
     Podman["//src/hypervisor:podman_adapter"]
     Chunking["//src/chunking:snapshot_chunker"]
     Storage["//src/storage:filesystem_storage"]
+    Hasher["//src/core:blake3_hasher"]
     Manifest["//src/manifest:manifest"]
     Crypto["//src/crypto:blake3"]
-    Json["@nlohmann_json//:json"]
-    Blake3["@blake3//:blake3"]
 
-    SchedulerClient --> Protocol
-    Binary --> Core
-    Core --> Protocol
-    Service --> Core
+    PublicClient --> Client
+    Client --> Protocol
+    Client --> Codec
+    Binary --> Server
+    Binary --> Store
+    Binary --> Rpc
+    Binary --> Service
+    Binary --> Creator
+    Binary --> Restorer
+    Binary --> LinuxRuntime
+    Binary --> Podman
+    Binary --> Chunking
+    Binary --> Storage
+    Binary --> Hasher
+    Server --> Codec
+    Rpc --> Codec
+    Rpc --> Store
     Service --> Creator
     Service --> Restorer
-    Creator --> Core
     Creator --> Chunking
     Creator --> Manifest
-    Restorer --> Core
     Restorer --> Chunking
     Restorer --> Manifest
-    Hasher --> Core
-    Hasher --> Crypto
-    LinuxRuntime --> Core
-    Podman --> Core
-    Podman --> Json
-    Chunking --> Core
-    Chunking --> Manifest
     Chunking --> Storage
-    Storage --> Core
+    Chunking --> Manifest
     Storage --> Manifest
     Storage --> Crypto
-    Manifest --> Protocol
-    Manifest --> Crypto
-    Manifest --> Json
-    Crypto --> Protocol
-    Crypto --> Blake3
+    Hasher --> Crypto
+    Store --> Crypto
 ```
 
-A key limitation of the current graph is that the binary depends only on `ccm_core`;
-there are currently no edges from the binary to the service, runtime, storage, or
-orchestration libraries.
-
-`ccm_core` contains contracts and structured errors, but not workflow implementations.
-The Scheduler client depends only on the protocol. BLAKE3 `1.8.2.bcr.1`, nlohmann JSON
-`3.12.0.bcr.2`, and GoogleTest `1.18.0.bcr.1` are pinned in `MODULE.bazel` and do not
-appear in the public scheduler-facing target. `//tests/unit:unit_tests` is an
-aggregating test suite, not a library node in this dependency graph.
+The executable now has direct edges to the service, orchestration, runtime, IPC, and
+storage targets used by `main.cxx`. `ccm_core` still contains contracts and structured
+errors rather than workflow implementations. The public Scheduler client target is an
+alias for the concrete client; its JSON codec is an implementation dependency rather
+than part of the public API. BLAKE3 `1.8.2.bcr.1`, nlohmann JSON `3.12.0.bcr.2`, and
+GoogleTest `1.18.0.bcr.1` are pinned in `MODULE.bazel`.
+`//tests/unit:unit_tests` is an aggregating test suite, not a library node in this
+dependency graph.
 
 ## Identities and Configuration
 
@@ -144,18 +168,65 @@ an empty value and an embedded NUL. Stricter constraints are imposed at other la
 - the runtime adapter applies its own constraints to Podman names, image references,
   argv, and the environment.
 
-As a result, an identifier may be created successfully at the protocol layer but later
-be rejected at the manifest/storage boundary. Until unified ingress validation is
-introduced, the caller is responsible for checking this.
+A direct in-process caller can still construct a strong identifier that a later layer
+rejects. The wire boundary is stricter: every identifier is 1–128 bytes and contains
+only ASCII letters, digits, `_`, `-`, `.`, or `:`. Storage and runtime checks are
+repeated after decoding rather than relying on transport validation alone.
 
-`CheckpointConfig` has defaults of `interval = 60s` and `keep_last = 3`. Registration
-validation requires:
+`CheckpointConfig` has defaults of `interval = 60s` and `keep_last = 3`. The
+`Register` request uses this exact `ContainerRegistration` parameter shape; every
+listed key is required, unknown keys are rejected, and the two optional values are
+represented explicitly as either `null` or the complete object:
 
-- a positive interval;
-- `keep_last` in the range `1..3`;
+```text
+{
+  "container_id": string,
+  "runtime_container": string,
+  "checkpoint": {
+    "interval_seconds": integer,
+    "keep_last": integer,
+    "container_cpu": integer,
+    "checkpoint_cpu": integer
+  },
+  "cold_start": null | {
+    "image_reference": string,
+    "argv": [string, ...],
+    "environment": [{"name": string, "value": string}, ...],
+    "mounts": [{"source": string, "target": string, "read_only": boolean}, ...],
+    "runtime_options": [string, ...]
+  },
+  "runtime_fingerprint": null | {
+    "runtime_name": string,
+    "runtime_version": string,
+    "runtime_build_origin": string,
+    "architecture": string,
+    "kernel_release": string,
+    "criu_version": string,
+    "oci_runtime_name": string,
+    "oci_runtime_version": string,
+    "oci_runtime_commit": string,
+    "oci_runtime_features": string,
+    "cgroup_version": string,
+    "cgroup_manager": string,
+    "cgroup_controllers": string,
+    "privilege_mode": string,
+    "user_namespace_mode": string,
+    "capability_profile": string,
+    "selinux_mode": string,
+    "apparmor_profile": string,
+    "seccomp_profile": string,
+    "command_profile": string
+  }
+}
+```
+
+Registration validation requires:
+
+- `interval_seconds` in `1..31536000` and `keep_last` in `1..3`;
 - one of the CPU pairs `(0,1)`, `(2,3)`, `(4,5)`, `(6,7)`;
 - no more than four registrations, with no duplicate CPU assignments;
-- a bounded and syntactically valid `ColdStartSpec`;
+- a bounded and syntactically valid `ColdStartSpec`, including unique environment
+  names and the complete arrays shown above;
 - non-empty fields in the registration-level `RuntimeFingerprint`, if specified.
 
 Two fields currently do not affect the workflow after validation:
@@ -198,6 +269,9 @@ following properties apply to the production classes:
 | Exact Podman/CRIU profile and ownership checks | `PodmanAdapter` |
 | Shell-free child execution and process-group timeout | `PosixProcessRunner` |
 | Same-container serialization within one service | `CheckpointService` |
+| Bounded strict JSON request/response packets | IPC codec and `SOCK_SEQPACKET` server/client |
+| Server and client peer-UID checks | IPC server and `SchedulerClient` via `SO_PEERCRED` |
+| Durable operation acceptance, deduplication, and crash classification | `OperationStore` |
 
 All injected implementations must follow the calling layer's thread-safety and
 sanitization rules. Core passes collaborator diagnostics to the logger without
@@ -238,19 +312,23 @@ and do not constitute a committed checkpoint. A directory-`fsync` failure after 
 manifest rename produces `publication_may_be_visible`: the operation returns failure,
 but the manifest may already appear in the next listing and occupy the generation.
 
-Core does not maintain a journal/idempotency table. Unique `RequestId` and
-`OperationId` values for a new attempt are the caller's responsibility. Production
-storage rejects only a conflict with retained staging for the same operation key; a
-retry after successful cleanup is not an idempotent replay.
+The direct core remains synchronous and does not maintain an idempotency table. In
+the production RPC path, however, `SubmitCreateCheckpoint` is first durably recorded
+by `OperationStore`; its deterministic `OperationId` is then passed into the service
+and storage transaction. Repeating the same `RequestId` with the same canonical
+method/container payload returns that operation instead of capturing again, including
+after restart. A direct in-process retry or a submission with a new request ID is a
+new capture attempt.
 
 Full details: [checkpoint-create.md](checkpoint-create.md).
 
 ## Restore Data Flow
 
 A direct `RestoreCoordinator` call returns a `RestoredContainer` with an outcome,
-incarnation, checkpoint metadata, and cleanup flags. Externally,
-`ICheckpointService` returns only success/error and uses the incarnation as an internal
-fence.
+incarnation, checkpoint metadata, and cleanup flags. `ICheckpointService` returns only
+success/error and uses the incarnation as an internal fence. Across IPC,
+`SubmitRestoreOrRestart` is durable and asynchronous; clients poll `GetOperation` for
+a terminal state.
 
 ```mermaid
 flowchart TD
@@ -307,7 +385,9 @@ Guarantees within a single service instance:
 - operations in different slots may run concurrently;
 - a second synchronous caller waits for the slot to become available;
 - a periodic tick is skipped if the slot is busy, with no catch-up burst;
-- unregister closes the slot to new work and waits for accepted/active manual work;
+- unregister returns a retryable conflict while manual or periodic work is active;
+  otherwise it closes the slot, cancels a pending periodic item, and joins the idle
+  worker before releasing the registration;
 - shutdown closes all slots, stops the scheduler, and joins the workers;
 - a worker catches exceptions from the operation implementation and remains available.
 
@@ -315,12 +395,14 @@ Limitations:
 
 - FIFO/fairness among multiple manual callers and the scheduler is not guaranteed;
 - operation cancellation and service-level deadlines are not implemented;
-- a hung collaborator may delay the caller, unregister, and shutdown indefinitely;
+- a hung operation collaborator may delay its operation caller and shutdown
+  indefinitely; unregister rejects an active slot instead of waiting for it;
 - a periodic result is available only through `ILogger`;
 - a periodic `RequestId` is constructed as `periodic-<container>-<slot-sequence>` and
   may repeat after unregister/re-register; `OperationId` is generated separately;
-- an exception in the scheduler loop is logged and terminates periodic scheduling
-  without a health API;
+- an exception in the scheduler loop is logged and terminates periodic scheduling;
+  the general IPC health response does not expose that specific scheduler-thread
+  failure;
 - affinity restoration may fail, and that error is returned by explicit
   unregister/shutdown; the destructor cannot report it to the caller.
 
@@ -329,23 +411,43 @@ Details: [service-core.md](service-core.md).
 ## Persistence Boundary
 
 A committed checkpoint is defined by the presence of a canonical manifest, not staging
-or a chunk. The main layout is:
+or a chunk. With the production defaults, the daemon-owned persistence layout is:
 
 ```text
-root/
-  containers/<container-key>/
-    identity
-    manifests/<20-digit-generation>.json
-    chunks/<two-hex-prefix>/<64-hex-blake3>
-    staging/<operation-key>/...
-  locks/<container-key>.lock
-  tmp/
+/var/lib/gravesentinel/
+  operations.jsonl
+  hypervisor.lock
+  checkpoint-data/                 # storage root and Podman trusted staging root
+    containers/<container-key>/
+      identity
+      manifests/<20-digit-generation>.json
+      chunks/<two-hex-prefix>/<64-hex-blake3>
+      staging/<operation-key>/...
+    locks/<container-key>.lock
+    tmp/
 ```
 
-Raw IDs do not become path components: storage uses domain-separated BLAKE3 keys and
-checks the immutable `identity`. The operation lease is held until the operation state
-is destroyed; a longer-lived pin may extend the lease. Manifest/chunk publication is
-immutable and no-replace.
+Raw checkpoint IDs do not become storage path components: storage uses
+domain-separated BLAKE3 keys and checks the immutable `identity`. The storage
+operation lease is held until the operation state is destroyed; a longer-lived pin
+may extend the lease. Manifest/chunk publication is immutable and no-replace.
+
+`hypervisor.lock` is opened without following symlinks, validated as a single-link
+regular file owned by the daemon, forced to mode `0600`, and exclusively locked before
+checkpoint storage or `operations.jsonl` is opened. The lock remains held through
+service shutdown, so a losing second process cannot recover or compact the live journal.
+
+`operations.jsonl` is a separate mode-`0600`, daemon-owned durable journal. Acceptance,
+the transition to `running`, and terminal state changes are appended and `fsync`ed.
+Compaction writes one current record per operation to a fresh mode-`0600` file,
+`fsync`s it, renames it over the journal, and `fsync`s the parent directory. Startup
+also compacts after recovery. The journal and registry have configured entry, byte,
+in-flight, identifier, request, and result bounds.
+
+Pre-release journals written by the earlier prototype with PID-suffixed operation IDs
+are intentionally not migrated: strict recovery requires the deterministic
+`op-<BLAKE3(request_id)>` identity and fails closed on those records. Such a prototype
+journal must be archived or removed before starting this version.
 
 `FilesystemStorage` trusts a pre-created absolute root and an administrator who does
 not change the namespace under the running process. It applies descriptor-relative
@@ -375,8 +477,10 @@ The main safety rules are:
 - runtime stderr is not included in production adapter diagnostics.
 
 Qualification is tied to a specific rootful host profile and makes no general claims
-about other kernels, versions, architectures, or security policies. See
-[testbed.md](testbed.md) and
+about other kernels, versions, architectures, or security policies. The destructive
+Podman/CRIU flow must be run only in such a qualified environment. The existence of
+the production composition and its unit tests is not evidence that the complete
+production daemon flow has been run there. See [testbed.md](testbed.md) and
 [ADR 0001](adr/0001-podman-criu-runtime-profile.md).
 
 ## Errors and Indeterminate Side Effects
@@ -401,54 +505,97 @@ After such a result, a destructive action must not be retried automatically with
 reconciliation/absence proof. The service conservatively adds these flags to
 exceptions because the exception may have occurred after an opaque side effect.
 
-Diagnostics are currently internal. The future wire boundary should return a stable
-code/status/correlation, but not arbitrary internal diagnostics.
+Arbitrary internal diagnostics do not cross the wire. `GetOperation` exposes only the
+operation ID, state, and a stable error code for `failed` or `indeterminate` terminal
+states.
 
-## Future Async IPC Contract
+A journal-level `indeterminate` state is deliberately conservative. It can result
+from recovery of a `running` record, an exception after an opaque executor side
+effect, a core side-effect flag, or failure to persist a terminal result. The scheduler
+or an operator must reconcile checkpoint publication and runtime presence before a
+new destructive attempt.
 
-The following section is a design, not an implemented API.
+## Implemented IPC and Async Operation Contract
 
-The scheduler-facing `IHypervisorClient` retains synchronous `bool` semantics:
-`true` must mean confirmed completion, not merely acceptance of a long-running
-operation. The planned wire flow is:
+IPC is local `AF_UNIX/SOCK_SEQPACKET` request/response transport. Each JSON request and
+response occupies one packet and is limited to 256 KiB. The protocol-v2 envelopes are:
 
-1. submit with a unique `RequestId` returns accepted and an `OperationId`;
-2. `GetOperation` returns `queued`, `running`, `succeeded`, `failed`, or
+```text
+request  = {"version": 2, "method": string, "request_id": string,
+            "params": object}
+success  = {"version": 2, "request_id": string, "ok": true,
+            "result": object, "close_connection": bool}
+failure  = {"version": 2, "request_id": string, "ok": false,
+            "error_code": string, "close_connection": bool}
+```
+
+The codec rejects unknown envelope fields, methods, protocol versions, malformed or
+oversized packets, invalid identifier syntax, and method parameters outside their
+exact schema. `SchedulerClient` starts each connection with `Handshake`;
+`GetHealth`, `Register`, `Unregister`, `SubmitCreateCheckpoint`,
+`SubmitRestoreOrRestart`, and `GetOperation` are implemented. Individual packet
+reads/writes have deadlines, the server has a bounded accepted-peer queue, and each
+connection serves a bounded number of requests. The final allowed response sets
+`close_connection=true`; the client closes that descriptor before issuing another
+request, avoiding a race where a mutating packet could be accepted by the kernel after
+the server had stopped reading that connection.
+
+Create and restore use durable asynchronous submission:
+
+1. submission with a caller `RequestId` persists `queued` before success is returned;
+2. the operation ID is deterministically `op-` plus the BLAKE3 digest of the request
+   ID, so the same journaled request has the same ID after restart;
+3. the worker durably records `running` before calling the synchronous service;
+4. `GetOperation` reports `queued`, `running`, `succeeded`, `failed`, or
    `indeterminate`;
-3. the concrete scheduler client implements a bounded wait over submit/poll;
-4. a disconnect does not cancel an accepted operation;
-5. repeating the same request/payload returns the previous operation, while reusing an
-   ID with a different payload is rejected.
+5. the high-level synchronous `bool` client methods submit and poll until the
+   configured operation timeout, returning `true` only for `succeeded`.
 
-Neither a journal, deduplication, nor `GetOperation` is currently implemented. The
-current synchronous service core does not itself provide the described idempotency.
+An identical request ID plus canonical method/container payload is deduplicated and
+returns the existing operation. Reusing a request ID with a different method,
+container, or payload is a conflict. Async submission transport retries reuse the same
+request ID, so an ambiguous response does not create a second operation. A disconnect
+does not cancel accepted work.
 
-The planned transport is:
+`Register` and `Unregister` are synchronous and are not journaled. The client may retry
+connection establishment before an exchange, but once a request/response exchange
+fails ambiguously it does not transport-retry that mutation. It returns failure and
+the scheduler must reconcile registration state rather than assume the request did or
+did not execute. At the in-process core boundary, `Unregister` returns
+`StableErrorCode::conflict` with `retryable=true` without changing a registration that
+has active work. Protocol v2 intentionally collapses synchronous Register/Unregister
+service failures to `request_failed`, and the boolean client returns `false`; the
+scheduler must reconcile state and decide whether to retry.
 
-- local `AF_UNIX/SOCK_SEQPACKET`;
-- a version handshake and bounded JSON envelope;
-- an exact schema that rejects unknown fields/methods/versions;
-- socket owner/group/mode and `SO_PEERCRED`;
-- repeated server-side validation of all IDs and cold-start data.
+On journal recovery, a `queued` record is durably changed to `failed` with the
+`interrupted`/failed-before-execution classification; it is never executed after
+restart. A `running` record is durably changed to `indeterminate` and requires
+reconciliation. Terminal operations are not rerun.
 
-Local IPC must not be treated as a trusted boundary.
+The registry is intentionally bounded and currently has no eviction or operation
+history retention policy. Once `max_records` is reached, new unique operations are
+rejected even if all existing records are terminal; known duplicates and
+`GetOperation` remain available. Journal compaction bounds transition history but does
+not forget deduplication history. Local IPC is therefore authenticated and validated,
+not implicitly trusted.
 
 ## Lifecycle and Features Not Yet Implemented
 
-The following are still required for an operational MVP:
+The daemon composition, IPC, scheduler client, durable async journal, and journal
+startup classification are implemented. The remaining lifecycle limitations are:
 
-1. a composition root for storage, hashing, runtime, create/restore, and the service;
-2. configuration of the storage root, Podman/CRIU paths, socket, and logging;
-3. a Unix socket server and concrete scheduler client;
-4. a bounded async operation registry/journal and reconnect semantics;
-5. startup reconciliation for indeterminate publications and stale staging;
-6. retention according to `keep_last`, with pin-aware deletion;
-7. garbage collection of orphan chunks/temp/staging;
-8. an end-to-end test of the complete daemon flow.
+1. retention according to `keep_last`, with pin-aware manifest deletion;
+2. garbage collection of orphan chunks, temporary files, and stale operation staging;
+3. automatic reconciliation of indeterminate checkpoint publications or runtime
+   incarnations;
+4. operation-history retention/administrative pruning to free bounded registry slots;
+5. cancellation and service-level deadlines for already accepted operations;
+6. a recorded end-to-end execution of the complete production daemon flow in the
+   qualified rootful Podman/CRIU environment.
 
-Until these layers exist, the Scheduler cannot perform registration or checkpointing
-through `gravesentinel_hypervisor`, and `keep_last` does not limit the number of
-manifests.
+Consequently, `keep_last` does not limit the number of manifests, registry saturation
+rejects new unique operations, and an indeterminate operation remains an explicit
+scheduler/operator responsibility.
 
 ## Build and Checks
 
@@ -474,8 +621,9 @@ suite, such as the integration fixture's unit test.
 
 Manual integration targets are excluded from `bazel test //...`. They should be run
 only in a qualified rootful environment according to the instructions in
-[testbed.md](testbed.md). `bazel build //:hypervisor` successfully builds the current
-stub, but running it intentionally returns failure.
+[testbed.md](testbed.md). `bazel build //:hypervisor` builds the composed daemon; a
+successful build or unit-test run does not imply that the destructive production
+end-to-end flow was executed.
 
 Independent profiles `--config=debug`, `--config=release`, `--config=asan`,
 `--config=ubsan`, and `--config=tsan` are available.

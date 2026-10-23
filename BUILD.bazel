@@ -14,7 +14,8 @@ filegroup(
         ".bazelversion",
         ".clang-format",
         ".gitignore",
-        "MODULE.bazel"
+        "AGENTS.md",
+        "MODULE.bazel",
     ],
 )
 

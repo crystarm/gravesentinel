@@ -13,7 +13,5 @@ if ! command -v "$CLANG_FORMAT" >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "PATH=$PATH" >&2
-command -v "$CLANG_FORMAT" >&2
 
 "$CLANG_FORMAT" --dry-run --Werror "$@"

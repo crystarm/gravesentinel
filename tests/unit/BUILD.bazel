@@ -150,6 +150,7 @@ gravesentinel_cc_test(
     deps = [
         "//src/core:ccm_core",
         "//src/scheduler_client:scheduler_client",
+        "//src/scheduler_client:hypervisor_client",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
@@ -195,6 +196,7 @@ filegroup(
         "restore_coordinator_test.cxx",
         "snapshot_chunker_test.cxx",
         "value_types_test.cxx",
+        "ipc_server_client_test.cxx",
     ],
     visibility = ["//scripts:__pkg__"],
 )
@@ -211,4 +213,16 @@ gravesentinel_cc_test(
     srcs = ["operation_store_test.cxx"],
     size = "small",
     deps = ["//src/ipc:operation_store", "@nlohmann_json//:json", "@googletest//:gtest", "@googletest//:gtest_main"],
+)
+
+gravesentinel_cc_test(
+    name = "ipc_server_client_test",
+    srcs = ["ipc_server_client_test.cxx"],
+    size = "small",
+    deps = [
+        "//src/client:scheduler_client",
+        "//src/ipc:ipc_server",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
 )

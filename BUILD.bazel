@@ -33,7 +33,7 @@ alias(
 
 alias(
     name = "scheduler_client",
-    actual = "//src/scheduler_client:scheduler_client",
+    actual = "//src/client:scheduler_client",
     visibility = ["//visibility:public"],
 )
 

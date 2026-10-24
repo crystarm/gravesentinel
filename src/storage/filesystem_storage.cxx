@@ -8,11 +8,14 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -29,7 +32,12 @@ constexpr std::size_t kMaximumIdentifierBytes = 256U;
 constexpr std::size_t kMaximumTemporaryAttempts = 64U;
 constexpr std::size_t kManifestNameDigits = 20U;
 constexpr std::size_t kMaximumDirectoryEntries = 131072U;
+constexpr std::size_t kCandidateRecordMaximumBytes = 1024U;
+constexpr std::size_t kHashHexBytes = ChunkHash::digest_size * 2U;
+constexpr std::size_t kPublicationNonceHexBytes = 32U;
 constexpr std::string_view kManifestSuffix = ".json";
+constexpr std::string_view kTemporaryPrefix = ".tmp-";
+constexpr std::string_view kCandidatesDirectory = "gc-candidates";
 
 class UniqueFileDescriptor final {
 public:
@@ -190,6 +198,86 @@ identifier_key(std::string_view domain, std::string_view value,
   return hash_to_hex(blake3_hash(input));
 }
 
+template <typename Action>
+[[nodiscard]] auto retry_interrupted(Action &&action) {
+  auto result = action();
+  while (!result && result.error() == EINTR) {
+    result = action();
+  }
+  return result;
+}
+
+[[nodiscard]] bool is_lower_hex(std::string_view value) noexcept {
+  return std::ranges::all_of(value, [](char character) {
+    return (character >= '0' && character <= '9') ||
+           (character >= 'a' && character <= 'f');
+  });
+}
+
+[[nodiscard]] bool is_container_key(std::string_view name) noexcept {
+  return name.size() == kHashHexBytes && is_lower_hex(name);
+}
+
+[[nodiscard]] bool is_chunk_prefix(std::string_view name) noexcept {
+  return name.size() == 2U && is_lower_hex(name);
+}
+
+[[nodiscard]] bool is_chunk_name(std::string_view name) noexcept {
+  return name.size() == kHashHexBytes && is_lower_hex(name);
+}
+
+[[nodiscard]] bool is_publication_temporary(std::string_view name) noexcept {
+  return name.size() == kTemporaryPrefix.size() + kPublicationNonceHexBytes &&
+         name.starts_with(kTemporaryPrefix) &&
+         is_lower_hex(name.substr(kTemporaryPrefix.size()));
+}
+
+[[nodiscard]] std::int64_t
+unix_nanoseconds(std::chrono::system_clock::time_point value) noexcept {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             value.time_since_epoch())
+      .count();
+}
+
+[[nodiscard]] bool grace_elapsed(std::int64_t first_observed_nanoseconds,
+                                 std::int64_t now_nanoseconds,
+                                 std::chrono::seconds grace_period) noexcept {
+  if (grace_period.count() < 0 ||
+      now_nanoseconds < first_observed_nanoseconds) {
+    return false;
+  }
+  const auto elapsed = static_cast<std::uint64_t>(now_nanoseconds) -
+                       static_cast<std::uint64_t>(first_observed_nanoseconds);
+  const auto grace_seconds = static_cast<std::uint64_t>(grace_period.count());
+  if (grace_seconds >
+      std::numeric_limits<std::uint64_t>::max() / 1000000000ULL) {
+    return false;
+  }
+  return elapsed >= grace_seconds * 1000000000ULL;
+}
+
+[[nodiscard]] std::optional<std::int64_t>
+timestamp_nanoseconds(FileTimestamp timestamp) noexcept {
+  constexpr auto billion = 1000000000LL;
+  if (timestamp.nanoseconds >= static_cast<std::uint32_t>(billion) ||
+      timestamp.seconds > (std::numeric_limits<std::int64_t>::max() -
+                           static_cast<std::int64_t>(timestamp.nanoseconds)) /
+                              billion ||
+      timestamp.seconds < std::numeric_limits<std::int64_t>::min() / billion) {
+    return std::nullopt;
+  }
+  return timestamp.seconds * billion +
+         static_cast<std::int64_t>(timestamp.nanoseconds);
+}
+
+[[nodiscard]] bool is_stale(const FileStatus &status,
+                            const StartupRecoveryOptions &options) noexcept {
+  const auto modified = timestamp_nanoseconds(status.modification_time);
+  return modified.has_value() &&
+         grace_elapsed(*modified, unix_nanoseconds(options.now),
+                       options.grace_period);
+}
+
 [[nodiscard]] CheckpointResult<void>
 sync_directory(const std::shared_ptr<IFileOperations> &operations, int fd,
                std::string_view description,
@@ -228,7 +316,8 @@ open_directory(const std::shared_ptr<IFileOperations> &operations,
     auto opened = operations->open_directory_at(parent_fd, name);
     if (opened) {
       UniqueFileDescriptor descriptor{operations, *opened};
-      auto status = operations->status(descriptor.get());
+      auto status = retry_interrupted(
+          [&] { return operations->status(descriptor.get()); });
       if (!status) {
         return std::unexpected(filesystem_error(description, status.error()));
       }
@@ -249,7 +338,7 @@ open_directory(const std::shared_ptr<IFileOperations> &operations,
 directory_identity(const std::shared_ptr<IFileOperations> &operations, int fd,
                    std::string_view description) {
   while (true) {
-    auto status = operations->status(fd);
+    auto status = retry_interrupted([&] { return operations->status(fd); });
     if (status) {
       if (status->type != FileType::directory) {
         return std::unexpected(
@@ -320,7 +409,8 @@ read_regular_file(const std::shared_ptr<IFileOperations> &operations,
     }
   }
 
-  auto status = operations->status(file.get());
+  auto status =
+      retry_interrupted([&] { return operations->status(file.get()); });
   if (!status) {
     return std::unexpected(filesystem_error(description, status.error()));
   }
@@ -404,13 +494,43 @@ write_all(const std::shared_ptr<IFileOperations> &operations, int fd,
 void remove_temporary_best_effort(
     const std::shared_ptr<IFileOperations> &operations, int directory_fd,
     std::string_view name) noexcept {
-  auto removed = operations->remove_file_at(directory_fd, name);
-  if (!removed && removed.error() == EINTR) {
-    removed = operations->remove_file_at(directory_fd, name);
-  }
+  auto removed = retry_interrupted(
+      [&] { return operations->remove_file_at(directory_fd, name); });
   if (removed) {
     static_cast<void>(operations->sync_directory(directory_fd));
   }
+}
+
+[[nodiscard]] CheckpointResult<std::vector<std::string>>
+list_directory(const std::shared_ptr<IFileOperations> &operations,
+               int directory_fd, std::string_view description) {
+  auto entries = retry_interrupted([&] {
+    return operations->list_directory(directory_fd, kMaximumDirectoryEntries);
+  });
+  if (!entries) {
+    return std::unexpected(filesystem_error(description, entries.error()));
+  }
+  return std::move(*entries);
+}
+
+[[nodiscard]] CheckpointResult<bool> durable_remove_file(
+    const std::shared_ptr<IFileOperations> &operations, int directory_fd,
+    std::string_view name, std::string_view remove_description,
+    std::string_view sync_description, bool allow_missing = false) {
+  auto removed = retry_interrupted(
+      [&] { return operations->remove_file_at(directory_fd, name); });
+  if (!removed) {
+    if (allow_missing && removed.error() == ENOENT) {
+      return false;
+    }
+    return std::unexpected(
+        filesystem_error(remove_description, removed.error()));
+  }
+  if (auto synced = sync_directory(operations, directory_fd, sync_description);
+      !synced) {
+    return std::unexpected(synced.error());
+  }
+  return true;
 }
 
 [[nodiscard]] CheckpointResult<void>
@@ -451,7 +571,8 @@ durable_publish(const std::shared_ptr<IFileOperations> &operations,
     remove_temporary_best_effort(operations, directory_fd, temporary);
     return result;
   }
-  auto status = operations->status(file.get());
+  auto status =
+      retry_interrupted([&] { return operations->status(file.get()); });
   if (!status) {
     const auto error =
         filesystem_error("inspect publication temporary file", status.error());
@@ -565,7 +686,8 @@ list_manifest_references(const std::shared_ptr<IFileOperations> &operations,
             filesystem_error("open published manifest", opened.error()));
       }
     }
-    auto status = operations->status(file.get());
+    auto status =
+        retry_interrupted([&] { return operations->status(file.get()); });
     if (!status) {
       return std::unexpected(
           filesystem_error("inspect published manifest", status.error()));
@@ -580,6 +702,286 @@ list_manifest_references(const std::shared_ptr<IFileOperations> &operations,
   }
   std::ranges::sort(manifests, std::greater{}, &StoredManifest::generation);
   return manifests;
+}
+
+struct StrictManifestSnapshot {
+  std::vector<StoredManifest> manifests;
+  std::map<std::string, std::uint64_t> live_chunks;
+};
+
+[[nodiscard]] CheckpointResult<FileStatus>
+regular_file_status(const std::shared_ptr<IFileOperations> &operations,
+                    int parent_fd, std::string_view name,
+                    std::string_view description) {
+  auto opened = retry_interrupted(
+      [&] { return operations->open_regular_file_at(parent_fd, name); });
+  if (!opened) {
+    return std::unexpected(filesystem_error(description, opened.error()));
+  }
+  UniqueFileDescriptor file{operations, *opened};
+  auto status =
+      retry_interrupted([&] { return operations->status(file.get()); });
+  if (!status) {
+    return std::unexpected(filesystem_error(description, status.error()));
+  }
+  if (status->type != FileType::regular_file) {
+    return std::unexpected(
+        logical_error(StableErrorCode::storage_error,
+                      std::string{description} + " is not a regular file"));
+  }
+  return *status;
+}
+
+[[nodiscard]] CheckpointResult<StrictManifestSnapshot>
+scan_manifests_strict(const std::shared_ptr<IFileOperations> &operations,
+                      int manifests_fd, int chunks_fd,
+                      const ContainerId &container_id) {
+  if (auto synced =
+          sync_directory(operations, manifests_fd,
+                         "confirm manifest root durability before maintenance");
+      !synced) {
+    return std::unexpected(synced.error());
+  }
+  auto entries =
+      list_directory(operations, manifests_fd, "strictly list manifest root");
+  if (!entries) {
+    return std::unexpected(entries.error());
+  }
+
+  StrictManifestSnapshot snapshot;
+  for (const auto &entry : *entries) {
+    const auto generation = parse_manifest_name(entry);
+    if (!generation.has_value()) {
+      if (is_publication_temporary(entry)) {
+        continue;
+      }
+      return std::unexpected(
+          logical_error(StableErrorCode::corrupted_snapshot,
+                        "manifest root contains an unknown entry"));
+    }
+
+    auto encoded = read_regular_file(operations, manifests_fd, entry,
+                                     ManifestLimits::maximum_encoded_bytes,
+                                     "strictly read published manifest");
+    if (!encoded) {
+      return std::unexpected(encoded.error());
+    }
+    auto manifest = decode_manifest_v1(*encoded);
+    if (!manifest || manifest->container_id != container_id ||
+        manifest->generation != *generation) {
+      return std::unexpected(logical_error(
+          StableErrorCode::corrupted_snapshot,
+          "published manifest failed strict namespace validation"));
+    }
+
+    snapshot.manifests.push_back(StoredManifest{.generation = *generation});
+    for (const auto &artifact : manifest->artifacts) {
+      for (const auto &chunk : artifact.chunks) {
+        const auto name = hash_to_hex(chunk.hash);
+        const auto [iterator, inserted] =
+            snapshot.live_chunks.emplace(name, chunk.size);
+        if (!inserted && iterator->second != chunk.size) {
+          return std::unexpected(logical_error(
+              StableErrorCode::corrupted_snapshot,
+              "manifests disagree about an immutable chunk size"));
+        }
+      }
+    }
+  }
+
+  std::ranges::sort(snapshot.manifests, std::greater{},
+                    &StoredManifest::generation);
+  for (const auto &[name, expected_size] : snapshot.live_chunks) {
+    auto prefix = open_directory(operations, chunks_fd, name.substr(0, 2),
+                                 "open referenced chunk prefix");
+    if (!prefix) {
+      return std::unexpected(logical_error(
+          StableErrorCode::corrupted_snapshot,
+          "manifest references a missing or invalid chunk prefix"));
+    }
+    auto status = regular_file_status(operations, prefix->get(), name,
+                                      "inspect referenced chunk");
+    if (!status || status->size != expected_size) {
+      return std::unexpected(logical_error(
+          StableErrorCode::corrupted_snapshot,
+          "manifest references a missing chunk or an unexpected chunk size"));
+    }
+  }
+  return snapshot;
+}
+
+[[nodiscard]] CheckpointResult<void> clear_referenced_candidates(
+    const std::shared_ptr<IFileOperations> &operations, int container_fd,
+    const std::map<std::string, std::uint64_t> &live_chunks);
+
+[[nodiscard]] CheckpointResult<RetentionReport>
+apply_retention_locked(const std::shared_ptr<IFileOperations> &operations,
+                       int container_fd, int manifests_fd, int chunks_fd,
+                       const ContainerId &container_id, std::size_t keep_last) {
+  if (keep_last < 1U || keep_last > 3U) {
+    return std::unexpected(
+        logical_error(StableErrorCode::invalid_argument,
+                      "retention keep_last must be between one and three"));
+  }
+
+  auto snapshot =
+      scan_manifests_strict(operations, manifests_fd, chunks_fd, container_id);
+  if (!snapshot) {
+    return std::unexpected(snapshot.error());
+  }
+  if (auto cleared = clear_referenced_candidates(operations, container_fd,
+                                                 snapshot->live_chunks);
+      !cleared) {
+    return std::unexpected(cleared.error());
+  }
+
+  RetentionReport report{
+      .manifests_deleted = 0U,
+      .manifests_deferred = 0U,
+      .complete = true,
+  };
+  for (std::size_t index = snapshot->manifests.size(); index > keep_last;
+       --index) {
+    auto removed = durable_remove_file(
+        operations, manifests_fd,
+        manifest_name(snapshot->manifests[index - 1U].generation),
+        "remove retained manifest", "sync manifest retention deletion");
+    if (!removed) {
+      return std::unexpected(removed.error());
+    }
+    if (*removed) {
+      ++report.manifests_deleted;
+    }
+  }
+  return report;
+}
+
+struct ChunkIdentity {
+  std::uint64_t device;
+  std::uint64_t inode;
+  std::uint64_t size;
+  FileTimestamp modification_time;
+  FileTimestamp status_change_time;
+
+  bool operator==(const ChunkIdentity &) const = default;
+};
+
+[[nodiscard]] ChunkIdentity chunk_identity(const FileStatus &status) noexcept {
+  return ChunkIdentity{
+      .device = status.device,
+      .inode = status.inode,
+      .size = status.size,
+      .modification_time = status.modification_time,
+      .status_change_time = status.status_change_time,
+  };
+}
+
+struct GarbageCandidate {
+  std::string chunk_name;
+  std::int64_t first_observed_unreferenced;
+  ChunkIdentity identity;
+};
+
+[[nodiscard]] std::vector<std::byte> bytes_from_text(std::string_view text);
+
+[[nodiscard]] std::string text_from_bytes(std::span<const std::byte> bytes) {
+  std::string text;
+  text.reserve(bytes.size());
+  for (const auto byte : bytes) {
+    text.push_back(static_cast<char>(std::to_integer<unsigned char>(byte)));
+  }
+  return text;
+}
+
+[[nodiscard]] std::vector<std::byte>
+encode_candidate(const GarbageCandidate &candidate) {
+  const auto text =
+      "format_version=1\nchunk=" + candidate.chunk_name +
+      "\nfirst_observed_unix_nanoseconds=" +
+      std::to_string(candidate.first_observed_unreferenced) +
+      "\ndevice=" + std::to_string(candidate.identity.device) +
+      "\ninode=" + std::to_string(candidate.identity.inode) +
+      "\nsize=" + std::to_string(candidate.identity.size) + "\nmtime_seconds=" +
+      std::to_string(candidate.identity.modification_time.seconds) +
+      "\nmtime_nanoseconds=" +
+      std::to_string(candidate.identity.modification_time.nanoseconds) +
+      "\nctime_seconds=" +
+      std::to_string(candidate.identity.status_change_time.seconds) +
+      "\nctime_nanoseconds=" +
+      std::to_string(candidate.identity.status_change_time.nanoseconds) + "\n";
+  return bytes_from_text(text);
+}
+
+template <typename Integer>
+[[nodiscard]] bool parse_integer(std::string_view text, Integer &value) {
+  const auto parsed =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+[[nodiscard]] CheckpointResult<GarbageCandidate>
+decode_candidate(std::span<const std::byte> encoded,
+                 std::string_view expected_chunk_name) {
+  const auto text = text_from_bytes(encoded);
+  std::vector<std::string_view> lines;
+  std::size_t begin = 0U;
+  while (begin < text.size()) {
+    const auto end = text.find('\n', begin);
+    if (end == std::string::npos) {
+      return std::unexpected(
+          logical_error(StableErrorCode::corrupted_snapshot,
+                        "garbage candidate record is not newline terminated"));
+    }
+    lines.emplace_back(text.data() + begin, end - begin);
+    begin = end + 1U;
+  }
+  if (lines.size() != 10U || lines[0] != "format_version=1") {
+    return std::unexpected(
+        logical_error(StableErrorCode::corrupted_snapshot,
+                      "garbage candidate record has an unsupported format"));
+  }
+
+  const auto field =
+      [&](std::size_t index,
+          std::string_view prefix) -> std::optional<std::string_view> {
+    if (!lines[index].starts_with(prefix)) {
+      return std::nullopt;
+    }
+    return lines[index].substr(prefix.size());
+  };
+  const auto chunk = field(1U, "chunk=");
+  const auto first = field(2U, "first_observed_unix_nanoseconds=");
+  const auto device = field(3U, "device=");
+  const auto inode = field(4U, "inode=");
+  const auto size = field(5U, "size=");
+  const auto modification_seconds = field(6U, "mtime_seconds=");
+  const auto modification_nanoseconds = field(7U, "mtime_nanoseconds=");
+  const auto change_seconds = field(8U, "ctime_seconds=");
+  const auto change_nanoseconds = field(9U, "ctime_nanoseconds=");
+  GarbageCandidate candidate;
+  if (!chunk || *chunk != expected_chunk_name || !first || !device || !inode ||
+      !size || !modification_seconds || !modification_nanoseconds ||
+      !change_seconds || !change_nanoseconds ||
+      !parse_integer(*first, candidate.first_observed_unreferenced) ||
+      !parse_integer(*device, candidate.identity.device) ||
+      !parse_integer(*inode, candidate.identity.inode) ||
+      !parse_integer(*size, candidate.identity.size) ||
+      !parse_integer(*modification_seconds,
+                     candidate.identity.modification_time.seconds) ||
+      !parse_integer(*modification_nanoseconds,
+                     candidate.identity.modification_time.nanoseconds) ||
+      !parse_integer(*change_seconds,
+                     candidate.identity.status_change_time.seconds) ||
+      !parse_integer(*change_nanoseconds,
+                     candidate.identity.status_change_time.nanoseconds) ||
+      candidate.identity.modification_time.nanoseconds >= 1000000000U ||
+      candidate.identity.status_change_time.nanoseconds >= 1000000000U) {
+    return std::unexpected(
+        logical_error(StableErrorCode::corrupted_snapshot,
+                      "garbage candidate record is corrupt"));
+  }
+  candidate.chunk_name = std::string{*chunk};
+  return candidate;
 }
 
 [[nodiscard]] CheckpointResult<UniqueFileDescriptor>
@@ -618,7 +1020,8 @@ open_or_create_lock(const std::shared_ptr<StorageContext> &context,
         context->locks_fd.get(), name);
     if (opened) {
       UniqueFileDescriptor lock{context->operations, *opened};
-      auto status = context->operations->status(lock.get());
+      auto status = retry_interrupted(
+          [&] { return context->operations->status(lock.get()); });
       if (!status) {
         return std::unexpected(
             filesystem_error("inspect container lock file", status.error()));
@@ -645,9 +1048,11 @@ try_acquire_lock(const std::shared_ptr<StorageContext> &context, int lock_fd) {
       if (*locked) {
         return {};
       }
-      return std::unexpected(logical_error(
+      auto error = logical_error(
           StableErrorCode::conflict,
-          "another operation owns the exclusive container storage lock"));
+          "another operation owns the exclusive container storage lock");
+      error.retryable = true;
+      return std::unexpected(std::move(error));
     }
     if (locked.error() != EINTR) {
       return std::unexpected(
@@ -740,29 +1145,46 @@ ensure_container(const std::shared_ptr<StorageContext> &context,
   auto identity =
       read_regular_file(context->operations, container->get(), "identity",
                         kMaximumIdentifierBytes, "read container identity");
-  if (!identity && identity.error().code == StableErrorCode::not_found) {
-    auto published = durable_publish(context->operations, container->get(),
-                                     "identity", identity_bytes);
-    if (!published &&
-        published.error().code != StableErrorCode::already_exists) {
-      return std::unexpected(published.error());
+  if (identity) {
+    if (auto result = sync_directory(context->operations, container->get(),
+                                     "confirm container layout durability");
+        !result) {
+      return std::unexpected(result.error());
     }
-    identity =
-        read_regular_file(context->operations, container->get(), "identity",
-                          kMaximumIdentifierBytes, "read container identity");
+    if (!std::ranges::equal(*identity, identity_bytes)) {
+      return std::unexpected(logical_error(
+          StableErrorCode::conflict,
+          "container namespace identity does not match its derived key"));
+    }
+
+    auto manifests = open_directory(context->operations, container->get(),
+                                    "manifests", "open manifest directory");
+    if (!manifests) {
+      return std::unexpected(
+          required_namespace_error(manifests.error(), "manifests"));
+    }
+    auto chunks = open_directory(context->operations, container->get(),
+                                 "chunks", "open chunk directory");
+    if (!chunks) {
+      return std::unexpected(
+          required_namespace_error(chunks.error(), "chunks"));
+    }
+    auto staging = open_directory(context->operations, container->get(),
+                                  "staging", "open staging directory");
+    if (!staging) {
+      return std::unexpected(
+          required_namespace_error(staging.error(), "staging"));
+    }
+    return ContainerDirectories{
+        .key = std::move(*key),
+        .container = std::move(*container),
+        .manifests = std::move(*manifests),
+        .chunks = std::move(*chunks),
+        .staging = std::move(*staging),
+    };
   }
-  if (!identity) {
+  if (identity.error().code != StableErrorCode::not_found) {
     return std::unexpected(identity.error());
-  }
-  if (auto result = sync_directory(context->operations, container->get(),
-                                   "confirm container identity durability");
-      !result) {
-    return std::unexpected(result.error());
-  }
-  if (!std::ranges::equal(*identity, identity_bytes)) {
-    return std::unexpected(logical_error(
-        StableErrorCode::conflict,
-        "container namespace identity does not match its derived key"));
   }
 
   auto manifests = ensure_directory(context->operations, container->get(),
@@ -779,6 +1201,28 @@ ensure_container(const std::shared_ptr<StorageContext> &context,
                                   "staging", "create staging directory");
   if (!staging) {
     return std::unexpected(staging.error());
+  }
+
+  auto published = durable_publish(context->operations, container->get(),
+                                   "identity", identity_bytes);
+  if (!published && published.error().code != StableErrorCode::already_exists) {
+    return std::unexpected(published.error());
+  }
+  identity =
+      read_regular_file(context->operations, container->get(), "identity",
+                        kMaximumIdentifierBytes, "read container identity");
+  if (!identity) {
+    return std::unexpected(identity.error());
+  }
+  if (auto result = sync_directory(context->operations, container->get(),
+                                   "confirm completed container durability");
+      !result) {
+    return std::unexpected(result.error());
+  }
+  if (!std::ranges::equal(*identity, identity_bytes)) {
+    return std::unexpected(logical_error(
+        StableErrorCode::conflict,
+        "container namespace identity does not match its derived key"));
   }
   return ContainerDirectories{
       .key = std::move(*key),
@@ -808,14 +1252,373 @@ ensure_container(const std::shared_ptr<StorageContext> &context,
   return {bytes.begin(), bytes.end()};
 }
 
+struct ChunkFile {
+  std::string prefix;
+  FileStatus status;
+};
+
+[[nodiscard]] CheckpointResult<std::map<std::string, ChunkFile>>
+scan_canonical_chunks(const std::shared_ptr<IFileOperations> &operations,
+                      int chunks_fd) {
+  auto prefixes = list_directory(operations, chunks_fd,
+                                 "list chunk root for garbage collection");
+  if (!prefixes) {
+    return std::unexpected(prefixes.error());
+  }
+
+  std::map<std::string, ChunkFile> chunks;
+  for (const auto &prefix_name : *prefixes) {
+    if (!is_chunk_prefix(prefix_name)) {
+      continue;
+    }
+    auto opened_prefix = retry_interrupted(
+        [&] { return operations->open_directory_at(chunks_fd, prefix_name); });
+    if (!opened_prefix) {
+      if (opened_prefix.error() == ENOENT || opened_prefix.error() == ENOTDIR ||
+          opened_prefix.error() == ELOOP || opened_prefix.error() == EINVAL) {
+        continue;
+      }
+      return std::unexpected(filesystem_error(
+          "open chunk prefix for garbage collection", opened_prefix.error()));
+    }
+    UniqueFileDescriptor prefix{operations, *opened_prefix};
+    auto entries = list_directory(operations, prefix.get(),
+                                  "list chunk prefix for garbage collection");
+    if (!entries) {
+      return std::unexpected(entries.error());
+    }
+    for (const auto &entry : *entries) {
+      if (!is_chunk_name(entry) || !entry.starts_with(prefix_name)) {
+        continue;
+      }
+      auto opened = retry_interrupted([&] {
+        return operations->open_regular_file_at(prefix.get(), entry);
+      });
+      if (!opened) {
+        if (opened.error() == ENOENT || opened.error() == ELOOP ||
+            opened.error() == EINVAL || opened.error() == ENOTDIR) {
+          continue;
+        }
+        return std::unexpected(
+            filesystem_error("open chunk during garbage scan", opened.error()));
+      }
+      UniqueFileDescriptor file{operations, *opened};
+      auto status =
+          retry_interrupted([&] { return operations->status(file.get()); });
+      if (!status) {
+        return std::unexpected(filesystem_error(
+            "inspect chunk during garbage scan", status.error()));
+      }
+      if (status->type != FileType::regular_file) {
+        continue;
+      }
+      chunks.emplace(entry,
+                     ChunkFile{.prefix = prefix_name, .status = *status});
+    }
+  }
+  return chunks;
+}
+
+[[nodiscard]] CheckpointResult<std::map<std::string, GarbageCandidate>>
+scan_candidates(const std::shared_ptr<IFileOperations> &operations,
+                int candidates_fd) {
+  if (auto synced = sync_directory(
+          operations, candidates_fd,
+          "confirm garbage candidate records before maintenance");
+      !synced) {
+    return std::unexpected(synced.error());
+  }
+  auto entries = list_directory(operations, candidates_fd,
+                                "list garbage candidate records");
+  if (!entries) {
+    return std::unexpected(entries.error());
+  }
+
+  std::map<std::string, GarbageCandidate> candidates;
+  for (const auto &entry : *entries) {
+    if (!is_chunk_name(entry)) {
+      continue;
+    }
+    auto encoded = read_regular_file(operations, candidates_fd, entry,
+                                     kCandidateRecordMaximumBytes,
+                                     "read garbage candidate record");
+    if (!encoded) {
+      return std::unexpected(logical_error(
+          StableErrorCode::corrupted_snapshot,
+          "garbage candidate record is unreadable or has an invalid type"));
+    }
+    auto candidate = decode_candidate(*encoded, entry);
+    if (!candidate) {
+      return std::unexpected(candidate.error());
+    }
+    candidates.emplace(entry, std::move(*candidate));
+  }
+  return candidates;
+}
+
+[[nodiscard]] CheckpointResult<void>
+publish_candidate(const std::shared_ptr<IFileOperations> &operations,
+                  int candidates_fd, std::string_view chunk_name,
+                  const FileStatus &status, std::int64_t observed_at) {
+  const auto encoded = encode_candidate(GarbageCandidate{
+      .chunk_name = std::string{chunk_name},
+      .first_observed_unreferenced = observed_at,
+      .identity = chunk_identity(status),
+  });
+  return durable_publish(operations, candidates_fd, chunk_name, encoded);
+}
+
+[[nodiscard]] CheckpointResult<bool>
+remove_candidate(const std::shared_ptr<IFileOperations> &operations,
+                 int candidates_fd, std::string_view chunk_name) {
+  return durable_remove_file(operations, candidates_fd, chunk_name,
+                             "remove garbage candidate record",
+                             "sync garbage candidate removal", true);
+}
+
+[[nodiscard]] CheckpointResult<void> clear_referenced_candidates(
+    const std::shared_ptr<IFileOperations> &operations, int container_fd,
+    const std::map<std::string, std::uint64_t> &live_chunks) {
+  auto candidates_directory =
+      ensure_directory(operations, container_fd, kCandidatesDirectory,
+                       "create garbage candidate directory before retention");
+  if (!candidates_directory) {
+    return std::unexpected(candidates_directory.error());
+  }
+  auto candidates = scan_candidates(operations, candidates_directory->get());
+  if (!candidates) {
+    return std::unexpected(candidates.error());
+  }
+  for (const auto &[name, unused_candidate] : *candidates) {
+    static_cast<void>(unused_candidate);
+    if (!live_chunks.contains(name)) {
+      continue;
+    }
+    auto removed =
+        remove_candidate(operations, candidates_directory->get(), name);
+    if (!removed) {
+      return std::unexpected(removed.error());
+    }
+  }
+  return {};
+}
+
+[[nodiscard]] CheckpointResult<std::optional<FileStatus>>
+recheck_chunk(const std::shared_ptr<IFileOperations> &operations, int chunks_fd,
+              std::string_view chunk_name) {
+  auto prefix = retry_interrupted([&] {
+    return operations->open_directory_at(chunks_fd, chunk_name.substr(0, 2));
+  });
+  if (!prefix) {
+    if (prefix.error() == ENOENT || prefix.error() == ENOTDIR ||
+        prefix.error() == ELOOP || prefix.error() == EINVAL) {
+      return std::optional<FileStatus>{};
+    }
+    return std::unexpected(
+        filesystem_error("reopen garbage chunk prefix", prefix.error()));
+  }
+  UniqueFileDescriptor prefix_fd{operations, *prefix};
+  auto file = retry_interrupted([&] {
+    return operations->open_regular_file_at(prefix_fd.get(), chunk_name);
+  });
+  if (!file) {
+    if (file.error() == ENOENT || file.error() == ELOOP ||
+        file.error() == EINVAL || file.error() == ENOTDIR) {
+      return std::optional<FileStatus>{};
+    }
+    return std::unexpected(
+        filesystem_error("reopen garbage chunk", file.error()));
+  }
+  UniqueFileDescriptor file_fd{operations, *file};
+  auto status =
+      retry_interrupted([&] { return operations->status(file_fd.get()); });
+  if (!status) {
+    return std::unexpected(
+        filesystem_error("reinspect garbage chunk", status.error()));
+  }
+  if (status->type != FileType::regular_file) {
+    return std::optional<FileStatus>{};
+  }
+  return std::optional<FileStatus>{*status};
+}
+
+[[nodiscard]] CheckpointResult<GarbageCollectionReport>
+collect_garbage_locked(const std::shared_ptr<IFileOperations> &operations,
+                       int container_fd, int manifests_fd, int chunks_fd,
+                       const ContainerId &container_id,
+                       const GarbageCollectionOptions &options) {
+  if (options.grace_period.count() < 0) {
+    return std::unexpected(
+        logical_error(StableErrorCode::invalid_argument,
+                      "garbage collection grace period must not be negative"));
+  }
+
+  auto roots =
+      scan_manifests_strict(operations, manifests_fd, chunks_fd, container_id);
+  if (!roots) {
+    return std::unexpected(roots.error());
+  }
+  auto candidates_directory =
+      ensure_directory(operations, container_fd, kCandidatesDirectory,
+                       "create garbage candidate directory");
+  if (!candidates_directory) {
+    return std::unexpected(candidates_directory.error());
+  }
+  auto candidates = scan_candidates(operations, candidates_directory->get());
+  if (!candidates) {
+    return std::unexpected(candidates.error());
+  }
+  auto chunks = scan_canonical_chunks(operations, chunks_fd);
+  if (!chunks) {
+    return std::unexpected(chunks.error());
+  }
+
+  GarbageCollectionReport report{
+      .chunks_marked = 0U,
+      .chunks_deleted = 0U,
+      .candidate_records_deleted = 0U,
+      .more_work = false,
+  };
+
+  for (auto iterator = candidates->begin(); iterator != candidates->end();) {
+    const bool referenced = roots->live_chunks.contains(iterator->first);
+    const bool missing = !chunks->contains(iterator->first);
+    if (!referenced && !missing) {
+      ++iterator;
+      continue;
+    }
+    auto removed = remove_candidate(operations, candidates_directory->get(),
+                                    iterator->first);
+    if (!removed) {
+      return std::unexpected(removed.error());
+    }
+    if (*removed) {
+      ++report.candidate_records_deleted;
+    }
+    iterator = candidates->erase(iterator);
+  }
+
+  const auto now = unix_nanoseconds(options.now);
+  for (const auto &[name, chunk] : *chunks) {
+    if (roots->live_chunks.contains(name)) {
+      continue;
+    }
+
+    auto candidate = candidates->find(name);
+    if (candidate == candidates->end()) {
+      if (auto marked = publish_candidate(
+              operations, candidates_directory->get(), name, chunk.status, now);
+          !marked) {
+        return std::unexpected(marked.error());
+      }
+      ++report.chunks_marked;
+      continue;
+    }
+
+    if (candidate->second.identity != chunk_identity(chunk.status)) {
+      auto removed =
+          remove_candidate(operations, candidates_directory->get(), name);
+      if (!removed) {
+        return std::unexpected(removed.error());
+      }
+      if (*removed) {
+        ++report.candidate_records_deleted;
+      }
+      if (auto marked = publish_candidate(
+              operations, candidates_directory->get(), name, chunk.status, now);
+          !marked) {
+        return std::unexpected(marked.error());
+      }
+      ++report.chunks_marked;
+      continue;
+    }
+
+    if (!grace_elapsed(candidate->second.first_observed_unreferenced, now,
+                       options.grace_period)) {
+      continue;
+    }
+    if (report.chunks_deleted >= options.maximum_deletions) {
+      report.more_work = true;
+      continue;
+    }
+
+    auto rechecked_roots = scan_manifests_strict(operations, manifests_fd,
+                                                 chunks_fd, container_id);
+    if (!rechecked_roots) {
+      return std::unexpected(rechecked_roots.error());
+    }
+    if (rechecked_roots->live_chunks.contains(name)) {
+      auto removed =
+          remove_candidate(operations, candidates_directory->get(), name);
+      if (!removed) {
+        return std::unexpected(removed.error());
+      }
+      if (*removed) {
+        ++report.candidate_records_deleted;
+      }
+      continue;
+    }
+
+    auto current = recheck_chunk(operations, chunks_fd, name);
+    if (!current) {
+      return std::unexpected(current.error());
+    }
+    if (!current->has_value() ||
+        chunk_identity(**current) != candidate->second.identity) {
+      auto removed =
+          remove_candidate(operations, candidates_directory->get(), name);
+      if (!removed) {
+        return std::unexpected(removed.error());
+      }
+      if (*removed) {
+        ++report.candidate_records_deleted;
+      }
+      if (current->has_value()) {
+        if (auto marked = publish_candidate(
+                operations, candidates_directory->get(), name, **current, now);
+            !marked) {
+          return std::unexpected(marked.error());
+        }
+        ++report.chunks_marked;
+      }
+      continue;
+    }
+
+    auto prefix = open_directory(operations, chunks_fd, chunk.prefix,
+                                 "open garbage chunk prefix for deletion");
+    if (!prefix) {
+      return std::unexpected(prefix.error());
+    }
+    auto removed_chunk = durable_remove_file(
+        operations, prefix->get(), name, "remove unreferenced chunk",
+        "sync unreferenced chunk deletion");
+    if (!removed_chunk) {
+      return std::unexpected(removed_chunk.error());
+    }
+    if (!*removed_chunk) {
+      continue;
+    }
+    ++report.chunks_deleted;
+
+    auto removed_record =
+        remove_candidate(operations, candidates_directory->get(), name);
+    if (!removed_record) {
+      return std::unexpected(removed_record.error());
+    }
+    if (*removed_record) {
+      ++report.candidate_records_deleted;
+    }
+  }
+  return report;
+}
+
 [[nodiscard]] CheckpointResult<void>
 remove_tree_contents(const std::shared_ptr<IFileOperations> &operations,
                      int directory_fd) {
-  auto entries =
-      operations->list_directory(directory_fd, kMaximumDirectoryEntries);
+  auto entries = list_directory(operations, directory_fd,
+                                "list staging directory for cleanup");
   if (!entries) {
-    return std::unexpected(filesystem_error(
-        "list staging directory for cleanup", entries.error()));
+    return std::unexpected(entries.error());
   }
   for (const auto &entry : *entries) {
     auto child = operations->open_directory_at(directory_fd, entry);
@@ -826,7 +1629,8 @@ remove_tree_contents(const std::shared_ptr<IFileOperations> &operations,
         return result;
       }
       child_fd.reset();
-      auto removed = operations->remove_directory_at(directory_fd, entry);
+      auto removed = retry_interrupted(
+          [&] { return operations->remove_directory_at(directory_fd, entry); });
       if (!removed) {
         return std::unexpected(
             filesystem_error("remove staging subdirectory", removed.error()));
@@ -837,7 +1641,8 @@ remove_tree_contents(const std::shared_ptr<IFileOperations> &operations,
       return std::unexpected(
           filesystem_error("inspect staging entry", child.error()));
     }
-    auto removed = operations->remove_file_at(directory_fd, entry);
+    auto removed = retry_interrupted(
+        [&] { return operations->remove_file_at(directory_fd, entry); });
     if (!removed) {
       return std::unexpected(
           filesystem_error("remove staging file", removed.error()));
@@ -857,8 +1662,9 @@ void cleanup_failed_operation_initialization_best_effort(
     operation_directory.reset();
   }
 
-  auto removed =
-      operations->remove_directory_at(staging_parent_fd, operation_key);
+  auto removed = retry_interrupted([&] {
+    return operations->remove_directory_at(staging_parent_fd, operation_key);
+  });
   if (removed) {
     static_cast<void>(sync_directory(
         operations, staging_parent_fd,
@@ -891,6 +1697,7 @@ struct StorageOperationData {
   std::mutex mutex;
   std::size_t pins{0};
   bool manifest_finalized{false};
+  bool manifest_confirmed{false};
   bool cleaned{false};
   bool owner_alive{true};
 };
@@ -912,8 +1719,10 @@ cleanup_operation_locked(StorageOperationData &state) {
     return result;
   }
   state.operation_fd.reset();
-  auto removed = state.context->operations->remove_directory_at(
-      state.staging_parent_fd.get(), state.operation_key);
+  auto removed = retry_interrupted([&] {
+    return state.context->operations->remove_directory_at(
+        state.staging_parent_fd.get(), state.operation_key);
+  });
   if (!removed) {
     return std::unexpected(filesystem_error(
         "remove operation staging directory", removed.error()));
@@ -942,8 +1751,10 @@ public:
     }
     auto state = std::exchange(state_, {});
     std::scoped_lock lock{state->mutex};
-    auto removed = state->context->operations->remove_file_at(
-        state->operation_fd.get(), name_);
+    auto removed = retry_interrupted([&] {
+      return state->context->operations->remove_file_at(
+          state->operation_fd.get(), name_);
+    });
     CheckpointResult<void> result;
     if (!removed && removed.error() != ENOENT) {
       result = std::unexpected(
@@ -1151,6 +1962,7 @@ public:
               StorageSideEffect::publication_may_be_visible);
           if (confirmed) {
             state_->manifest_finalized = true;
+            state_->manifest_confirmed = true;
           }
           return confirmed;
         }
@@ -1185,8 +1997,11 @@ public:
     auto published =
         durable_publish(state_->context->operations, state_->manifests_fd.get(),
                         destination, manifest_bytes);
-    if (published || published.error().storage_side_effect ==
-                         StorageSideEffect::publication_may_be_visible) {
+    if (published) {
+      state_->manifest_finalized = true;
+      state_->manifest_confirmed = true;
+    } else if (published.error().storage_side_effect ==
+               StorageSideEffect::publication_may_be_visible) {
       state_->manifest_finalized = true;
     }
     return published;
@@ -1229,6 +2044,21 @@ public:
         std::make_unique<FilesystemStoragePin>(state_, pin_name)};
   }
 
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(std::size_t keep_last) override {
+    std::scoped_lock lock{state_->mutex};
+    if (state_->kind != StorageOperationKind::create_checkpoint ||
+        state_->cleaned || !state_->manifest_confirmed) {
+      return std::unexpected(logical_error(
+          StableErrorCode::conflict,
+          "immediate retention requires a confirmed active create manifest"));
+    }
+    return apply_retention_locked(
+        state_->context->operations, state_->container_fd.get(),
+        state_->manifests_fd.get(), state_->chunks_fd.get(),
+        state_->container_id, keep_last);
+  }
+
   [[nodiscard]] CheckpointResult<void> cleanup() override {
     std::scoped_lock lock{state_->mutex};
     return cleanup_operation_locked(*state_);
@@ -1237,6 +2067,349 @@ public:
 private:
   std::shared_ptr<StorageOperationData> state_;
 };
+
+struct StorageMaintenanceData {
+  std::shared_ptr<StorageContext> context;
+  ContainerId container_id;
+  StorageOperationKind kind;
+  UniqueFileDescriptor lock_fd;
+  UniqueFileDescriptor container_fd;
+  UniqueFileDescriptor manifests_fd;
+  UniqueFileDescriptor chunks_fd;
+  UniqueFileDescriptor staging_fd;
+};
+
+class FilesystemStorageMaintenanceOperation final
+    : public IStorageMaintenanceOperation {
+public:
+  explicit FilesystemStorageMaintenanceOperation(StorageMaintenanceData data)
+      : data_(std::move(data)) {}
+
+  [[nodiscard]] const ContainerId &container_id() const noexcept override {
+    return data_.container_id;
+  }
+
+  [[nodiscard]] StorageOperationKind kind() const noexcept override {
+    return data_.kind;
+  }
+
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(std::size_t keep_last) override {
+    if (data_.kind != StorageOperationKind::retention) {
+      return std::unexpected(logical_error(
+          StableErrorCode::conflict,
+          "retention is allowed only by a retention maintenance operation"));
+    }
+    return apply_retention_locked(
+        data_.context->operations, data_.container_fd.get(),
+        data_.manifests_fd.get(), data_.chunks_fd.get(), data_.container_id,
+        keep_last);
+  }
+
+  [[nodiscard]] CheckpointResult<GarbageCollectionReport>
+  collect_garbage(const GarbageCollectionOptions &options) override {
+    if (data_.kind != StorageOperationKind::garbage_collection) {
+      return std::unexpected(logical_error(
+          StableErrorCode::conflict,
+          "garbage collection is allowed only by a garbage collection "
+          "maintenance operation"));
+    }
+    return collect_garbage_locked(
+        data_.context->operations, data_.container_fd.get(),
+        data_.manifests_fd.get(), data_.chunks_fd.get(), data_.container_id,
+        options);
+  }
+
+private:
+  StorageMaintenanceData data_;
+};
+
+struct RecoveryContainer {
+  ContainerId container_id;
+  ContainerDirectories directories;
+};
+
+[[nodiscard]] CheckpointResult<std::optional<RecoveryContainer>>
+open_recovery_container(const std::shared_ptr<StorageContext> &context,
+                        std::string_view key) {
+  auto opened = retry_interrupted([&] {
+    return context->operations->open_directory_at(context->containers_fd.get(),
+                                                  key);
+  });
+  if (!opened) {
+    if (opened.error() == ENOENT || opened.error() == ENOTDIR ||
+        opened.error() == ELOOP || opened.error() == EINVAL) {
+      return std::optional<RecoveryContainer>{};
+    }
+    return std::unexpected(
+        filesystem_error("open recovery container namespace", opened.error()));
+  }
+  UniqueFileDescriptor container{context->operations, *opened};
+  auto status = retry_interrupted(
+      [&] { return context->operations->status(container.get()); });
+  if (!status) {
+    return std::unexpected(filesystem_error(
+        "inspect recovery container namespace", status.error()));
+  }
+  if (status->type != FileType::directory) {
+    return std::optional<RecoveryContainer>{};
+  }
+  if (auto synced = sync_directory(context->operations, container.get(),
+                                   "confirm recovery container durability");
+      !synced) {
+    return std::unexpected(synced.error());
+  }
+
+  auto identity = read_regular_file(context->operations, container.get(),
+                                    "identity", kMaximumIdentifierBytes,
+                                    "read recovery container identity");
+  if (!identity) {
+    if (identity.error().code == StableErrorCode::not_found) {
+      return std::optional<RecoveryContainer>{};
+    }
+    return std::unexpected(identity.error());
+  }
+  const auto identity_text = text_from_bytes(*identity);
+  auto container_id = ContainerId::create(identity_text);
+  if (!container_id || identity_text.size() > kMaximumIdentifierBytes) {
+    return std::unexpected(
+        logical_error(StableErrorCode::corrupted_snapshot,
+                      "recovery container identity is invalid"));
+  }
+  auto expected_key =
+      identifier_key("container", container_id->value(), "container_id");
+  if (!expected_key) {
+    return std::unexpected(expected_key.error());
+  }
+  if (*expected_key != key) {
+    return std::unexpected(logical_error(
+        StableErrorCode::conflict,
+        "recovery container identity does not match its namespace key"));
+  }
+
+  auto manifests = open_directory(context->operations, container.get(),
+                                  "manifests", "open recovery manifests");
+  if (!manifests) {
+    return std::unexpected(
+        required_namespace_error(manifests.error(), "manifests"));
+  }
+  auto chunks = open_directory(context->operations, container.get(), "chunks",
+                               "open recovery chunks");
+  if (!chunks) {
+    return std::unexpected(required_namespace_error(chunks.error(), "chunks"));
+  }
+  auto staging = open_directory(context->operations, container.get(), "staging",
+                                "open recovery staging");
+  if (!staging) {
+    return std::unexpected(
+        required_namespace_error(staging.error(), "staging"));
+  }
+
+  return std::optional<RecoveryContainer>{RecoveryContainer{
+      .container_id = std::move(*container_id),
+      .directories =
+          ContainerDirectories{
+              .key = std::string{key},
+              .container = std::move(container),
+              .manifests = std::move(*manifests),
+              .chunks = std::move(*chunks),
+              .staging = std::move(*staging),
+          },
+  }};
+}
+
+[[nodiscard]] CheckpointResult<std::size_t>
+remove_stale_temporaries(const std::shared_ptr<IFileOperations> &operations,
+                         int directory_fd,
+                         const StartupRecoveryOptions &options) {
+  auto entries = list_directory(operations, directory_fd,
+                                "list directory for stale publication files");
+  if (!entries) {
+    return std::unexpected(entries.error());
+  }
+  std::size_t removed_count = 0U;
+  for (const auto &entry : *entries) {
+    if (!is_publication_temporary(entry)) {
+      continue;
+    }
+    auto opened = retry_interrupted(
+        [&] { return operations->open_regular_file_at(directory_fd, entry); });
+    if (!opened) {
+      if (opened.error() == ENOENT || opened.error() == ELOOP ||
+          opened.error() == EINVAL || opened.error() == ENOTDIR) {
+        continue;
+      }
+      return std::unexpected(
+          filesystem_error("open stale publication temporary", opened.error()));
+    }
+    UniqueFileDescriptor file{operations, *opened};
+    auto status =
+        retry_interrupted([&] { return operations->status(file.get()); });
+    if (!status) {
+      return std::unexpected(filesystem_error(
+          "inspect stale publication temporary", status.error()));
+    }
+    if (status->type != FileType::regular_file || !is_stale(*status, options)) {
+      continue;
+    }
+    file.reset();
+    auto removed = durable_remove_file(
+        operations, directory_fd, entry, "remove stale publication temporary",
+        "sync stale publication temporary removal", true);
+    if (!removed) {
+      return std::unexpected(removed.error());
+    }
+    if (*removed) {
+      ++removed_count;
+    }
+  }
+  return removed_count;
+}
+
+[[nodiscard]] CheckpointResult<std::size_t>
+recover_staging(const std::shared_ptr<IFileOperations> &operations,
+                int staging_fd, const StartupRecoveryOptions &options,
+                std::size_t &temporary_entries_deleted) {
+  auto root_temporaries =
+      remove_stale_temporaries(operations, staging_fd, options);
+  if (!root_temporaries) {
+    return std::unexpected(root_temporaries.error());
+  }
+  temporary_entries_deleted += *root_temporaries;
+
+  auto entries = list_directory(operations, staging_fd,
+                                "list staging root for startup recovery");
+  if (!entries) {
+    return std::unexpected(entries.error());
+  }
+  std::size_t deleted = 0U;
+  for (const auto &entry : *entries) {
+    if (!is_container_key(entry)) {
+      continue;
+    }
+    auto opened = retry_interrupted(
+        [&] { return operations->open_directory_at(staging_fd, entry); });
+    if (!opened) {
+      if (opened.error() == ENOENT || opened.error() == ENOTDIR ||
+          opened.error() == ELOOP || opened.error() == EINVAL) {
+        continue;
+      }
+      return std::unexpected(
+          filesystem_error("open recovery staging operation", opened.error()));
+    }
+    UniqueFileDescriptor operation{operations, *opened};
+    auto status =
+        retry_interrupted([&] { return operations->status(operation.get()); });
+    if (!status) {
+      return std::unexpected(filesystem_error(
+          "inspect recovery staging operation", status.error()));
+    }
+    if (!is_stale(*status, options)) {
+      auto temporaries =
+          remove_stale_temporaries(operations, operation.get(), options);
+      if (!temporaries) {
+        return std::unexpected(temporaries.error());
+      }
+      temporary_entries_deleted += *temporaries;
+      continue;
+    }
+
+    if (auto cleaned = remove_tree_contents(operations, operation.get());
+        !cleaned) {
+      return std::unexpected(cleaned.error());
+    }
+    operation.reset();
+    auto removed = retry_interrupted(
+        [&] { return operations->remove_directory_at(staging_fd, entry); });
+    if (!removed) {
+      return std::unexpected(
+          filesystem_error("remove stale staging operation", removed.error()));
+    }
+    if (auto synced = sync_directory(operations, staging_fd,
+                                     "sync stale staging operation removal");
+        !synced) {
+      return std::unexpected(synced.error());
+    }
+    ++deleted;
+  }
+  return deleted;
+}
+
+[[nodiscard]] CheckpointResult<std::size_t>
+recover_chunk_temporaries(const std::shared_ptr<IFileOperations> &operations,
+                          int chunks_fd,
+                          const StartupRecoveryOptions &options) {
+  auto root_removed = remove_stale_temporaries(operations, chunks_fd, options);
+  if (!root_removed) {
+    return std::unexpected(root_removed.error());
+  }
+  std::size_t deleted = *root_removed;
+  auto entries = list_directory(operations, chunks_fd,
+                                "list chunk root for temporary recovery");
+  if (!entries) {
+    return std::unexpected(entries.error());
+  }
+  for (const auto &entry : *entries) {
+    if (!is_chunk_prefix(entry)) {
+      continue;
+    }
+    auto opened = retry_interrupted(
+        [&] { return operations->open_directory_at(chunks_fd, entry); });
+    if (!opened) {
+      if (opened.error() == ENOENT || opened.error() == ENOTDIR ||
+          opened.error() == ELOOP || opened.error() == EINVAL) {
+        continue;
+      }
+      return std::unexpected(filesystem_error(
+          "open chunk prefix for temporary recovery", opened.error()));
+    }
+    UniqueFileDescriptor prefix{operations, *opened};
+    auto removed = remove_stale_temporaries(operations, prefix.get(), options);
+    if (!removed) {
+      return std::unexpected(removed.error());
+    }
+    deleted += *removed;
+  }
+  return deleted;
+}
+
+[[nodiscard]] CheckpointResult<void>
+recover_container_files(const std::shared_ptr<IFileOperations> &operations,
+                        ContainerDirectories &directories,
+                        const StartupRecoveryOptions &options,
+                        StartupRecoveryReport &report) {
+  auto candidates = ensure_directory(
+      operations, directories.container.get(), kCandidatesDirectory,
+      "create recovery garbage candidate directory");
+  if (!candidates) {
+    return std::unexpected(candidates.error());
+  }
+
+  const std::array<int, 3> publication_roots{directories.container.get(),
+                                             directories.manifests.get(),
+                                             candidates->get()};
+  for (const int directory_fd : publication_roots) {
+    auto removed = remove_stale_temporaries(operations, directory_fd, options);
+    if (!removed) {
+      return std::unexpected(removed.error());
+    }
+    report.temporary_entries_deleted += *removed;
+  }
+  auto chunk_temporaries =
+      recover_chunk_temporaries(operations, directories.chunks.get(), options);
+  if (!chunk_temporaries) {
+    return std::unexpected(chunk_temporaries.error());
+  }
+  report.temporary_entries_deleted += *chunk_temporaries;
+
+  auto staging = recover_staging(operations, directories.staging.get(), options,
+                                 report.temporary_entries_deleted);
+  if (!staging) {
+    return std::unexpected(staging.error());
+  }
+  report.staging_entries_deleted += *staging;
+  return {};
+}
 
 } // namespace
 
@@ -1281,7 +2454,8 @@ FilesystemStorage::open(std::filesystem::path root,
   context->operations = std::move(file_operations);
   context->root_fd = UniqueFileDescriptor{context->operations, *opened};
 
-  auto root_status = context->operations->status(context->root_fd.get());
+  auto root_status = retry_interrupted(
+      [&] { return context->operations->status(context->root_fd.get()); });
   if (!root_status) {
     return std::unexpected(
         filesystem_error("inspect trusted storage root", root_status.error()));
@@ -1319,6 +2493,12 @@ CheckpointResult<std::unique_ptr<IStorageOperation>>
 FilesystemStorage::begin_operation(const ContainerId &container_id,
                                    const OperationId &operation_id,
                                    StorageOperationKind kind) {
+  if (kind != StorageOperationKind::create_checkpoint &&
+      kind != StorageOperationKind::restore) {
+    return std::unexpected(logical_error(
+        StableErrorCode::invalid_argument,
+        "retention and garbage collection require begin_maintenance"));
+  }
   auto container_key =
       identifier_key("container", container_id.value(), "container_id");
   if (!container_key) {
@@ -1464,6 +2644,131 @@ FilesystemStorage::begin_operation(const ContainerId &container_id,
 
   return std::unique_ptr<IStorageOperation>{
       std::make_unique<FilesystemStorageOperation>(std::move(state))};
+}
+
+CheckpointResult<std::unique_ptr<IStorageMaintenanceOperation>>
+FilesystemStorage::begin_maintenance(const ContainerId &container_id,
+                                     StorageOperationKind kind) {
+  if (kind != StorageOperationKind::retention &&
+      kind != StorageOperationKind::garbage_collection) {
+    return std::unexpected(logical_error(
+        StableErrorCode::invalid_argument,
+        "maintenance kind must be retention or garbage_collection"));
+  }
+  auto container_key =
+      identifier_key("container", container_id.value(), "container_id");
+  if (!container_key) {
+    return std::unexpected(container_key.error());
+  }
+  auto lock_fd =
+      open_or_create_lock(implementation_->context_, *container_key + ".lock");
+  if (!lock_fd) {
+    return std::unexpected(lock_fd.error());
+  }
+  if (auto acquired =
+          try_acquire_lock(implementation_->context_, lock_fd->get());
+      !acquired) {
+    return std::unexpected(acquired.error());
+  }
+  auto directories =
+      open_existing_container(implementation_->context_, container_id);
+  if (!directories) {
+    static_cast<void>(
+        implementation_->context_->operations->unlock(lock_fd->get()));
+    return std::unexpected(directories.error());
+  }
+
+  StorageMaintenanceData data{
+      .context = implementation_->context_,
+      .container_id = container_id,
+      .kind = kind,
+      .lock_fd = std::move(*lock_fd),
+      .container_fd = std::move(directories->container),
+      .manifests_fd = std::move(directories->manifests),
+      .chunks_fd = std::move(directories->chunks),
+      .staging_fd = std::move(directories->staging),
+  };
+  return std::unique_ptr<IStorageMaintenanceOperation>{
+      std::make_unique<FilesystemStorageMaintenanceOperation>(std::move(data))};
+}
+
+CheckpointResult<StartupRecoveryReport>
+FilesystemStorage::recover(const StartupRecoveryOptions &options) {
+  if (options.grace_period.count() < 0) {
+    return std::unexpected(
+        logical_error(StableErrorCode::invalid_argument,
+                      "startup recovery grace period must not be negative"));
+  }
+  auto entries =
+      list_directory(implementation_->context_->operations,
+                     implementation_->context_->containers_fd.get(),
+                     "list container namespaces for startup recovery");
+  if (!entries) {
+    return std::unexpected(entries.error());
+  }
+
+  StartupRecoveryReport report{
+      .containers_scanned = 0U,
+      .containers_deferred = 0U,
+      .staging_entries_deleted = 0U,
+      .temporary_entries_deleted = 0U,
+      .chunks_marked = 0U,
+      .chunks_deleted = 0U,
+      .more_work = false,
+  };
+  for (const auto &key : *entries) {
+    if (!is_container_key(key)) {
+      continue;
+    }
+    auto lock_fd =
+        open_or_create_lock(implementation_->context_, key + ".lock");
+    if (!lock_fd) {
+      return std::unexpected(lock_fd.error());
+    }
+    auto acquired = try_acquire_lock(implementation_->context_, lock_fd->get());
+    if (!acquired) {
+      if (acquired.error().code == StableErrorCode::conflict) {
+        ++report.containers_deferred;
+        report.more_work = true;
+        continue;
+      }
+      return std::unexpected(acquired.error());
+    }
+
+    auto recovered = open_recovery_container(implementation_->context_, key);
+    if (!recovered) {
+      return std::unexpected(recovered.error());
+    }
+    if (!recovered->has_value()) {
+      continue;
+    }
+    auto container = std::move(**recovered);
+    ++report.containers_scanned;
+
+    if (auto cleaned =
+            recover_container_files(implementation_->context_->operations,
+                                    container.directories, options, report);
+        !cleaned) {
+      return std::unexpected(cleaned.error());
+    }
+    auto garbage = collect_garbage_locked(
+        implementation_->context_->operations,
+        container.directories.container.get(),
+        container.directories.manifests.get(),
+        container.directories.chunks.get(), container.container_id,
+        GarbageCollectionOptions{
+            .now = options.now,
+            .grace_period = options.grace_period,
+            .maximum_deletions = options.maximum_chunk_deletions_per_container,
+        });
+    if (!garbage) {
+      return std::unexpected(garbage.error());
+    }
+    report.chunks_marked += garbage->chunks_marked;
+    report.chunks_deleted += garbage->chunks_deleted;
+    report.more_work = report.more_work || garbage->more_work;
+  }
+  return report;
 }
 
 CheckpointResult<bool>

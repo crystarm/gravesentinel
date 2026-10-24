@@ -138,10 +138,11 @@ void log_transition(ILogger &logger, const CheckpointCreateRequest &request,
   logger.log(level, "checkpoint create state transition", fields);
 }
 
-void log_cleanup_failure(ILogger &logger,
-                         const CheckpointCreateRequest &request,
-                         CheckpointCreateState state,
-                         const CheckpointErrorDetail &error) {
+void log_maintenance_failure(ILogger &logger,
+                             const CheckpointCreateRequest &request,
+                             CheckpointCreateState state,
+                             std::string_view message,
+                             const CheckpointErrorDetail &error) {
   const std::vector<LogField> fields{
       {"container_id", request.container_id.value()},
       {"operation_id", request.operation_id.value()},
@@ -151,8 +152,29 @@ void log_cleanup_failure(ILogger &logger,
       {"retryable", error.retryable ? "true" : "false"},
       {"diagnostic", error.diagnostic},
   };
-  logger.log(LogLevel::error, "checkpoint create staging cleanup failed",
-             fields);
+  logger.log(LogLevel::error, message, fields);
+}
+
+void log_cleanup_failure(ILogger &logger,
+                         const CheckpointCreateRequest &request,
+                         CheckpointCreateState state,
+                         const CheckpointErrorDetail &error) {
+  log_maintenance_failure(logger, request, state,
+                          "checkpoint create staging cleanup failed", error);
+}
+
+void log_post_commit_exception(ILogger &logger,
+                               const CheckpointCreateRequest &request,
+                               std::string_view activity) noexcept {
+  try {
+    const auto error = make_error(
+        StableErrorCode::internal,
+        std::string{activity} + " threw after the checkpoint was committed",
+        request.request_id);
+    log_maintenance_failure(logger, request, CheckpointCreateState::committed,
+                            "post-commit checkpoint maintenance threw", error);
+  } catch (...) {
+  }
 }
 
 [[nodiscard]] CheckpointResult<std::uint64_t>
@@ -352,30 +374,55 @@ CheckpointCreator::create(const CheckpointCreateRequest &request) {
     return fail(
         manifest_encoding_error(encoded_manifest.error(), request.request_id));
   }
+  CreatedCheckpoint created{
+      .operation_id = request.operation_id,
+      .checkpoint_id = *checkpoint_id,
+      .generation = *generation,
+      .source_incarnation = captured->source_incarnation,
+      .retention_complete = false,
+      .staging_cleanup_complete = false,
+  };
   if (auto published =
           (*operation)->publish_manifest(*checkpoint_id, *encoded_manifest);
       !published) {
     return fail(published.error());
   }
 
-  log_transition(logger_, request, state, CheckpointCreateState::committed,
-                 &*checkpoint_id, &*generation);
   state = CheckpointCreateState::committed;
-
-  const auto cleaned = (*operation)->cleanup();
-  if (!cleaned) {
-    auto cleanup_error = cleaned.error();
-    attach_correlation(cleanup_error, request.request_id);
-    log_cleanup_failure(logger_, request, state, cleanup_error);
+  try {
+    log_transition(logger_, request, CheckpointCreateState::committing, state,
+                   &*checkpoint_id, &*generation);
+  } catch (...) {
   }
 
-  return CreatedCheckpoint{
-      .operation_id = request.operation_id,
-      .checkpoint_id = *checkpoint_id,
-      .generation = *generation,
-      .source_incarnation = captured->source_incarnation,
-      .staging_cleanup_complete = cleaned.has_value(),
-  };
+  try {
+    auto retained = (*operation)->apply_retention(request.keep_last);
+    if (!retained) {
+      auto retention_error = retained.error();
+      attach_correlation(retention_error, request.request_id);
+      log_maintenance_failure(logger_, request, state,
+                              "post-commit checkpoint retention failed",
+                              retention_error);
+    } else {
+      created.retention_complete = retained->complete;
+    }
+  } catch (...) {
+    log_post_commit_exception(logger_, request, "checkpoint retention");
+  }
+
+  try {
+    auto cleaned = (*operation)->cleanup();
+    created.staging_cleanup_complete = cleaned.has_value();
+    if (!cleaned) {
+      auto cleanup_error = cleaned.error();
+      attach_correlation(cleanup_error, request.request_id);
+      log_cleanup_failure(logger_, request, state, cleanup_error);
+    }
+  } catch (...) {
+    log_post_commit_exception(logger_, request, "checkpoint staging cleanup");
+  }
+
+  return created;
 }
 
 } // namespace gravesentinel::ccm

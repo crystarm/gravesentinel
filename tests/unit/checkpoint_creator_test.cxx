@@ -243,6 +243,9 @@ public:
         make_test_error(StableErrorCode::not_found, "manifest is not pinned"));
   }
 
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(std::size_t keep_last) override;
+
   [[nodiscard]] CheckpointResult<void> cleanup() override;
 
 private:
@@ -288,6 +291,12 @@ public:
     });
     records_.push_back(record);
     return std::make_unique<FakeStorageOperation>(*this, std::move(record));
+  }
+
+  [[nodiscard]] CheckpointResult<std::unique_ptr<IStorageMaintenanceOperation>>
+  begin_maintenance(const ContainerId &, StorageOperationKind) override {
+    return std::unexpected(make_test_error(
+        StableErrorCode::internal, "maintenance is not used by this fake"));
   }
 
   [[nodiscard]] CheckpointResult<bool>
@@ -471,7 +480,30 @@ public:
     return {};
   }
 
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(const std::shared_ptr<OperationRecord> &record,
+                  std::size_t keep_last) {
+    retention_calls_.push_back(keep_last);
+    publication_events_.push_back(PublicationEvent{
+        .kind = "retention",
+        .container = record->container.value(),
+        .operation = record->operation.value(),
+    });
+    if (std::exchange(throw_next_retention_, false)) {
+      throw std::runtime_error("injected retention exception");
+    }
+    if (next_retention_failure_) {
+      auto injected = std::move(*next_retention_failure_);
+      next_retention_failure_.reset();
+      return std::unexpected(std::move(injected));
+    }
+    return retention_report_;
+  }
+
   [[nodiscard]] std::optional<CheckpointErrorDetail> take_cleanup_failure() {
+    if (std::exchange(throw_next_cleanup_, false)) {
+      throw std::runtime_error("injected cleanup exception");
+    }
     if (!next_cleanup_failure_) {
       return std::nullopt;
     }
@@ -495,12 +527,25 @@ public:
     next_manifest_failure_ = std::move(injected);
   }
 
+  void fail_next_retention(CheckpointErrorDetail injected) {
+    next_retention_failure_ = std::move(injected);
+  }
+
+  void throw_next_retention() { throw_next_retention_ = true; }
+
+  void throw_next_cleanup() { throw_next_cleanup_ = true; }
+
+  void set_retention_report(RetentionReport report) {
+    retention_report_ = report;
+  }
+
   void fail_next_cleanup(CheckpointErrorDetail injected) {
     next_cleanup_failure_ = std::move(injected);
   }
 
   void clear_observations() {
     publication_events_.clear();
+    retention_calls_.clear();
     unique_chunk_publications_ = 0;
     list_observed_active_ = false;
   }
@@ -526,6 +571,11 @@ public:
     return publication_events_;
   }
 
+  [[nodiscard]] const std::vector<std::size_t> &
+  retention_calls() const noexcept {
+    return retention_calls_;
+  }
+
   [[nodiscard]] const std::vector<std::shared_ptr<OperationRecord>> &
   records() const noexcept {
     return records_;
@@ -541,9 +591,18 @@ private:
   std::set<std::string> active_containers_;
   std::vector<std::shared_ptr<OperationRecord>> records_;
   std::vector<PublicationEvent> publication_events_;
+  std::vector<std::size_t> retention_calls_;
+  RetentionReport retention_report_{
+      .manifests_deleted = 0,
+      .manifests_deferred = 0,
+      .complete = true,
+  };
   std::optional<CheckpointErrorDetail> next_chunk_failure_;
   std::optional<CheckpointErrorDetail> next_manifest_failure_;
+  std::optional<CheckpointErrorDetail> next_retention_failure_;
   std::optional<CheckpointErrorDetail> next_cleanup_failure_;
+  bool throw_next_retention_{false};
+  bool throw_next_cleanup_{false};
   std::size_t operation_sequence_{0};
   std::size_t maximum_active_operations_{0};
   std::size_t unique_chunk_publications_{0};
@@ -567,6 +626,11 @@ CheckpointResult<void>
 FakeStorageOperation::publish_manifest(const CheckpointId &checkpoint,
                                        std::span<const std::byte> manifest) {
   return storage_.publish_manifest(record_, checkpoint, manifest);
+}
+
+CheckpointResult<RetentionReport>
+FakeStorageOperation::apply_retention(std::size_t keep_last) {
+  return storage_.apply_retention(record_, keep_last);
 }
 
 CheckpointResult<void> FakeStorageOperation::cleanup() {
@@ -1108,6 +1172,7 @@ TEST(CheckpointCreatorTest,
   EXPECT_EQ(result->checkpoint_id.value(), "checkpoint-new");
   EXPECT_EQ(result->generation, 8U);
   EXPECT_EQ(result->source_incarnation.reference, request.runtime_container);
+  EXPECT_TRUE(result->retention_complete);
   EXPECT_TRUE(result->staging_cleanup_complete);
   ASSERT_EQ(rig.ids.issued_checkpoint_ids().size(), 1U);
   EXPECT_NE(rig.ids.issued_checkpoint_ids().front().value(),
@@ -1160,6 +1225,11 @@ TEST(CheckpointCreatorTest,
           .container = request.container_id.value(),
           .operation = request.operation_id.value(),
       },
+      PublicationEvent{
+          .kind = "retention",
+          .container = request.container_id.value(),
+          .operation = request.operation_id.value(),
+      },
   };
   EXPECT_EQ(rig.storage.publication_events(), expected_publications);
 
@@ -1172,6 +1242,123 @@ TEST(CheckpointCreatorTest,
   EXPECT_EQ(rig.logger.transitions(), expected_transitions);
   expect_all_logs_correlated(rig.logger, request);
   expect_previous_checkpoints_intact(rig);
+}
+
+TEST(CheckpointCreatorTest, KeepLastIsForwardedExactlyToRetention) {
+  TestRig rig;
+  auto request = make_request();
+  request.keep_last = 11U;
+
+  const auto result = rig.creator.create(request);
+
+  ASSERT_TRUE(result.has_value()) << result.error().diagnostic;
+  EXPECT_EQ(rig.storage.retention_calls(), (std::vector<std::size_t>{11U}));
+}
+
+TEST(CheckpointCreatorTest,
+     RetentionRunsAfterConfirmedManifestPublicationAndNotAfterFailedCommit) {
+  TestRig successful_rig;
+  const auto successful_request = make_request();
+
+  const auto successful = successful_rig.creator.create(successful_request);
+
+  ASSERT_TRUE(successful.has_value()) << successful.error().diagnostic;
+  const auto &successful_events = successful_rig.storage.publication_events();
+  const auto manifest = std::ranges::find_if(
+      successful_events,
+      [](const PublicationEvent &event) { return event.kind == "manifest"; });
+  const auto retention = std::ranges::find_if(
+      successful_events,
+      [](const PublicationEvent &event) { return event.kind == "retention"; });
+  ASSERT_NE(manifest, successful_events.end());
+  ASSERT_NE(retention, successful_events.end());
+  EXPECT_LT(manifest, retention);
+
+  TestRig failed_rig;
+  const auto failed_request = make_request();
+  failed_rig.storage.fail_next_manifest(make_test_error(
+      StableErrorCode::storage_error, "injected unconfirmed manifest failure",
+      StorageSideEffect::publication_may_be_visible, true));
+
+  const auto failed = failed_rig.creator.create(failed_request);
+
+  ASSERT_FALSE(failed.has_value());
+  EXPECT_TRUE(failed_rig.storage.retention_calls().empty());
+  EXPECT_TRUE(std::ranges::none_of(
+      failed_rig.storage.publication_events(),
+      [](const PublicationEvent &event) { return event.kind == "retention"; }));
+}
+
+TEST(CheckpointCreatorTest,
+     RetentionFailureKeepsCreatedCheckpointAndReportsIncompleteRetention) {
+  TestRig rig;
+  const auto request = make_request();
+  rig.storage.fail_next_retention(make_test_error(
+      StableErrorCode::storage_error, "injected retention failure", {}, true));
+
+  const auto result = rig.creator.create(request);
+
+  ASSERT_TRUE(result.has_value()) << result.error().diagnostic;
+  EXPECT_EQ(result->generation, 8U);
+  EXPECT_FALSE(result->retention_complete);
+}
+
+TEST(CheckpointCreatorTest, CleanupStillRunsAfterRetentionFailure) {
+  TestRig rig;
+  const auto request = make_request();
+  rig.storage.fail_next_retention(make_test_error(
+      StableErrorCode::storage_error, "injected retention failure"));
+
+  const auto result = rig.creator.create(request);
+
+  ASSERT_TRUE(result.has_value()) << result.error().diagnostic;
+  ASSERT_EQ(rig.storage.records().size(), 1U);
+  EXPECT_EQ(rig.storage.records().front()->cleanup_calls, 1U);
+  EXPECT_TRUE(rig.storage.records().front()->cleanup_complete);
+  EXPECT_TRUE(result->staging_cleanup_complete);
+}
+
+TEST(CheckpointCreatorTest,
+     PostCommitRetentionExceptionKeepsSuccessAndStillCleansStaging) {
+  TestRig rig;
+  const auto request = make_request();
+  rig.storage.throw_next_retention();
+
+  const auto result = rig.creator.create(request);
+
+  ASSERT_TRUE(result.has_value()) << result.error().diagnostic;
+  EXPECT_FALSE(result->retention_complete);
+  EXPECT_TRUE(result->staging_cleanup_complete);
+  ASSERT_EQ(rig.storage.records().size(), 1U);
+  EXPECT_EQ(rig.storage.records().front()->cleanup_calls, 1U);
+}
+
+TEST(CheckpointCreatorTest, PostCommitCleanupExceptionKeepsCommittedSuccess) {
+  TestRig rig;
+  const auto request = make_request();
+  rig.storage.throw_next_cleanup();
+
+  const auto result = rig.creator.create(request);
+
+  ASSERT_TRUE(result.has_value()) << result.error().diagnostic;
+  EXPECT_TRUE(result->retention_complete);
+  EXPECT_FALSE(result->staging_cleanup_complete);
+}
+
+TEST(CheckpointCreatorTest,
+     CompleteRetentionReportMarksCreatedCheckpointRetentionComplete) {
+  TestRig rig;
+  const auto request = make_request();
+  rig.storage.set_retention_report(RetentionReport{
+      .manifests_deleted = 2U,
+      .manifests_deferred = 0U,
+      .complete = true,
+  });
+
+  const auto result = rig.creator.create(request);
+
+  ASSERT_TRUE(result.has_value()) << result.error().diagnostic;
+  EXPECT_TRUE(result->retention_complete);
 }
 
 TEST(CheckpointCreatorTest,

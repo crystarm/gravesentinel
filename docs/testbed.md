@@ -10,8 +10,12 @@ progress, removal of the original container before restore, in-memory state
 continuity after import, CPU affinity, negative-restore cleanup, cgroup cleanup,
 and idempotent resource cleanup.
 
-This is a historical qualification record for the measured host on that date,
-not a statement that the current host or current runtime installation has been
+**QUALIFIED for stage 12 on 2026-10-24.** The production hypervisor subprocess
+and `SchedulerClient` completed the full process/IPC/Podman suite with
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`.
+
+These are historical qualification records for the measured host on those dates,
+not statements that the current host or current runtime installation has been
 rechecked. Qualification applies only to the exact runtime profile and command
 boundary in this document. A `+CRIU` feature in `crun --version` means that the
 OCI runtime was compiled with CRIU integration; the successful smoke, not that
@@ -76,11 +80,18 @@ enables `no-new-privileges`, has no network, and has a read-only root filesystem
 ## Implementation and gate boundaries
 
 The runtime libraries are built as `//src/hypervisor:linux_runtime` and
-`//src/hypervisor:podman_adapter`, but the production
-`//src/hypervisor:gravesentinel_hypervisor` binary is not wired to them yet. Its
-current `main` is a fail-fast placeholder, so the integration helper exercises
-the production libraries directly and is not an end-to-end test of the shipped
-hypervisor process, IPC, storage, or service composition.
+`//src/hypervisor:podman_adapter`; the production
+`//src/hypervisor:gravesentinel_hypervisor` composes them with storage, chunking,
+create/restore, maintenance, the operation journal, and IPC. The dated stage-06
+adapter helper still tests the runtime layer directly. The opt-in
+`//tests/integration:hypervisor_scheduler_e2e` target instead starts the production
+binary and drives functional operations through `SchedulerClient`.
+
+The process-boundary target completed successfully in the qualified rootful context
+on 2026-10-24 and emitted
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. This is the stage-12
+production-daemon E2E evidence; the older direct and adapter qualification records
+remain evidence for their narrower boundaries.
 
 `scripts/check_testbed.sh` is a prerequisite screen, not an exact implementation
 of the adapter fingerprint. It checks Linux/x86-64, the exact kernel, CPU
@@ -95,10 +106,14 @@ validation.
 
 ## Reproducing the qualification
 
-Build the fixture as the normal repository user; do not run Bazel as root:
+Build the fixture and process-boundary E2E binaries as the normal repository user;
+do not run Bazel as root:
 
 ```text
-bazel build //tests/integration/fixture:counter_fixture
+bazel build \
+  //src/hypervisor:gravesentinel_hypervisor \
+  //tests/integration:hypervisor_e2e_driver \
+  //tests/integration/fixture:counter_fixture
 ```
 
 Run the read-only prerequisite gate in the intended rootful context:
@@ -120,12 +135,30 @@ sudo env \
   --check-script scripts/check_testbed.sh
 ```
 
+Run the complete production process/IPC E2E separately (expected duration 3–10
+minutes):
+
+```text
+sudo env \
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  tests/integration/hypervisor_scheduler_e2e.sh \
+  --hypervisor bazel-bin/src/hypervisor/gravesentinel_hypervisor \
+  --driver bazel-bin/tests/integration/hypervisor_e2e_driver \
+  --fixture-binary bazel-bin/tests/integration/fixture/counter_fixture \
+  --containerfile tests/integration/fixture/Containerfile \
+  --check-script scripts/check_testbed.sh
+```
+
 The manual Bazel targets are available for CI or another process that is already
 running in the correct rootful environment:
 
 ```text
 bazel test //tests/integration:testbed_check --test_output=streamed
 bazel test //tests/integration:podman_checkpoint_smoke \
+  --test_output=streamed
+bazel test //tests/integration:podman_adapter_smoke \
+  --test_output=streamed
+bazel test //tests/integration:hypervisor_scheduler_e2e \
   --test_output=streamed
 ```
 
@@ -335,6 +368,26 @@ Podman. Non-privileged scripted unit tests cover env-file construction, mode,
 secret exclusion from Podman's process environment/argv, and successful-path
 removal; an underlying unlink failure still produces an operation error and only
 a best-effort destructor retry.
+
+## Stage 12 production hypervisor + SchedulerClient E2E
+
+**QUALIFIED on 2026-10-24.** The manual rootful
+`//tests/integration:hypervisor_scheduler_e2e` run ended with:
+
+```text
+PASS: all SchedulerClient/process-boundary scenarios passed
+RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed
+```
+
+The suite started the real `gravesentinel_hypervisor` subprocess and used
+`SchedulerClient` for handshake, registration, operation submission and polling,
+and unregistration. It covered leave-running checkpoint continuity across memory,
+local files, and `/dev/shm`; fallback from a corrupted newest checkpoint to the
+previous generation; incompatible-snapshot cold start from an explicit spec; and
+three-generation retention with grace-based chunk collection. Every scenario
+checked CPU placement and single runtime incarnation. The final marker also
+requires successful cleanup of owned containers, images, processes, cgroups,
+mounts, sockets, and temporary storage.
 
 ## Adapter operation limits
 

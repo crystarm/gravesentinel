@@ -116,7 +116,10 @@ The first pass that observes an unreferenced chunk only publishes its candidate 
 it does not delete that chunk. The persisted first-observed timestamp starts the grace
 period, and the device, inode, size, modification time, and status-change time bind the
 marker to the observed file identity. `CheckpointMaintenance` defaults to a one-hour
-grace period and at most 128 chunk deletions per pass.
+grace period and at most 128 chunk deletions per pass. The production daemon exposes
+that grace as `--gc-grace-seconds N` (default `3600`); it is an operator-controlled
+startup setting, not a scheduler request field. The stage-12 manual E2E uses `1` so it
+can exercise both candidate marking and a later deletion without waiting an hour.
 
 Every pass first `fsync`s `gc-candidates/` before trusting its visible marker set,
 so an indeterminate marker publication/removal cannot be silently treated as
@@ -145,8 +148,9 @@ then calls `FilesystemStorage::recover`. Recovery must complete before
 message are created. Consequently, no registered work can race startup recovery in the
 normal composition.
 
-The production startup options use a one-hour stale/grace period and a maximum of 128
-chunk deletions per container per pass. Recovery takes the same per-container lease and:
+Production startup recovery uses the same configured `--gc-grace-seconds` value
+(default one hour) and a maximum of 128 chunk deletions per container per pass. Recovery
+takes the same per-container lease and:
 
 - removes only canonical operation-key staging directories whose modification time is
   stale;

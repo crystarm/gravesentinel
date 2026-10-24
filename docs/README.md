@@ -50,8 +50,11 @@ The remaining important limits are:
   restore flow must run only in a qualified rootful environment.
 
 The binary is buildable and its composed components and IPC behavior are covered by
-unit tests, but this documentation does not claim that the complete production
-daemon-to-Podman/CRIU end-to-end flow has been executed.
+unit tests. On 2026-10-24, the manual
+`//tests/integration:hypervisor_scheduler_e2e` harness completed the full
+process/IPC/Podman path in the qualified rootful profile and emitted
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. This is dated evidence
+for the measured host; each deployment still requires its own rootful qualification.
 
 ## Reading guide
 
@@ -134,13 +137,14 @@ Fast project checks:
 bazel test //:checks
 ```
 
-Focused stage 11 validation targets include:
+Focused maintenance and stage-12 fixture validation targets include:
 
 ```text
 bazel test //tests/unit:checkpoint_maintenance_test
 bazel test //tests/unit:filesystem_storage_test
 bazel test //tests/unit:checkpoint_service_test
 bazel test //tests/unit:checkpoint_creator_test
+bazel test //tests/integration/fixture:counter_fixture_test
 ```
 
 Broader repository commands:

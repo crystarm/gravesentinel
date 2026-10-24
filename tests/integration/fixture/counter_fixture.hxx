@@ -12,6 +12,8 @@ namespace gravesentinel::ccm::test {
 struct CounterOptions {
   std::size_t worker_threads{2};
   std::chrono::milliseconds interval{250};
+  std::string state_file{"/dev/shm/gravesentinel-counter-fixture.state"};
+  std::string instance_tag{"default"};
   bool show_help{false};
 
   bool operator==(const CounterOptions &) const = default;

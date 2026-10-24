@@ -393,6 +393,9 @@ Full details: [checkpoint-restore.md](checkpoint-restore.md).
 `CheckpointService` supports at most four registration slots. Each slot has one
 persistent worker pinned to `checkpoint_cpu`; create, restore, retention, and GC all
 reuse it. There is no fifth CPU-heavy worker. The control caller thread is not rebound.
+Linux CPU availability checks use the process leader's allowed mask rather than the
+already narrowed worker mask, so adapter validation of `container_cpu` remains valid
+while the caller is pinned to `checkpoint_cpu`.
 
 Within a slot, work selection priority is manual foreground, periodic create, retention,
 then GC. Periodic creates skip busy ticks without catch-up. Maintenance uses coalesced
@@ -497,7 +500,10 @@ The main safety rules are:
 - destructive failed-restore cleanup is permitted only after its own attempt, which
   began when absence had been proven under a continuous per-container lease;
 - an unknown fingerprint or image mismatch fails closed;
-- runtime stderr is not included in production adapter diagnostics.
+- runtime stderr is not included in production adapter diagnostics;
+- the daemon passes only `PATH`, `HOME`, `XDG_RUNTIME_DIR`, and
+  `DBUS_SESSION_BUS_ADDRESS` from its own environment to Podman/CRIU. Workload
+  environment remains separate and uses the transient mode-`0600` env-file contract.
 
 Qualification is tied to a specific rootful host profile and makes no general claims
 about other kernels, versions, architectures, or security policies. The destructive
@@ -612,9 +618,11 @@ and startup pass repetition are implemented. The remaining lifecycle limitations
 1. automatic reconciliation of indeterminate checkpoint publications or runtime
    incarnations;
 2. operation-history retention/administrative pruning to free bounded registry slots;
-3. cancellation and service-level deadlines for already accepted operations;
-4. a recorded end-to-end execution of the complete production daemon flow in the
-   qualified rootful Podman/CRIU environment.
+3. cancellation and service-level deadlines for already accepted operations.
+
+The implemented `//tests/integration:hypervisor_scheduler_e2e` process-boundary
+target completed successfully in the qualified rootful Podman/CRIU environment on
+2026-10-24 with `RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`.
 
 Consequently, `keep_last` does limit committed manifests when immediate retention or a
 retry completes, but registry saturation still rejects new unique public operations and
@@ -649,9 +657,11 @@ suite, such as the integration fixture's unit test.
 
 Manual integration targets are excluded from `bazel test //...`. They should be run
 only in a qualified rootful environment according to the instructions in
-[testbed.md](testbed.md). `bazel build //:hypervisor` builds the composed daemon; a
-successful build or unit-test run does not imply that the destructive production
-end-to-end flow was executed.
+[testbed.md](testbed.md). The complete process/IPC target is
+`//tests/integration:hypervisor_scheduler_e2e`; it carries `manual`,
+`requires-podman`, `exclusive`, and `local`. `bazel build //:hypervisor` builds the
+composed daemon, but a successful build or unit-test run does not imply that the
+destructive production end-to-end flow was executed.
 
 Independent profiles `--config=debug`, `--config=release`, `--config=asan`,
 `--config=ubsan`, and `--config=tsan` are available commands; this document does not

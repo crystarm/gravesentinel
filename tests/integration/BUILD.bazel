@@ -12,6 +12,15 @@ gravesentinel_cc_binary(
     ],
 )
 
+gravesentinel_cc_binary(
+    name = "hypervisor_e2e_driver",
+    srcs = ["hypervisor_e2e_driver.cxx"],
+    deps = [
+        "//src/client:scheduler_client",
+        "//src/manifest:manifest",
+    ],
+)
+
 sh_test(
     name = "testbed_check",
     srcs = ["run_testbed_check.sh"],
@@ -102,9 +111,51 @@ sh_test(
     timeout = "long",
 )
 
+sh_test(
+    name = "hypervisor_scheduler_e2e",
+    srcs = ["hypervisor_scheduler_e2e.sh"],
+    args = [
+        "--hypervisor",
+        "$(location //src/hypervisor:gravesentinel_hypervisor)",
+        "--driver",
+        "$(location :hypervisor_e2e_driver)",
+        "--fixture-binary",
+        "$(location //tests/integration/fixture:counter_fixture)",
+        "--containerfile",
+        "$(location //tests/integration/fixture:Containerfile)",
+        "--check-script",
+        "$(location //scripts:check_testbed)",
+    ],
+    data = [
+        ":hypervisor_e2e_driver",
+        "//scripts:check_testbed",
+        "//src/hypervisor:gravesentinel_hypervisor",
+        "//tests/integration/fixture:Containerfile",
+        "//tests/integration/fixture:counter_fixture",
+    ],
+    env_inherit = [
+        "DBUS_SESSION_BUS_ADDRESS",
+        "HOME",
+        "PATH",
+        "XDG_RUNTIME_DIR",
+    ],
+    local = True,
+    size = "enormous",
+    tags = [
+        "exclusive",
+        "local",
+        "manual",
+        "requires-podman",
+    ],
+    timeout = "eternal",
+)
+
 filegroup(
     name = "format_sources",
-    srcs = ["podman_adapter_smoke_driver.cxx"],
+    srcs = [
+        "hypervisor_e2e_driver.cxx",
+        "podman_adapter_smoke_driver.cxx",
+    ],
     visibility = ["//scripts:__pkg__"],
 )
 

@@ -117,8 +117,9 @@ before it becomes visible:
 1. the complete `ContainerRegistration` passes value/configuration validation;
 2. the `ContainerId` is not already registered;
 3. neither CPU is assigned to another live or retiring registration;
-4. both `container_cpu` and `checkpoint_cpu` are online and present in the current
-   allowed affinity mask according to `IAffinityController`;
+4. both `container_cpu` and `checkpoint_cpu` are online and present in the
+   process-level allowed affinity mask according to `IAffinityController`; this
+   validation is independent of a narrower binding on the calling worker;
 5. the registration interval has a representable monotonic deadline;
 6. the worker starts and successfully binds itself to `checkpoint_cpu`.
 
@@ -178,7 +179,10 @@ destructive attempt blindly.
 Each registered container owns one persistent worker, a foreground mailbox of
 capacity one, a periodic-create slot, and coalesced retention/GC pending flags.
 The worker binds its own thread to the registration's `checkpoint_cpu` before the
-registration succeeds and attempts to restore its original affinity on exit. An
+registration succeeds and attempts to restore its original affinity on exit. The
+production Linux controller validates CPU availability against the process leader's
+allowed mask, not this already narrowed worker mask; consequently the runtime adapter
+can still validate `container_cpu` while executing on `checkpoint_cpu`. An
 affinity-restore error is returned by unregister/shutdown (and cached by shutdown);
 the destructor invokes shutdown but cannot report that error. The calling control
 thread is never rebound. Capture, chunking, hashing, reassembly, runtime adapter calls,
@@ -304,7 +308,8 @@ unregister/shutdown races, exception containment, and source-incarnation forward
 `//tests/unit:checkpoint_maintenance_test` covers lease-only orchestration defaults and
 error propagation; `//tests/unit:filesystem_storage_test` covers durable
 retention/GC/recovery algorithms. Linux affinity mask restoration itself remains
-covered by `//tests/unit:linux_runtime_test`. IPC codec, server/client, RPC handler,
+covered by `//tests/unit:linux_runtime_test`, including process-level validation from
+a worker pinned to a different allowed CPU. IPC codec, server/client, RPC handler,
 and operation-store tests cover the production-facing wrapper and journal semantics.
 These are still unit-level/component tests: they do not establish that the complete
 production daemon-to-Podman/CRIU flow was executed end to end in a qualified rootful

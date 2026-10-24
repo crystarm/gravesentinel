@@ -47,9 +47,10 @@ profile.
 These notes record the current implementation boundary without changing the
 accepted decision or the historical qualification result.
 
-The successful stage-02 runs on 2026-10-21 and the production adapter run on
-2026-10-22 are dated recorded evidence for the measured host. They are not a
-claim that a current deployment has been rechecked. This repository retains the
+The successful stage-02 runs on 2026-10-21, the production adapter run on
+2026-10-22, and the production process/IPC E2E run on 2026-10-24 are dated
+recorded evidence for the measured host. They are not a claim that a current
+deployment has been rechecked. This repository retains the
 observations and success markers, but not raw qualification logs, signed or
 checksummed host reports, checkpoint hashes, or a CI evidence bundle from those
 runs. A current deployment is verified only by rerunning the prerequisite gate
@@ -63,10 +64,12 @@ operation journal, and the `SOCK_SEQPACKET` IPC server. The scheduler client and
 server perform peer-UID checks, and only the hypervisor side invokes rootful
 Podman/CRIU.
 
-The dated adapter smoke still exercises the production runtime libraries through a
-purpose-built integration helper. It is not evidence that the complete production
-hypervisor + IPC + journal + storage + service + Podman/CRIU flow was run end to end;
-no such production end-to-end execution is claimed here.
+The dated adapter smoke exercises the production runtime libraries through a
+purpose-built integration helper and is not by itself evidence for the complete
+production hypervisor + IPC + journal + storage + service + Podman/CRIU flow. The
+manual `//tests/integration:hypervisor_scheduler_e2e` target covers that boundary.
+Its rootful run on 2026-10-24 completed on the qualified profile and emitted
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`.
 
 The prerequisite gate is intentionally less exact than the adapter profile. It
 checks the main host capabilities and runs `criu check`, but it does not enforce

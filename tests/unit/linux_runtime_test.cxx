@@ -618,6 +618,57 @@ TEST(PosixProcessRunnerTest, AppliesRequestedAffinityOnlyToTheChild) {
 }
 
 TEST(LinuxAffinityControllerTest,
+     ProcessAvailabilityIgnoresNarrowerCallingWorkerBinding) {
+  auto process_affinity = read_current_affinity();
+  ASSERT_TRUE(process_affinity) << process_affinity.error();
+
+  std::vector<std::uint32_t> allowed_cpus;
+  for (std::size_t cpu = 0; cpu < process_affinity->cpu_count; ++cpu) {
+    if (CPU_ISSET_S(cpu, process_affinity->size, process_affinity->set.get()) !=
+        0) {
+      allowed_cpus.push_back(static_cast<std::uint32_t>(cpu));
+      if (allowed_cpus.size() == 2U) {
+        break;
+      }
+    }
+  }
+  if (allowed_cpus.size() < 2U) {
+    GTEST_SKIP() << "test requires two allowed logical CPUs";
+  }
+
+  LinuxAffinityController controller;
+  std::promise<CheckpointResult<void>> result_promise;
+  auto result_future = result_promise.get_future();
+  std::jthread worker([&] {
+    auto binding = controller.bind_current_thread(allowed_cpus[1]);
+    if (!binding || *binding == nullptr) {
+      result_promise.set_value(std::unexpected(
+          binding ? CheckpointErrorDetail{
+                        .code = StableErrorCode::internal,
+                        .diagnostic = "affinity controller returned null binding",
+                        .retryable = false,
+                        .correlation_id = std::nullopt,
+                        .storage_side_effect = StorageSideEffect::none,
+                        .runtime_side_effect = RuntimeSideEffect::none,
+                    }
+                  : std::move(binding.error())));
+      return;
+    }
+
+    auto available = controller.validate_cpu_available(allowed_cpus[0]);
+    const auto restored = (*binding)->restore();
+    if (available && !restored) {
+      available = std::unexpected(restored.error());
+    }
+    result_promise.set_value(std::move(available));
+  });
+  worker.join();
+
+  const auto result = result_future.get();
+  ASSERT_TRUE(result) << result.error().diagnostic;
+}
+
+TEST(LinuxAffinityControllerTest,
      RestoresWithExplicitAndRaiiPathsWithoutChangingAnotherThread) {
   auto original = read_current_affinity();
   ASSERT_TRUE(original) << original.error();

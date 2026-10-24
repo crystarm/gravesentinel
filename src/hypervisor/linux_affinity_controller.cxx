@@ -10,6 +10,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -132,7 +133,8 @@ allocate_cpu_set(std::size_t cpu_count) {
 }
 
 [[nodiscard]] CheckpointResult<DynamicCpuSet>
-current_affinity(std::uint32_t logical_cpu) {
+read_affinity(std::uint32_t logical_cpu, pid_t thread_id,
+              std::string_view operation) {
   auto cpu_count_result = initial_cpu_count(logical_cpu);
   if (!cpu_count_result) {
     return std::unexpected(std::move(cpu_count_result.error()));
@@ -146,15 +148,15 @@ current_affinity(std::uint32_t logical_cpu) {
     }
 
     auto mask = std::move(*mask_result);
-    if (::sched_getaffinity(0, mask.size, mask.set.get()) == 0) {
+    if (::sched_getaffinity(thread_id, mask.size, mask.set.get()) == 0) {
       return mask;
     }
 
     const int affinity_error = errno;
     if (affinity_error != EINVAL ||
         cpu_count >= static_cast<std::size_t>(maximum_supported_cpu_count)) {
-      return std::unexpected(make_system_error(
-          "read current thread CPU affinity", affinity_error));
+      return std::unexpected(
+          make_system_error(std::string(operation), affinity_error));
     }
     cpu_count *= 2U;
   }
@@ -238,7 +240,8 @@ validate_cpu_in_mask(std::uint32_t logical_cpu, const DynamicCpuSet &mask) {
 CheckpointResult<std::unique_ptr<IThreadAffinityBinding>>
 LinuxAffinityController::bind_current_thread(std::uint32_t logical_cpu) {
   try {
-    auto original_result = current_affinity(logical_cpu);
+    auto original_result =
+        read_affinity(logical_cpu, 0, "read current thread CPU affinity");
     if (!original_result) {
       return std::unexpected(std::move(original_result.error()));
     }
@@ -275,7 +278,8 @@ LinuxAffinityController::bind_current_thread(std::uint32_t logical_cpu) {
 CheckpointResult<void> LinuxAffinityController::validate_cpu_available(
     std::uint32_t logical_cpu) const {
   try {
-    auto affinity_result = current_affinity(logical_cpu);
+    auto affinity_result = read_affinity(logical_cpu, ::getpid(),
+                                         "read process leader CPU affinity");
     if (!affinity_result) {
       return std::unexpected(std::move(affinity_result.error()));
     }

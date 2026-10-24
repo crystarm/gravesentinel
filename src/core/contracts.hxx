@@ -289,6 +289,8 @@ public:
   [[nodiscard]] virtual CheckpointResult<
       std::unique_ptr<IThreadAffinityBinding>>
   bind_current_thread(std::uint32_t logical_cpu) = 0;
+  // Availability is evaluated against the controller's process-level CPU
+  // allowance, independently of any narrower binding on the calling worker.
   [[nodiscard]] virtual CheckpointResult<void>
   validate_cpu_available(std::uint32_t logical_cpu) const = 0;
 };

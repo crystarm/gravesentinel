@@ -27,6 +27,12 @@ public:
   begin_operation(const ContainerId &container_id,
                   const OperationId &operation_id,
                   StorageOperationKind kind) override;
+  [[nodiscard]]
+  CheckpointResult<std::unique_ptr<IStorageMaintenanceOperation>>
+  begin_maintenance(const ContainerId &container_id,
+                    StorageOperationKind kind) override;
+  [[nodiscard]] CheckpointResult<StartupRecoveryReport>
+  recover(const StartupRecoveryOptions &options);
   [[nodiscard]] CheckpointResult<bool>
   contains_chunk(const ContainerId &container_id,
                  const ChunkHash &hash) const override;

@@ -219,6 +219,12 @@ public:
         test_error(StableErrorCode::not_found, "manifest is not present"));
   }
 
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(std::size_t) override {
+    return std::unexpected(
+        test_error(StableErrorCode::internal, "retention is not expected"));
+  }
+
   [[nodiscard]] CheckpointResult<void> cleanup() override {
     cleaned_ = true;
     return {};
@@ -241,6 +247,12 @@ public:
                   StorageOperationKind) override {
     return std::unexpected(test_error(
         StableErrorCode::internal, "begin_operation is not used by this fake"));
+  }
+
+  [[nodiscard]] CheckpointResult<std::unique_ptr<IStorageMaintenanceOperation>>
+  begin_maintenance(const ContainerId &, StorageOperationKind) override {
+    return std::unexpected(test_error(StableErrorCode::internal,
+                                      "maintenance is not used by this fake"));
   }
 
   [[nodiscard]] CheckpointResult<bool>

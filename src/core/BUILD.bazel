@@ -48,12 +48,24 @@ gravesentinel_cc_library(
 )
 
 gravesentinel_cc_library(
+    name = "checkpoint_maintenance",
+    srcs = ["checkpoint_maintenance.cxx"],
+    hdrs = ["checkpoint_maintenance.hxx"],
+    deps = [":ccm_core"],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/unit:__pkg__",
+    ],
+)
+
+gravesentinel_cc_library(
     name = "checkpoint_service",
     srcs = ["checkpoint_service.cxx"],
     hdrs = ["checkpoint_service.hxx"],
     deps = [
         ":ccm_core",
         ":checkpoint_creator",
+        ":checkpoint_maintenance",
         ":restore_coordinator",
     ],
     visibility = [
@@ -83,6 +95,8 @@ filegroup(
         "blake3_hasher.hxx",
         "checkpoint_creator.cxx",
         "checkpoint_creator.hxx",
+        "checkpoint_maintenance.cxx",
+        "checkpoint_maintenance.hxx",
         "checkpoint_service.cxx",
         "checkpoint_service.hxx",
         "contracts.hxx",

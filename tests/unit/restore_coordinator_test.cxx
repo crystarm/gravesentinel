@@ -277,6 +277,12 @@ public:
   [[nodiscard]] CheckpointResult<std::unique_ptr<IStoragePin>>
   pin_manifest(std::uint64_t generation) override;
 
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(std::size_t) override {
+    return std::unexpected(make_test_error(StableErrorCode::internal,
+                                           "retention is not under test"));
+  }
+
   [[nodiscard]] CheckpointResult<void> cleanup() override;
 
 private:
@@ -324,6 +330,12 @@ public:
     });
     operation_records_.push_back(record);
     return std::make_unique<FakeStorageOperation>(*this, std::move(record));
+  }
+
+  [[nodiscard]] CheckpointResult<std::unique_ptr<IStorageMaintenanceOperation>>
+  begin_maintenance(const ContainerId &, StorageOperationKind) override {
+    return std::unexpected(make_test_error(StableErrorCode::internal,
+                                           "maintenance is not under test"));
   }
 
   [[nodiscard]] CheckpointResult<bool>

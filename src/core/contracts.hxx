@@ -52,6 +52,51 @@ struct StoredManifest {
   auto operator<=>(const StoredManifest &) const = default;
 };
 
+struct RetentionReport {
+  std::size_t manifests_deleted;
+  std::size_t manifests_deferred;
+  bool complete;
+
+  bool operator==(const RetentionReport &) const = default;
+};
+
+struct GarbageCollectionOptions {
+  std::chrono::system_clock::time_point now;
+  std::chrono::seconds grace_period;
+  std::size_t maximum_deletions;
+
+  bool operator==(const GarbageCollectionOptions &) const = default;
+};
+
+struct GarbageCollectionReport {
+  std::size_t chunks_marked;
+  std::size_t chunks_deleted;
+  std::size_t candidate_records_deleted;
+  bool more_work;
+
+  bool operator==(const GarbageCollectionReport &) const = default;
+};
+
+struct StartupRecoveryOptions {
+  std::chrono::system_clock::time_point now;
+  std::chrono::seconds grace_period;
+  std::size_t maximum_chunk_deletions_per_container;
+
+  bool operator==(const StartupRecoveryOptions &) const = default;
+};
+
+struct StartupRecoveryReport {
+  std::size_t containers_scanned;
+  std::size_t containers_deferred;
+  std::size_t staging_entries_deleted;
+  std::size_t temporary_entries_deleted;
+  std::size_t chunks_marked;
+  std::size_t chunks_deleted;
+  bool more_work;
+
+  bool operator==(const StartupRecoveryReport &) const = default;
+};
+
 struct StorageDirectoryIdentity {
   std::uint64_t device;
   std::uint64_t inode;
@@ -89,7 +134,21 @@ public:
                    std::span<const std::byte> manifest) = 0;
   [[nodiscard]] virtual CheckpointResult<std::unique_ptr<IStoragePin>>
   pin_manifest(std::uint64_t generation) = 0;
+  [[nodiscard]] virtual CheckpointResult<RetentionReport>
+  apply_retention(std::size_t keep_last) = 0;
   [[nodiscard]] virtual CheckpointResult<void> cleanup() = 0;
+};
+
+class IStorageMaintenanceOperation {
+public:
+  virtual ~IStorageMaintenanceOperation() = default;
+
+  [[nodiscard]] virtual const ContainerId &container_id() const noexcept = 0;
+  [[nodiscard]] virtual StorageOperationKind kind() const noexcept = 0;
+  [[nodiscard]] virtual CheckpointResult<RetentionReport>
+  apply_retention(std::size_t keep_last) = 0;
+  [[nodiscard]] virtual CheckpointResult<GarbageCollectionReport>
+  collect_garbage(const GarbageCollectionOptions &options) = 0;
 };
 
 class IStorage {
@@ -100,6 +159,10 @@ public:
   begin_operation(const ContainerId &container_id,
                   const OperationId &operation_id,
                   StorageOperationKind kind) = 0;
+  [[nodiscard]] virtual CheckpointResult<
+      std::unique_ptr<IStorageMaintenanceOperation>>
+  begin_maintenance(const ContainerId &container_id,
+                    StorageOperationKind kind) = 0;
   [[nodiscard]] virtual CheckpointResult<bool>
   contains_chunk(const ContainerId &container_id,
                  const ChunkHash &hash) const = 0;

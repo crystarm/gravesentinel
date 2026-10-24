@@ -11,12 +11,12 @@ candidates are unusable or have failed with confirmed cleanup. The production
 `CheckpointOperations` and `CheckpointService`; the outer operation store exposes it
 through durable asynchronous IPC submission.
 
-Periodic scheduling and registration ownership belong to the
-[checkpoint service core](service-core.md). Retention and garbage collection are not
-implemented. The coordinator holds an exclusive storage operation for
-the complete request, so create, restore, retention, and conflicting cleanup for
-the same `ContainerId` cannot overlap when the configured `IStorage`
-implementation provides the documented per-container lease.
+Periodic scheduling, registration ownership, and background maintenance belong to the
+[checkpoint service core](service-core.md). The coordinator holds an exclusive storage
+operation for the complete request, so create, restore, retention, garbage collection,
+and startup recovery for the same `ContainerId` cannot overlap when the configured
+`IStorage` implementation provides the documented per-container lease. See the
+[maintenance guide](maintenance.md) for the separate lease-only path.
 
 ## Request and result
 
@@ -40,8 +40,10 @@ staging-cleanup completion are reported separately. The
 expose the outcome, selected checkpoint, or maintenance-completion flags. IPC
 `GetOperation` similarly exposes only operation state and a stable terminal error
 code. Once a runtime start succeeds, a later metadata cleanup failure does not turn
-that start into a false failure or trigger another start; the failure is logged and
-conservative stale-staging cleanup remains future recovery/GC work.
+that
+start into a false failure or trigger another start; the failure is logged and
+canonical stale staging is eligible for conservative startup recovery after its grace
+period.
 
 `ColdStartSpec` environment values are used only for the synchronous adapter call
 and are not persisted by the coordinator in manifests or storage operation
@@ -102,7 +104,11 @@ ownership policy exclude out-of-band replacement as a supported operation during
 restore. The read-only probe deliberately does not delete an unexpected live
 container.
 
-The manifest pin remains held through the adapter restore call. If restore fails
+The manifest pin remains held through the adapter restore call. A production pin
+shares the storage operation state and can outlive its immediate operation owner; while
+it remains live, it keeps the same per-container `flock`, so retention, GC, create, and
+another restore are deferred rather than observing an unprotected manifest. If restore
+fails
 with `RuntimeSideEffect::incarnation_may_exist`, the coordinator invokes
 `cleanup_failed_restore`; this destructive cleanup is allowed only because the
 coordinator proved absence immediately before its own restore attempt under the
@@ -189,8 +195,9 @@ another destructive action.
 
 The operation registry is bounded and does not evict terminal records. Saturation
 rejects new unique create/restore requests while preserving duplicate lookup and
-`GetOperation`. Checkpoint retention, operation-history pruning, stale-staging cleanup,
-and garbage collection are not implemented.
+`GetOperation`; operation-history pruning remains unimplemented. Checkpoint retention,
+garbage collection, and startup stale-staging cleanup are implemented internally and
+are deliberately absent from the public operation journal.
 
 ## Verification
 
@@ -203,8 +210,9 @@ separately verifies the production read-only absence probe and confirms that
 presence never causes stop/remove commands. `RestoreCoordinator` tests cover the
 synchronous coordinator separately. Operation-store, RPC-handler, and server/client
 tests cover asynchronous submission, deduplication, polling, and crash classification
-with fake executors or services; no test wires the real `RestoreCoordinator` through
-the operation store and IPC stack. The production binary composes these components,
+with fake executors or services. `//tests/unit:filesystem_storage_test` separately
+covers lease exclusion between restore-style operations and maintenance; no test wires
+the real `RestoreCoordinator` through the operation store and IPC stack. The production binary composes these components,
 but no statement here claims that the complete production daemon-to-Podman/CRIU
-restore flow was executed end to end. Restore and its destructive cleanup must be exercised only in the
-qualified rootful environment.
+restore flow was executed end to end. Restore and its destructive cleanup must be
+exercised only in the qualified rootful environment.

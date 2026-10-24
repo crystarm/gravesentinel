@@ -2,10 +2,11 @@
 
 ## Scope and API boundary
 
-`//src/core:checkpoint_service` owns registrations and the synchronous
-create/restore orchestration implemented by
-[`CheckpointCreator`](checkpoint-create.md) and
-[`RestoreCoordinator`](checkpoint-restore.md). The production
+`//src/core:checkpoint_service` owns registrations and dispatches synchronous
+create/restore orchestration plus internal maintenance implemented by
+[`CheckpointCreator`](checkpoint-create.md),
+[`RestoreCoordinator`](checkpoint-restore.md), and
+[`CheckpointMaintenance`](maintenance.md). The production
 `gravesentinel_hypervisor` composition instantiates the service together with
 filesystem storage, chunking, hashing, affinity, the Podman adapter, the durable
 operation store, RPC handler, and Unix socket server.
@@ -36,15 +37,16 @@ synchronous service call. This distinction is important: calling the core direct
 does not acquire IPC idempotency merely because the production daemon has it.
 
 The direct creator and coordinator return rich `CreatedCheckpoint` and
-`RestoredContainer` results. The service intentionally consumes those results:
-create retains only the source incarnation, restore retains only the new
-incarnation, and neither the core facade nor the wire status exposes checkpoint
-identity/generation, checkpoint-versus-cold-start outcome, or pin/staging
-cleanup-completion flags.
+`RestoredContainer` results. The service intentionally consumes those results: create
+retains the source incarnation and uses `retention_complete` to schedule a retry;
+restore retains the new incarnation. Neither the core facade nor wire status exposes
+checkpoint identity/generation, checkpoint-versus-cold-start outcome, or
+retention/pin/staging cleanup-completion flags. Background maintenance is not submitted
+to or recorded by the public `OperationStore` journal.
 
 `CheckpointOperations` is the production adapter from the service to the existing
-synchronous creator and restore coordinator. Tests replace its
-`ICheckpointOperations` seam without constructing storage or Podman.
+synchronous creator, restore coordinator, and maintenance orchestrator. Tests replace
+its `ICheckpointOperations` seam without constructing storage or Podman.
 
 ## `ContainerRegistration` wire schema
 
@@ -124,17 +126,16 @@ The standard accepted pairs remain `(0,1)`, `(2,3)`, `(4,5)`, and `(6,7)`. A slo
 with active work rejects unregister with a retryable conflict and remains registered,
 so a fifth registration cannot reuse its CPUs prematurely.
 
-Two accepted registration fields are currently inert after validation:
+`CheckpointConfig::keep_last` is operational: its validated `1..3` value is passed to
+every manual or periodic create for immediate post-commit retention and to separate
+retention retries. Optional `ContainerRegistration::runtime_fingerprint` remains inert
+after validation: it must be complete when present, but is not forwarded to create or
+restore. Creation records the fingerprint returned by the runtime adapter, and restore
+validates the fingerprint stored in the selected manifest.
 
-- `CheckpointConfig::keep_last` must be in `1..3`, but there is no retention pass
-  and the value is not used when creating or scheduling checkpoints;
-- optional `ContainerRegistration::runtime_fingerprint` must be complete when
-  present, but it is not forwarded to create or restore. Creation records the
-  fingerprint returned by the runtime adapter, and restore validates the
-  fingerprint stored in the selected manifest.
-
-Retention and garbage collection are not implemented. Manifests, orphan chunks, and
-stale staging are not automatically reclaimed by this service.
+The service schedules retention and bounded garbage collection for registered
+containers. Conservative stale staging/publication cleanup occurs earlier in startup
+storage recovery, before registrations exist.
 
 ## IPC durability, bounds, and recovery
 
@@ -160,7 +161,12 @@ once the 4096-record registry is full, new unique operations are rejected even i
 existing operations are terminal. Existing duplicates and status queries remain
 available.
 
-At startup, a record left `queued` by a crash becomes `failed` with an
+Before this journal is opened, the production process holds `ServerLock`, opens
+`FilesystemStorage`, and completes bounded storage recovery. `CheckpointService` and
+its registrations do not yet exist, so startup performs no retention because no
+`keep_last` values are available.
+
+At operation-journal startup, a record left `queued` by a crash becomes `failed` with an
 interrupted-before-execution classification and is not run. A record left `running`
 becomes `indeterminate`, because its create/restore side effects cannot be inferred
 from the journal. `indeterminate` requires scheduler/operator reconciliation of
@@ -169,27 +175,30 @@ destructive attempt blindly.
 
 ## Worker and concurrency model
 
-Each registered container owns one persistent worker and a mailbox of capacity one.
+Each registered container owns one persistent worker, a foreground mailbox of
+capacity one, a periodic-create slot, and coalesced retention/GC pending flags.
 The worker binds its own thread to the registration's `checkpoint_cpu` before the
 registration succeeds and attempts to restore its original affinity on exit. An
 affinity-restore error is returned by unregister/shutdown (and cached by shutdown);
 the destructor invokes shutdown but cannot report that error. The calling control
-thread is never rebound. Capture, chunking, hashing, reassembly, and runtime adapter
-calls all execute inside that bound worker context. Runtime subprocesses also
-receive the same checkpoint CPU through the existing adapter/process-runner
+thread is never rebound. Capture, chunking, hashing, reassembly, runtime adapter calls,
+retention, and garbage collection all execute inside that bound worker context.
+Runtime subprocesses also receive the same checkpoint CPU through the existing adapter/process-runner
 contract.
 
 One worker per slot provides both limits without a global unbounded queue:
 
 - no more than four container operations can execute simultaneously;
-- create and restore for one `ContainerId` are serialized;
-- operations for different IDs can execute concurrently.
+- create, restore, retention, and GC for one `ContainerId` are serialized;
+- operations for different IDs can execute concurrently;
+- maintenance reuses the same `checkpoint_cpu` affinity; there is no fifth CPU-heavy
+  worker or separate maintenance pool.
 
-A second synchronous caller for the same ID waits for the active operation to
-finish before occupying the mailbox. Waiting callers are not queued in FIFO order,
-and no fairness guarantee exists between multiple manual callers or between a
-manual caller and a due periodic item; whichever participant acquires the slot
-mutex while it is idle may be admitted first. A closing registration wakes such
+A second synchronous caller for the same ID waits for the active operation to finish
+before occupying the mailbox. Waiting callers are not queued in FIFO order. Once work
+is selectable, priority is manual foreground, periodic create, retention, then GC;
+foreground waiters suppress lower-priority admission. There is no fairness guarantee
+among multiple manual callers. A closing registration wakes such
 callers and rejects work that had not yet been accepted. Reentrant synchronous
 service calls from the registration's own worker are rejected as conflicts rather
 than self-deadlocking.
@@ -207,58 +216,74 @@ hint, forcing the next attempt through the coordinator's conservative absence
 proof. The service itself neither persists cold-start environment values nor adds
 them to log fields; the collaborator-diagnostic constraint below still applies.
 
-## Periodic scheduling and missed ticks
+## Periodic creation and maintenance scheduling
 
 The scheduler uses `IClock::monotonic_now()` and an injectable generation-based
 `ITimer`. `SteadyTimer` is the production implementation. The generation parameter
 prevents a registration, shutdown, or test-clock advance from being lost between
 computing the earliest deadline and entering the timer wait.
 
-The first periodic deadline is registration time plus `interval`. At a due deadline
-the next deadline is set to `now + interval`. A periodic create is placed only when
-the slot is idle and its mailbox is empty. If a manual or periodic operation is
-pending/running, that tick is skipped. Multiple elapsed intervals therefore never
-create a catch-up burst or an unbounded backlog.
+The first periodic-create deadline is registration time plus `interval`. At a due
+deadline the next deadline is set to `now + interval`. Deadline promotion and worker
+selection share the slot mutex: before selecting maintenance, the worker also promotes
+any deadline that is already due, so scheduler-thread timing cannot invert priority.
+A periodic create is admitted only when no operation is already running and no create is
+pending. A foreground item or waiter still executes first, while the admitted periodic
+create remains coalesced behind it. A tick observed while an operation is already
+running is skipped; multiple elapsed intervals never create a catch-up burst.
+
+A successful create always coalesces a GC request. If immediate post-commit retention
+returns `retention_complete = false`, it also coalesces a retention request.
+Independently, GC is due every five minutes. Maintenance flags do not count occurrences
+and therefore cannot form an unbounded backlog. `GarbageCollectionReport::more_work` coalesces another
+pass.
 
 An admitted periodic operation receives a locally constructed request ID of the
 form `periodic-<container-id>-<slot-sequence>` and an `OperationId` from
 `IIdGenerator`. The sequence advances only for admitted periodic work and resets
 when a container is unregistered and registered again, so the periodic request ID
 is not globally unique; the generated operation ID must provide operation
-uniqueness. Periodic completion has no caller-visible operation-journal status and
-failures are sent only to the injected `ILogger`. In the current production
-composition that logger writes the message to stderr; periodic work is not represented
-by a scheduler-submitted `GetOperation` record.
+uniqueness. Periodic-create and maintenance completion have no caller-visible
+operation-journal status; failures are sent only to the injected `ILogger`. In the
+current production composition that logger writes to stderr. Neither periodic work nor background
+maintenance is represented by a scheduler-submitted `GetOperation` record.
 
-An exception escaping the scheduler loop is caught and logged, but it terminates
-the scheduler thread permanently. Manual operations and registrations can remain
+A retryable maintenance failure, any maintenance exception, or an incomplete retention
+report arms a 30-second retry deadline. A non-retryable failure is logged without a
+timer retry and waits for a relevant new trigger: a later create for retention, or a
+later create/periodic five-minute tick for GC. Under continuous foreground backlog, pending maintenance can wait until the slot becomes quiescent.
+
+An exception escaping the scheduler loop is caught and logged, but it terminates the
+scheduler thread permanently. Manual operations and registrations can remain
 available, and the current health/status API does not report the loss of periodic
 scheduling.
 
 ## Unregister and shutdown
 
-`unregister_container` first examines the slot under its mutex. If manual work is
-pending or any manual/periodic item is active, it returns a retryable `conflict`
-without closing or removing the registration. Otherwise it atomically marks the slot
-closing, cancels a pending periodic item, rejects new work, and joins the idle worker.
+`unregister_container` first examines the slot under its mutex. If foreground work is
+pending or any create/restore/maintenance item is active, it returns a retryable
+`conflict` without closing or removing the registration. Otherwise it atomically marks
+the slot closing, drops pending periodic-create and coalesced maintenance work, clears
+retry deadlines, rejects new work, and joins the idle worker.
 The worker restores its affinity and exits before the registry slot and CPU assignment
 are released. Register, unregister, and shutdown calls are globally serialized by the
 lifecycle mutex, while manual create/restore admission proceeds through per-slot locks.
 
-`shutdown` is idempotent. It marks every slot closing, cancels pending periodic
-items, stops and joins the scheduler, drains accepted/active manual operations and
-active periodic operations, joins all workers, and finally clears the registry.
+`shutdown` is idempotent. It marks every slot closing, drops queued periodic and
+maintenance work, clears retry deadlines, stops and joins the scheduler, drains an
+accepted/active foreground operation and any already active bounded maintenance pass,
+joins all workers, and finally clears the registry.
 It has no timeout or forced-cancellation path. If worker affinity restoration
 fails, shutdown stores that error and returns it again on later calls. The service
 destructor invokes the same path but discards the result. Injected dependencies
 must outlive the service.
 
-Exceptions from creator/restore implementations do not escape a worker. Allocation
+Exceptions from operation implementations do not escape a worker. Allocation
 failures become `resource_exhausted`; other exceptions become `internal`. Because an
 exception can occur after an opaque side effect, create exceptions conservatively
 report `publication_may_be_visible` and restore exceptions report
-`incarnation_may_exist`. The worker remains usable after an individual operation
-exception.
+`incarnation_may_exist`. Maintenance exceptions are logged as retryable and arm the
+30-second retry. The worker remains usable after an individual operation exception.
 
 Implementations injected behind `ICheckpointOperations`, `IClock`, `IIdGenerator`,
 `IAffinityController`, and `ILogger` must support the documented concurrent calls
@@ -273,9 +298,12 @@ credentials, cold-start environment values, runtime stderr, or artifact contents
 `//tests/unit:checkpoint_service_test` uses a fake generation timer, barriers,
 thread-safe operation counters, fake affinity bindings, and no sleeps. It verifies
 registration validation, the four-slot limit, four-way parallelism, same-ID
-serialization, worker CPU assignments, unchanged control-thread affinity, missed
-periodic tick coalescing, unregister/shutdown races, exception containment, and
-source-incarnation forwarding. Linux affinity mask restoration itself remains
+serialization, shared worker CPU assignments, exact foreground/create/retention/GC
+priority, maintenance coalescing and retries, bounded-pass continuation,
+unregister/shutdown races, exception containment, and source-incarnation forwarding.
+`//tests/unit:checkpoint_maintenance_test` covers lease-only orchestration defaults and
+error propagation; `//tests/unit:filesystem_storage_test` covers durable
+retention/GC/recovery algorithms. Linux affinity mask restoration itself remains
 covered by `//tests/unit:linux_runtime_test`. IPC codec, server/client, RPC handler,
 and operation-store tests cover the production-facing wrapper and journal semantics.
 These are still unit-level/component tests: they do not establish that the complete

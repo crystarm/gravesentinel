@@ -23,6 +23,7 @@ struct CheckpointCreateRequest {
   ContainerId container_id;
   RuntimeContainerRef runtime_container;
   RuntimeCpuAssignment cpu_assignment;
+  std::size_t keep_last{3};
 };
 
 struct CreatedCheckpoint {
@@ -30,6 +31,7 @@ struct CreatedCheckpoint {
   CheckpointId checkpoint_id;
   std::uint64_t generation;
   RuntimeIncarnation source_incarnation;
+  bool retention_complete{true};
   bool staging_cleanup_complete;
 
   bool operator==(const CreatedCheckpoint &) const = default;

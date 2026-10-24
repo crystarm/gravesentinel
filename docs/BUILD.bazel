@@ -43,6 +43,12 @@ filegroup(
 )
 
 filegroup(
+    name = "maintenance",
+    srcs = ["maintenance.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "service_core",
     srcs = ["service-core.md"],
     visibility = ["//visibility:public"],
@@ -67,6 +73,7 @@ filegroup(
         "checkpoint-restore.md",
         "chunking.md",
         "filesystem-storage.md",
+        "maintenance.md",
         "manifest-v1.md",
         "service-core.md",
         "testbed.md",

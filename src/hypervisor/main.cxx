@@ -272,6 +272,7 @@ int main(const int argc, char **const argv) {
     return 5;
 
   using namespace gravesentinel::ccm;
+  SystemClock clock;
   auto storage_result = FilesystemStorage::open(checkpoint_data);
   if (!storage_result) {
     std::cerr << "cannot initialize checkpoint storage: "
@@ -279,8 +280,35 @@ int main(const int argc, char **const argv) {
     return 6;
   }
   auto storage = std::move(*storage_result);
+  constexpr std::size_t kMaximumStartupRecoveryPasses = 1024U;
+  bool recovery_complete = false;
+  for (std::size_t pass = 0; pass < kMaximumStartupRecoveryPasses; ++pass) {
+    auto recovered = storage->recover(StartupRecoveryOptions{
+        .now = clock.wall_now(),
+        .grace_period = std::chrono::hours{1},
+        .maximum_chunk_deletions_per_container = 128,
+    });
+    if (!recovered) {
+      std::cerr << "cannot recover checkpoint storage: "
+                << recovered.error().diagnostic << '\n';
+      return 6;
+    }
+    if (recovered->containers_deferred != 0U) {
+      std::cerr << "cannot recover checkpoint storage: a container namespace "
+                   "is still leased\n";
+      return 6;
+    }
+    if (!recovered->more_work) {
+      recovery_complete = true;
+      break;
+    }
+  }
+  if (!recovery_complete) {
+    std::cerr << "cannot recover checkpoint storage within the startup work "
+                 "bound\n";
+    return 6;
+  }
 
-  SystemClock clock;
   SteadyTimer timer;
   IdGenerator ids;
   StderrLogger logger;
@@ -297,7 +325,8 @@ int main(const int argc, char **const argv) {
   SnapshotChunker chunker(hasher);
   CheckpointCreator creator(*storage, podman, chunker, clock, ids, logger);
   RestoreCoordinator restore(*storage, podman, hasher, logger);
-  CheckpointOperations operations(creator, restore);
+  CheckpointMaintenance maintenance(*storage, clock);
+  CheckpointOperations operations(creator, restore, maintenance);
   CheckpointService service(operations, clock, timer, ids, affinity, logger);
 
   gravesentinel::ipc::OperationStoreOptions store_options;

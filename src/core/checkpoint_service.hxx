@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/core/checkpoint_creator.hxx"
+#include "src/core/checkpoint_maintenance.hxx"
 #include "src/core/contracts.hxx"
 #include "src/core/restore_coordinator.hxx"
 
@@ -16,21 +17,32 @@ public:
   create(const CheckpointCreateRequest &request) = 0;
   [[nodiscard]] virtual CheckpointResult<RestoredContainer>
   restore_or_restart(const RestoreRequest &request) = 0;
+  [[nodiscard]] virtual CheckpointResult<RetentionReport>
+  apply_retention(const ContainerId &container_id, std::size_t keep_last) = 0;
+  [[nodiscard]] virtual CheckpointResult<GarbageCollectionReport>
+  collect_garbage(const ContainerId &container_id) = 0;
 };
 
 class CheckpointOperations final : public ICheckpointOperations {
 public:
   CheckpointOperations(CheckpointCreator &creator,
-                       RestoreCoordinator &restore_coordinator) noexcept;
+                       RestoreCoordinator &restore_coordinator,
+                       ICheckpointMaintenance &maintenance) noexcept;
 
   [[nodiscard]] CheckpointResult<CreatedCheckpoint>
   create(const CheckpointCreateRequest &request) override;
   [[nodiscard]] CheckpointResult<RestoredContainer>
   restore_or_restart(const RestoreRequest &request) override;
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(const ContainerId &container_id,
+                  std::size_t keep_last) override;
+  [[nodiscard]] CheckpointResult<GarbageCollectionReport>
+  collect_garbage(const ContainerId &container_id) override;
 
 private:
   CheckpointCreator &creator_;
   RestoreCoordinator &restore_coordinator_;
+  ICheckpointMaintenance &maintenance_;
 };
 
 class SteadyTimer final : public ITimer {

@@ -363,7 +363,12 @@ private:
   bool throw_next_restore_{false};
 };
 
-enum class ObservedOperationKind : std::uint8_t { create, restore };
+enum class ObservedOperationKind : std::uint8_t {
+  create,
+  restore,
+  retention,
+  garbage_collection,
+};
 
 struct OperationObservation {
   ObservedOperationKind kind;
@@ -380,6 +385,12 @@ public:
   void block_next_calls(std::size_t count) {
     const std::scoped_lock lock{mutex_};
     blocking_entries_remaining_ = count;
+    blocked_calls_released_ = false;
+  }
+
+  void block_next_calls(ObservedOperationKind kind, std::size_t count) {
+    const std::scoped_lock lock{mutex_};
+    blocking_entries_by_kind_[kind] = count;
     blocked_calls_released_ = false;
   }
 
@@ -401,6 +412,38 @@ public:
     throw_next_restore_ = true;
   }
 
+  void throw_on_next(ObservedOperationKind kind) {
+    const std::scoped_lock lock{mutex_};
+    throw_next_by_kind_[kind] = true;
+  }
+
+  void fail_on_next(ObservedOperationKind kind) {
+    const std::scoped_lock lock{mutex_};
+    fail_next_by_kind_[kind] = true;
+    nonretryable_failure_by_kind_[kind] = false;
+  }
+
+  void fail_nonretryably_on_next(ObservedOperationKind kind) {
+    const std::scoped_lock lock{mutex_};
+    fail_next_by_kind_[kind] = true;
+    nonretryable_failure_by_kind_[kind] = true;
+  }
+
+  void set_next_created_retention_complete(bool complete) {
+    const std::scoped_lock lock{mutex_};
+    next_created_retention_complete_ = complete;
+  }
+
+  void set_next_retention_pass_complete(bool complete) {
+    const std::scoped_lock lock{mutex_};
+    next_retention_pass_complete_ = complete;
+  }
+
+  void set_next_garbage_collection_more_work(bool more_work) {
+    const std::scoped_lock lock{mutex_};
+    next_garbage_collection_more_work_ = more_work;
+  }
+
   void run_during_next_create(std::function<void()> callback) {
     const std::scoped_lock lock{mutex_};
     next_create_callback_ = std::move(callback);
@@ -416,6 +459,13 @@ public:
     condition_.wait(lock, [&] { return total_calls_ >= expected_count; });
   }
 
+  void wait_for_total_calls(ObservedOperationKind kind,
+                            std::size_t expected_count) {
+    std::unique_lock lock{mutex_};
+    condition_.wait(
+        lock, [&] { return total_calls_by_kind_[kind] >= expected_count; });
+  }
+
   void wait_for_no_active_calls() {
     std::unique_lock lock{mutex_};
     condition_.wait(lock, [&] { return active_calls_ == 0U; });
@@ -424,6 +474,12 @@ public:
   [[nodiscard]] std::size_t total_calls() const {
     const std::scoped_lock lock{mutex_};
     return total_calls_;
+  }
+
+  [[nodiscard]] std::size_t total_calls(ObservedOperationKind kind) const {
+    const std::scoped_lock lock{mutex_};
+    const auto found = total_calls_by_kind_.find(kind);
+    return found == total_calls_by_kind_.end() ? 0U : found->second;
   }
 
   [[nodiscard]] std::size_t maximum_active_calls() const {
@@ -443,6 +499,18 @@ public:
     return observations_;
   }
 
+  [[nodiscard]] std::vector<OperationObservation>
+  observations(ObservedOperationKind kind) const {
+    const std::scoped_lock lock{mutex_};
+    std::vector<OperationObservation> matching;
+    for (const auto &observation : observations_) {
+      if (observation.kind == kind) {
+        matching.push_back(observation);
+      }
+    }
+    return matching;
+  }
+
   [[nodiscard]] std::vector<CheckpointCreateRequest> create_requests() const {
     const std::scoped_lock lock{mutex_};
     return create_requests_;
@@ -451,6 +519,11 @@ public:
   [[nodiscard]] std::vector<RestoreRequest> restore_requests() const {
     const std::scoped_lock lock{mutex_};
     return restore_requests_;
+  }
+
+  [[nodiscard]] std::vector<std::size_t> retention_keep_last_values() const {
+    const std::scoped_lock lock{mutex_};
+    return retention_keep_last_values_;
   }
 
   [[nodiscard]] CheckpointResult<CreatedCheckpoint>
@@ -465,6 +538,10 @@ public:
     if (context.throw_exception) {
       throw std::runtime_error("injected checkpoint operation exception");
     }
+    if (context.fail_operation) {
+      return std::unexpected(make_test_error(StableErrorCode::storage_error,
+                                             "injected create failure"));
+    }
 
     return CreatedCheckpoint{
         .operation_id = request.operation_id,
@@ -476,6 +553,7 @@ public:
                 .reference = request.runtime_container,
                 .runtime_id = "source-" + request.operation_id.value(),
             },
+        .retention_complete = context.retention_complete,
         .staging_cleanup_complete = true,
     };
   }
@@ -487,6 +565,10 @@ public:
     leave_call(context.container_id);
     if (context.throw_exception) {
       throw std::runtime_error("injected restore operation exception");
+    }
+    if (context.fail_operation) {
+      return std::unexpected(make_test_error(StableErrorCode::restore_failed,
+                                             "injected restore failure"));
     }
 
     return RestoredContainer{
@@ -504,12 +586,62 @@ public:
     };
   }
 
+  [[nodiscard]] CheckpointResult<RetentionReport>
+  apply_retention(const ContainerId &container_id,
+                  std::size_t keep_last) override {
+    auto context = enter_maintenance(ObservedOperationKind::retention,
+                                     container_id, keep_last);
+    wait_if_blocked(context.blocked);
+    leave_call(context.container_id);
+    if (context.throw_exception) {
+      throw std::runtime_error("injected retention exception");
+    }
+    if (context.fail_operation) {
+      auto error = make_test_error(StableErrorCode::storage_error,
+                                   "injected retention failure");
+      error.retryable = context.failure_retryable;
+      return std::unexpected(std::move(error));
+    }
+    return RetentionReport{
+        .manifests_deleted = 1U,
+        .manifests_deferred = context.retention_complete ? 0U : 1U,
+        .complete = context.retention_complete,
+    };
+  }
+
+  [[nodiscard]] CheckpointResult<GarbageCollectionReport>
+  collect_garbage(const ContainerId &container_id) override {
+    auto context = enter_maintenance(ObservedOperationKind::garbage_collection,
+                                     container_id, std::nullopt);
+    wait_if_blocked(context.blocked);
+    leave_call(context.container_id);
+    if (context.throw_exception) {
+      throw std::runtime_error("injected garbage collection exception");
+    }
+    if (context.fail_operation) {
+      auto error = make_test_error(StableErrorCode::storage_error,
+                                   "injected garbage collection failure");
+      error.retryable = context.failure_retryable;
+      return std::unexpected(std::move(error));
+    }
+    return GarbageCollectionReport{
+        .chunks_marked = 1U,
+        .chunks_deleted = 1U,
+        .candidate_records_deleted = 1U,
+        .more_work = context.garbage_collection_more_work,
+    };
+  }
+
 private:
   struct CallContext {
     std::string container_id;
     std::uint64_t sequence;
     bool blocked;
     bool throw_exception;
+    bool fail_operation;
+    bool failure_retryable;
+    bool retention_complete;
+    bool garbage_collection_more_work;
   };
 
   [[nodiscard]] CallContext
@@ -518,10 +650,18 @@ private:
     const auto current_thread_id = std::this_thread::get_id();
     std::scoped_lock lock{mutex_};
     create_requests_.push_back(request);
-    const bool throw_exception = std::exchange(throw_next_create_, false);
+    const bool throw_exception =
+        std::exchange(throw_next_create_, false) ||
+        std::exchange(throw_next_by_kind_[ObservedOperationKind::create],
+                      false);
+    const bool fail_operation =
+        std::exchange(fail_next_by_kind_[ObservedOperationKind::create], false);
+    const bool retention_complete =
+        std::exchange(next_created_retention_complete_, true);
     return enter_call_locked(ObservedOperationKind::create,
                              request.container_id.value(), current_thread_id,
-                             worker_cpu, throw_exception);
+                             worker_cpu, throw_exception, fail_operation, false,
+                             retention_complete);
   }
 
   [[nodiscard]] CallContext enter_restore(const RestoreRequest &request) {
@@ -529,10 +669,44 @@ private:
     const auto current_thread_id = std::this_thread::get_id();
     std::scoped_lock lock{mutex_};
     restore_requests_.push_back(request);
-    const bool throw_exception = std::exchange(throw_next_restore_, false);
+    const bool throw_exception =
+        std::exchange(throw_next_restore_, false) ||
+        std::exchange(throw_next_by_kind_[ObservedOperationKind::restore],
+                      false);
+    const bool fail_operation = std::exchange(
+        fail_next_by_kind_[ObservedOperationKind::restore], false);
     return enter_call_locked(ObservedOperationKind::restore,
                              request.container_id.value(), current_thread_id,
-                             worker_cpu, throw_exception);
+                             worker_cpu, throw_exception, fail_operation, false,
+                             true);
+  }
+
+  [[nodiscard]] CallContext
+  enter_maintenance(ObservedOperationKind kind, const ContainerId &container_id,
+                    std::optional<std::size_t> keep_last) {
+    const auto worker_cpu = affinity_.current_cpu();
+    const auto current_thread_id = std::this_thread::get_id();
+    std::scoped_lock lock{mutex_};
+    if (keep_last.has_value()) {
+      retention_keep_last_values_.push_back(*keep_last);
+    }
+    const bool throw_exception =
+        std::exchange(throw_next_by_kind_[kind], false);
+    const bool fail_operation = std::exchange(fail_next_by_kind_[kind], false);
+    const bool failure_retryable =
+        !std::exchange(nonretryable_failure_by_kind_[kind], false);
+    const bool retention_complete =
+        kind == ObservedOperationKind::retention
+            ? std::exchange(next_retention_pass_complete_, true)
+            : true;
+    const bool garbage_collection_more_work =
+        kind == ObservedOperationKind::garbage_collection
+            ? std::exchange(next_garbage_collection_more_work_, false)
+            : false;
+    return enter_call_locked(kind, container_id.value(), current_thread_id,
+                             worker_cpu, throw_exception, fail_operation,
+                             failure_retryable, retention_complete,
+                             garbage_collection_more_work);
   }
 
   [[nodiscard]] std::function<void()> take_create_callback() {
@@ -540,12 +714,13 @@ private:
     return std::exchange(next_create_callback_, {});
   }
 
-  [[nodiscard]] CallContext
-  enter_call_locked(ObservedOperationKind kind, std::string container_id,
-                    std::thread::id thread_id,
-                    std::optional<std::uint32_t> worker_cpu,
-                    bool throw_exception) {
+  [[nodiscard]] CallContext enter_call_locked(
+      ObservedOperationKind kind, std::string container_id,
+      std::thread::id thread_id, std::optional<std::uint32_t> worker_cpu,
+      bool throw_exception, bool fail_operation, bool failure_retryable,
+      bool retention_complete, bool garbage_collection_more_work = false) {
     ++total_calls_;
+    ++total_calls_by_kind_[kind];
     ++active_calls_;
     maximum_active_calls_ = std::max(maximum_active_calls_, active_calls_);
     auto &container_active = active_by_container_[container_id];
@@ -559,9 +734,15 @@ private:
         .worker_cpu = worker_cpu,
     });
 
-    const bool blocked = blocking_entries_remaining_ > 0U;
+    bool blocked = blocking_entries_remaining_ > 0U;
     if (blocked) {
       --blocking_entries_remaining_;
+    } else {
+      auto &kind_entries_remaining = blocking_entries_by_kind_[kind];
+      blocked = kind_entries_remaining > 0U;
+      if (blocked) {
+        --kind_entries_remaining;
+      }
     }
     const auto sequence = next_sequence_++;
     condition_.notify_all();
@@ -570,6 +751,10 @@ private:
         .sequence = sequence,
         .blocked = blocked,
         .throw_exception = throw_exception,
+        .fail_operation = fail_operation,
+        .failure_retryable = failure_retryable,
+        .retention_complete = retention_complete,
+        .garbage_collection_more_work = garbage_collection_more_work,
     };
   }
 
@@ -594,11 +779,19 @@ private:
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   std::size_t blocking_entries_remaining_{0U};
+  std::map<ObservedOperationKind, std::size_t> blocking_entries_by_kind_;
   bool blocked_calls_released_{true};
   bool throw_next_create_{false};
   bool throw_next_restore_{false};
+  std::map<ObservedOperationKind, bool> throw_next_by_kind_;
+  std::map<ObservedOperationKind, bool> fail_next_by_kind_;
+  std::map<ObservedOperationKind, bool> nonretryable_failure_by_kind_;
+  bool next_created_retention_complete_{true};
+  bool next_retention_pass_complete_{true};
+  bool next_garbage_collection_more_work_{false};
   std::function<void()> next_create_callback_;
   std::size_t total_calls_{0U};
+  std::map<ObservedOperationKind, std::size_t> total_calls_by_kind_;
   std::size_t active_calls_{0U};
   std::size_t maximum_active_calls_{0U};
   std::uint64_t next_sequence_{1U};
@@ -607,6 +800,7 @@ private:
   std::vector<OperationObservation> observations_;
   std::vector<CheckpointCreateRequest> create_requests_;
   std::vector<RestoreRequest> restore_requests_;
+  std::vector<std::size_t> retention_keep_last_values_;
 };
 
 class FakeIdGenerator final : public IIdGenerator {
@@ -810,7 +1004,8 @@ TEST(CheckpointServiceTest, SerializesOperationsForTheSameContainer) {
   ASSERT_TRUE(second_result.has_value());
   EXPECT_TRUE(*first_result);
   EXPECT_TRUE(*second_result);
-  EXPECT_EQ(rig.operations.total_calls(), 2U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::create), 1U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::restore), 1U);
   EXPECT_EQ(rig.operations.maximum_active_calls_for(registration.container_id),
             1U);
   EXPECT_TRUE(rig.service.shutdown());
@@ -825,14 +1020,14 @@ TEST(CheckpointServiceTest,
       registration, make_request("register-periodic")));
 
   rig.time.advance(59s);
-  EXPECT_EQ(rig.operations.total_calls(), 0U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::create), 0U);
 
   rig.time.advance(1s);
   rig.operations.wait_for_active_calls(1U);
-  EXPECT_EQ(rig.operations.total_calls(), 1U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::create), 1U);
 
   rig.time.advance(180s);
-  EXPECT_EQ(rig.operations.total_calls(), 1U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::create), 1U);
 
   rig.operations.release_blocked_calls();
   rig.operations.wait_for_no_active_calls();
@@ -848,9 +1043,9 @@ TEST(CheckpointServiceTest,
   EXPECT_EQ(requests.back().request_id.value(), "manual-synchronization");
 
   rig.time.advance(59s);
-  EXPECT_EQ(rig.operations.total_calls(), 2U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::create), 2U);
   rig.time.advance(1s);
-  rig.operations.wait_for_total_calls(3U);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::create, 3U);
 
   requests = rig.operations.create_requests();
   ASSERT_EQ(requests.size(), 3U);
@@ -858,6 +1053,348 @@ TEST(CheckpointServiceTest,
             "periodic-periodic-container-2");
   EXPECT_EQ(rig.ids.operation_count(), 2U);
   EXPECT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest,
+     RunsMaintenanceOnTheSlotWorkerInRetentionThenGarbageOrder) {
+  TestRig rig;
+  auto registration = make_registration("maintenance-affinity", 0U, 1U, 1h);
+  registration.checkpoint.keep_last = 2U;
+  rig.operations.set_next_created_retention_complete(false);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-maintenance-affinity")));
+
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("create-maintenance-affinity"),
+      make_operation("operation-maintenance-affinity")));
+  rig.operations.wait_for_total_calls(ObservedOperationKind::retention, 1U);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      1U);
+  ASSERT_TRUE(rig.service.shutdown());
+
+  const auto observations = rig.operations.observations();
+  ASSERT_EQ(observations.size(), 3U);
+  EXPECT_EQ(observations[0].kind, ObservedOperationKind::create);
+  EXPECT_EQ(observations[1].kind, ObservedOperationKind::retention);
+  EXPECT_EQ(observations[2].kind, ObservedOperationKind::garbage_collection);
+  for (const auto &observation : observations) {
+    EXPECT_EQ(observation.thread_id, observations.front().thread_id);
+    ASSERT_TRUE(observation.worker_cpu.has_value());
+    EXPECT_EQ(*observation.worker_cpu, registration.checkpoint.checkpoint_cpu);
+  }
+
+  const auto requests = rig.operations.create_requests();
+  ASSERT_EQ(requests.size(), 1U);
+  EXPECT_EQ(requests.front().keep_last, registration.checkpoint.keep_last);
+  EXPECT_EQ(rig.operations.retention_keep_last_values(),
+            std::vector<std::size_t>({registration.checkpoint.keep_last}));
+  EXPECT_EQ(rig.affinity.bind_cpus(), std::vector<std::uint32_t>({1U}));
+}
+
+TEST(CheckpointServiceTest,
+     WorkerPromotesDuePeriodicCreateBeforePendingMaintenance) {
+  TestRig rig;
+  auto registration = make_registration("due-priority", 0U, 1U);
+  registration.checkpoint.keep_last = 2U;
+  rig.operations.set_next_created_retention_complete(false);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-due-priority")));
+
+  rig.time.block_next_monotonic_read();
+  rig.time.advance_without_wait(60s);
+  rig.time.wait_for_blocked_monotonic_read();
+
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("manual-due-priority"),
+      make_operation("manual-due-priority-operation")));
+  rig.operations.wait_for_total_calls(ObservedOperationKind::create, 2U);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::retention, 1U);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      1U);
+  rig.operations.wait_for_no_active_calls();
+
+  rig.time.release_monotonic_read();
+  ASSERT_TRUE(rig.service.shutdown());
+  const auto observations = rig.operations.observations();
+  ASSERT_EQ(observations.size(), 4U);
+  EXPECT_EQ(observations[0].kind, ObservedOperationKind::create);
+  EXPECT_EQ(observations[1].kind, ObservedOperationKind::create);
+  EXPECT_EQ(observations[2].kind, ObservedOperationKind::retention);
+  EXPECT_EQ(observations[3].kind, ObservedOperationKind::garbage_collection);
+}
+
+TEST(CheckpointServiceTest,
+     GarbageMoreWorkCoalescesExactlyOneImmediateBoundedPass) {
+  TestRig rig;
+  const auto registration = make_registration("garbage-more-work", 0U, 1U, 1h);
+  rig.operations.set_next_garbage_collection_more_work(true);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-garbage-more-work")));
+
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("create-garbage-more-work"),
+      make_operation("operation-garbage-more-work")));
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      2U);
+  rig.operations.wait_for_no_active_calls();
+  ASSERT_TRUE(rig.service.shutdown());
+
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      2U);
+  const auto observations = rig.operations.observations();
+  ASSERT_EQ(observations.size(), 3U);
+  EXPECT_EQ(observations[0].kind, ObservedOperationKind::create);
+  EXPECT_EQ(observations[1].kind, ObservedOperationKind::garbage_collection);
+  EXPECT_EQ(observations[2].kind, ObservedOperationKind::garbage_collection);
+}
+
+TEST(CheckpointServiceTest,
+     PeriodicGarbageCollectionIsIndependentAndDueTicksCoalesce) {
+  TestRig rig;
+  const auto registration = make_registration("periodic-garbage", 0U, 1U, 1h);
+  rig.operations.block_next_calls(ObservedOperationKind::garbage_collection,
+                                  1U);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-periodic-garbage")));
+
+  rig.time.advance(299s);
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      0U);
+  rig.time.advance(1s);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      1U);
+  rig.operations.wait_for_active_calls(1U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::create), 0U);
+
+  rig.time.advance(300s);
+  rig.time.advance(300s);
+  rig.time.advance(300s);
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      1U);
+
+  rig.operations.release_blocked_calls();
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      2U);
+  ASSERT_TRUE(rig.service.shutdown());
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      2U);
+}
+
+TEST(CheckpointServiceTest, DeferredRetentionRetriesOnlyAfterTheDelay) {
+  TestRig rig;
+  const auto registration = make_registration("retention-deferred", 0U, 1U, 1h);
+  rig.operations.set_next_created_retention_complete(false);
+  rig.operations.set_next_retention_pass_complete(false);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-retention-deferred")));
+  const auto interrupts_before_create = rig.time.interrupt_count();
+
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("create-retention-deferred"),
+      make_operation("operation-retention-deferred")));
+  rig.operations.wait_for_total_calls(ObservedOperationKind::retention, 1U);
+  rig.time.wait_for_interrupt_count(interrupts_before_create + 1U);
+
+  rig.time.advance(29s);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::retention), 1U);
+  rig.time.advance(1s);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::retention, 2U);
+
+  ASSERT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest, NonRetryableMaintenanceFailureWaitsForANewTrigger) {
+  TestRig rig;
+  const auto registration =
+      make_registration("retention-permanent", 0U, 1U, 1h);
+  rig.operations.set_next_created_retention_complete(false);
+  rig.operations.fail_nonretryably_on_next(ObservedOperationKind::retention);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-retention-permanent")));
+
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("create-retention-permanent"),
+      make_operation("operation-retention-permanent")));
+  rig.operations.wait_for_total_calls(ObservedOperationKind::retention, 1U);
+
+  rig.time.advance(30s);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::retention), 1U);
+
+  ASSERT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest,
+     MaintenanceFailuresAndExceptionsRetryOnlyAfterTheDelay) {
+  TestRig rig;
+  const auto registration = make_registration("maintenance-retry", 0U, 1U, 1h);
+  rig.operations.set_next_created_retention_complete(false);
+  rig.operations.fail_on_next(ObservedOperationKind::retention);
+  rig.operations.throw_on_next(ObservedOperationKind::garbage_collection);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-maintenance-retry")));
+  rig.time.advance(290s);
+  const auto interrupts_before_create = rig.time.interrupt_count();
+
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("create-maintenance-retry"),
+      make_operation("operation-maintenance-retry")));
+  rig.time.wait_for_interrupt_count(interrupts_before_create + 2U);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::retention), 1U);
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      1U);
+  EXPECT_GE(rig.logger.error_count(), 2U);
+
+  rig.time.advance(10s);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::retention), 1U);
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      1U);
+
+  rig.time.advance(19s);
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::retention), 1U);
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      1U);
+
+  rig.time.advance(1s);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::retention, 2U);
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      2U);
+  ASSERT_TRUE(rig.service.shutdown());
+
+  const auto observations = rig.operations.observations();
+  ASSERT_EQ(observations.size(), 5U);
+  EXPECT_EQ(observations[0].kind, ObservedOperationKind::create);
+  EXPECT_EQ(observations[1].kind, ObservedOperationKind::retention);
+  EXPECT_EQ(observations[2].kind, ObservedOperationKind::garbage_collection);
+  EXPECT_EQ(observations[3].kind, ObservedOperationKind::retention);
+  EXPECT_EQ(observations[4].kind, ObservedOperationKind::garbage_collection);
+}
+
+TEST(CheckpointServiceTest,
+     UnregisterRejectsRunningMaintenanceAndCancelsItsQueuedRetry) {
+  TestRig rig;
+  const auto registration =
+      make_registration("unregister-maintenance", 0U, 1U, 1h);
+  rig.operations.block_next_calls(ObservedOperationKind::garbage_collection,
+                                  1U);
+  rig.operations.fail_on_next(ObservedOperationKind::garbage_collection);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-unregister-maintenance")));
+  const auto interrupts_before_create = rig.time.interrupt_count();
+
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("create-before-unregister"),
+      make_operation("operation-before-unregister")));
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      1U);
+  const auto rejected = rig.service.unregister_container(
+      registration.container_id,
+      make_request("unregister-running-maintenance"));
+  expect_error(rejected, StableErrorCode::conflict);
+  EXPECT_TRUE(rejected.error().retryable);
+
+  rig.operations.release_blocked_calls();
+  rig.time.wait_for_interrupt_count(interrupts_before_create + 1U);
+  ASSERT_TRUE(rig.service.restore_or_restart(
+      registration.container_id, make_request("sync-after-maintenance"),
+      make_operation("sync-after-maintenance-operation")));
+  ASSERT_TRUE(rig.service.unregister_container(
+      registration.container_id, make_request("unregister-maintenance-retry")));
+
+  rig.time.advance(30s);
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      1U);
+  EXPECT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest,
+     ShutdownWaitsForActiveMaintenanceAndCancelsQueuedMaintenance) {
+  TestRig rig;
+  const auto registration =
+      make_registration("shutdown-maintenance", 0U, 1U, 1h);
+  rig.operations.set_next_created_retention_complete(false);
+  rig.operations.block_next_calls(ObservedOperationKind::retention, 1U);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-shutdown-maintenance")));
+  ASSERT_TRUE(rig.service.create_checkpoint(
+      registration.container_id, make_request("create-before-maintenance-stop"),
+      make_operation("operation-before-maintenance-stop")));
+  rig.operations.wait_for_total_calls(ObservedOperationKind::retention, 1U);
+
+  const auto interrupts_before_shutdown = rig.time.interrupt_count();
+  std::atomic<bool> shutdown_finished{false};
+  std::optional<CheckpointResult<void>> shutdown_result;
+  std::jthread shutdown_caller([&] {
+    shutdown_result = rig.service.shutdown();
+    shutdown_finished.store(true, std::memory_order_release);
+  });
+  rig.time.wait_for_interrupt_count(interrupts_before_shutdown + 1U);
+  EXPECT_FALSE(shutdown_finished.load(std::memory_order_acquire));
+
+  rig.operations.release_blocked_calls();
+  shutdown_caller.join();
+  ASSERT_TRUE(shutdown_result.has_value());
+  EXPECT_TRUE(*shutdown_result);
+  EXPECT_TRUE(shutdown_finished.load(std::memory_order_acquire));
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      0U);
+}
+
+TEST(CheckpointServiceTest, RunsAtMostFourMaintenanceCallsConcurrently) {
+  TestRig rig;
+  const std::array registrations{
+      make_registration("maintenance-limit-0", 0U, 1U, 1h),
+      make_registration("maintenance-limit-1", 2U, 3U, 1h),
+      make_registration("maintenance-limit-2", 4U, 5U, 1h),
+      make_registration("maintenance-limit-3", 6U, 7U, 1h),
+  };
+  for (std::size_t index = 0; index < registrations.size(); ++index) {
+    ASSERT_TRUE(rig.service.register_container(
+        registrations[index],
+        make_request("register-maintenance-limit-" + std::to_string(index))));
+  }
+  rig.operations.block_next_calls(ObservedOperationKind::garbage_collection,
+                                  registrations.size());
+
+  std::array<std::optional<CheckpointResult<void>>, 4U> results;
+  std::array<std::jthread, 4U> callers;
+  for (std::size_t index = 0; index < callers.size(); ++index) {
+    callers[index] = std::jthread([&, index] {
+      results[index] = rig.service.create_checkpoint(
+          registrations[index].container_id,
+          make_request("create-maintenance-limit-" + std::to_string(index)),
+          make_operation("operation-maintenance-limit-" +
+                         std::to_string(index)));
+    });
+  }
+
+  rig.operations.wait_for_total_calls(ObservedOperationKind::garbage_collection,
+                                      registrations.size());
+  rig.operations.wait_for_active_calls(registrations.size());
+  EXPECT_EQ(rig.operations.maximum_active_calls(), registrations.size());
+  EXPECT_EQ(
+      rig.operations.total_calls(ObservedOperationKind::garbage_collection),
+      registrations.size());
+  EXPECT_EQ(rig.affinity.bind_cpus().size(), registrations.size());
+
+  rig.operations.release_blocked_calls();
+  for (auto &caller : callers) {
+    caller.join();
+  }
+  for (const auto &result : results) {
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(*result);
+  }
+  EXPECT_TRUE(rig.service.shutdown());
+  EXPECT_EQ(rig.affinity.bind_cpus().size(), registrations.size());
 }
 
 TEST(CheckpointServiceTest,
@@ -899,6 +1436,10 @@ TEST(CheckpointServiceTest,
   operation_caller.join();
   ASSERT_TRUE(operation_result.has_value());
   EXPECT_TRUE(*operation_result);
+  ASSERT_TRUE(rig.service.restore_or_restart(
+      registrations.front().container_id,
+      make_request("synchronize-after-active-create"),
+      make_operation("synchronize-after-active-create-operation")));
   EXPECT_TRUE(rig.service.unregister_container(
       registrations.front().container_id, make_request("unregister-retry")));
 
@@ -1011,7 +1552,8 @@ TEST(CheckpointServiceTest, ConvertsExceptionsAndReusesTheWorker) {
       make_operation("recovered-operation"));
   EXPECT_TRUE(recovered);
 
-  const auto observations = rig.operations.observations();
+  const auto observations =
+      rig.operations.observations(ObservedOperationKind::create);
   ASSERT_EQ(observations.size(), 2U);
   EXPECT_EQ(observations.front().thread_id, observations.back().thread_id);
   EXPECT_EQ(rig.operations.maximum_active_calls_for(registration.container_id),
@@ -1127,6 +1669,9 @@ TEST(CheckpointServiceTest,
   ASSERT_TRUE(reentrant_result.has_value());
   EXPECT_TRUE(*create_result);
   expect_error(*reentrant_result, StableErrorCode::conflict);
+  ASSERT_TRUE(rig.service.restore_or_restart(
+      registration.container_id, make_request("synchronize-after-reentrant"),
+      make_operation("synchronize-after-reentrant-operation")));
   EXPECT_TRUE(rig.service.unregister_container(
       registration.container_id, make_request("unregister-after-reentrant")));
   EXPECT_TRUE(rig.service.shutdown());

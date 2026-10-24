@@ -1,5 +1,6 @@
 #include "src/core/checkpoint_service.hxx"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,8 @@ namespace gravesentinel::ccm {
 namespace {
 
 constexpr std::size_t kMaximumRegistrations = 4;
+constexpr auto kGarbageCollectionInterval = std::chrono::minutes{5};
+constexpr auto kMaintenanceRetryInterval = std::chrono::seconds{30};
 
 [[nodiscard]] constexpr std::string_view
 error_code_name(StableErrorCode code) noexcept {
@@ -173,9 +176,10 @@ next_deadline(IClock::MonotonicTime now, std::chrono::seconds interval,
 } // namespace
 
 CheckpointOperations::CheckpointOperations(
-    CheckpointCreator &creator,
-    RestoreCoordinator &restore_coordinator) noexcept
-    : creator_(creator), restore_coordinator_(restore_coordinator) {}
+    CheckpointCreator &creator, RestoreCoordinator &restore_coordinator,
+    ICheckpointMaintenance &maintenance) noexcept
+    : creator_(creator), restore_coordinator_(restore_coordinator),
+      maintenance_(maintenance) {}
 
 CheckpointResult<CreatedCheckpoint>
 CheckpointOperations::create(const CheckpointCreateRequest &request) {
@@ -185,6 +189,17 @@ CheckpointOperations::create(const CheckpointCreateRequest &request) {
 CheckpointResult<RestoredContainer>
 CheckpointOperations::restore_or_restart(const RestoreRequest &request) {
   return restore_coordinator_.restore_or_restart(request);
+}
+
+CheckpointResult<RetentionReport>
+CheckpointOperations::apply_retention(const ContainerId &container_id,
+                                      std::size_t keep_last) {
+  return maintenance_.apply_retention(container_id, keep_last);
+}
+
+CheckpointResult<GarbageCollectionReport>
+CheckpointOperations::collect_garbage(const ContainerId &container_id) {
+  return maintenance_.collect_garbage(container_id);
 }
 
 struct SteadyTimer::Implementation {
@@ -230,6 +245,8 @@ struct CheckpointService::Implementation {
   enum class WorkKind : std::uint8_t {
     create,
     restore,
+    retention,
+    garbage_collection,
   };
 
   struct WorkItem {
@@ -243,8 +260,12 @@ struct CheckpointService::Implementation {
   };
 
   struct Slot {
-    Slot(ContainerRegistration value, IClock::MonotonicTime deadline_value)
-        : registration(std::move(value)), next_deadline(deadline_value),
+    Slot(ContainerRegistration value,
+         IClock::MonotonicTime create_deadline_value,
+         IClock::MonotonicTime garbage_collection_deadline_value)
+        : registration(std::move(value)),
+          next_create_deadline(create_deadline_value),
+          next_garbage_collection_deadline(garbage_collection_deadline_value),
           worker_exception_fallback(make_error(
               StableErrorCode::resource_exhausted,
               "checkpoint worker exhausted memory while handling an exception",
@@ -253,21 +274,39 @@ struct CheckpointService::Implementation {
           affinity_exception_fallback(make_error(
               StableErrorCode::resource_exhausted,
               "checkpoint worker exhausted memory while restoring affinity",
-              nullptr, true)) {}
+              nullptr, true)),
+          retention_exception_fallback(make_error(
+              StableErrorCode::resource_exhausted,
+              "retention exhausted memory while handling an exception", nullptr,
+              true, StorageSideEffect::publication_may_be_visible)),
+          garbage_collection_exception_fallback(make_error(
+              StableErrorCode::resource_exhausted,
+              "garbage collection exhausted memory while handling an exception",
+              nullptr, true, StorageSideEffect::publication_may_be_visible)) {}
 
     ContainerRegistration registration;
-    IClock::MonotonicTime next_deadline;
+    IClock::MonotonicTime next_create_deadline;
+    IClock::MonotonicTime next_garbage_collection_deadline;
+    std::optional<IClock::MonotonicTime> retention_retry_deadline;
+    std::optional<IClock::MonotonicTime> garbage_collection_retry_deadline;
     CheckpointErrorDetail worker_exception_fallback;
     CheckpointErrorDetail affinity_exception_fallback;
+    CheckpointErrorDetail retention_exception_fallback;
+    CheckpointErrorDetail garbage_collection_exception_fallback;
     std::mutex mutex;
     std::condition_variable condition;
     bool closing{false};
     bool running{false};
+    std::optional<WorkKind> running_kind;
     bool startup_ready{false};
     std::optional<CheckpointErrorDetail> startup_error;
     std::optional<CheckpointErrorDetail> exit_error;
     std::optional<RuntimeIncarnation> incarnation;
-    std::optional<WorkItem> pending;
+    std::optional<WorkItem> foreground_pending;
+    std::optional<WorkItem> periodic_create_pending;
+    std::size_t foreground_waiters{0U};
+    bool retention_pending{false};
+    bool garbage_collection_pending{false};
     std::uint64_t next_periodic_sequence{1};
     std::thread::id worker_thread_id;
     std::jthread worker;
@@ -306,6 +345,79 @@ struct CheckpointService::Implementation {
   CheckpointErrorDetail scheduler_exception_fallback;
   std::jthread scheduler;
   inline static thread_local Implementation *worker_context = nullptr;
+
+  struct DueWorkUpdate {
+    bool notify_worker{false};
+    std::optional<CheckpointErrorDetail> scheduling_error;
+  };
+
+  [[nodiscard]] DueWorkUpdate
+  promote_due_work_locked(Slot &slot, IClock::MonotonicTime now) {
+    DueWorkUpdate update;
+    if (slot.closing || stopping.load(std::memory_order_acquire)) {
+      return update;
+    }
+
+    if (now >= slot.next_create_deadline) {
+      auto next =
+          next_deadline(now, slot.registration.checkpoint.interval, nullptr);
+      if (next) {
+        slot.next_create_deadline = *next;
+      } else {
+        slot.next_create_deadline = IClock::MonotonicTime::max();
+        update.scheduling_error = std::move(next.error());
+      }
+      if (!slot.running && !slot.periodic_create_pending.has_value()) {
+        slot.periodic_create_pending = WorkItem{
+            .kind = WorkKind::create,
+            .periodic = true,
+            .periodic_sequence = slot.next_periodic_sequence++,
+            .request_id = std::nullopt,
+            .operation_id = std::nullopt,
+            .completion = nullptr,
+            .exception_fallback =
+                make_error(StableErrorCode::resource_exhausted,
+                           "periodic checkpoint exhausted memory", nullptr,
+                           true, StorageSideEffect::publication_may_be_visible),
+        };
+        update.notify_worker = true;
+      }
+    }
+
+    if (now >= slot.next_garbage_collection_deadline) {
+      auto next =
+          next_deadline(now,
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            kGarbageCollectionInterval),
+                        nullptr);
+      if (next) {
+        slot.next_garbage_collection_deadline = *next;
+      } else {
+        slot.next_garbage_collection_deadline = IClock::MonotonicTime::max();
+        if (!update.scheduling_error.has_value()) {
+          update.scheduling_error = std::move(next.error());
+        }
+      }
+      if (!slot.garbage_collection_retry_deadline.has_value()) {
+        slot.garbage_collection_pending = true;
+        update.notify_worker = true;
+      }
+    }
+
+    if (slot.retention_retry_deadline.has_value() &&
+        now >= *slot.retention_retry_deadline) {
+      slot.retention_retry_deadline.reset();
+      slot.retention_pending = true;
+      update.notify_worker = true;
+    }
+    if (slot.garbage_collection_retry_deadline.has_value() &&
+        now >= *slot.garbage_collection_retry_deadline) {
+      slot.garbage_collection_retry_deadline.reset();
+      slot.garbage_collection_pending = true;
+      update.notify_worker = true;
+    }
+    return update;
+  }
 
   [[nodiscard]] CheckpointResult<void>
   register_container(const ContainerRegistration &registration,
@@ -364,13 +476,24 @@ struct CheckpointService::Implementation {
         }
       }
 
-      auto deadline = next_deadline(
-          clock.monotonic_now(), registration.checkpoint.interval, &request_id);
-      if (!deadline) {
-        return std::unexpected(std::move(deadline.error()));
+      const auto now = clock.monotonic_now();
+      auto create_deadline =
+          next_deadline(now, registration.checkpoint.interval, &request_id);
+      if (!create_deadline) {
+        return std::unexpected(std::move(create_deadline.error()));
+      }
+      auto garbage_collection_deadline =
+          next_deadline(now,
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            kGarbageCollectionInterval),
+                        &request_id);
+      if (!garbage_collection_deadline) {
+        return std::unexpected(std::move(garbage_collection_deadline.error()));
       }
 
-      auto slot = std::make_shared<Slot>(registration, std::move(*deadline));
+      auto slot =
+          std::make_shared<Slot>(registration, std::move(*create_deadline),
+                                 std::move(*garbage_collection_deadline));
       try {
         slot->worker =
             std::jthread([this, slot](std::stop_token) { worker_loop(slot); });
@@ -467,16 +590,18 @@ struct CheckpointService::Implementation {
               "a checkpoint worker cannot unregister its own container",
               &request_id));
         }
-        if (slot->running ||
-            (slot->pending.has_value() && !slot->pending->periodic)) {
+        if (slot->running || slot->foreground_pending.has_value()) {
           return std::unexpected(
               make_error(StableErrorCode::conflict,
                          "container has an active checkpoint operation",
                          &request_id, true));
         }
         slot->closing = true;
-        if (slot->pending.has_value())
-          slot->pending.reset();
+        slot->periodic_create_pending.reset();
+        slot->retention_pending = false;
+        slot->garbage_collection_pending = false;
+        slot->retention_retry_deadline.reset();
+        slot->garbage_collection_retry_deadline.reset();
       }
       slot->condition.notify_all();
       timer.interrupt();
@@ -543,35 +668,48 @@ struct CheckpointService::Implementation {
       auto completion =
           std::make_shared<std::promise<CheckpointResult<void>>>();
       auto future = completion->get_future();
+      WorkItem item{
+          .kind = kind,
+          .periodic = false,
+          .periodic_sequence = 0,
+          .request_id = request_id,
+          .operation_id = operation_id,
+          .completion = completion,
+          .exception_fallback = make_error(
+              StableErrorCode::resource_exhausted,
+              "checkpoint operation exhausted memory", &request_id, true,
+              kind == WorkKind::create
+                  ? StorageSideEffect::publication_may_be_visible
+                  : StorageSideEffect::none,
+              kind == WorkKind::restore
+                  ? RuntimeSideEffect::incarnation_may_exist
+                  : RuntimeSideEffect::none),
+      };
       {
         std::unique_lock slot_lock{slot->mutex};
-        slot->condition.wait(slot_lock, [&] {
-          return slot->closing || stopping.load(std::memory_order_acquire) ||
-                 (!slot->running && !slot->pending.has_value());
-        });
+        ++slot->foreground_waiters;
+        try {
+          slot->condition.wait(slot_lock, [&] {
+            return slot->closing || stopping.load(std::memory_order_acquire) ||
+                   (!slot->running && !slot->foreground_pending.has_value());
+          });
+        } catch (...) {
+          --slot->foreground_waiters;
+          slot_lock.unlock();
+          slot->condition.notify_all();
+          throw;
+        }
         if (slot->closing || stopping.load(std::memory_order_acquire)) {
+          --slot->foreground_waiters;
+          slot_lock.unlock();
+          slot->condition.notify_all();
           return std::unexpected(make_error(
               StableErrorCode::unavailable,
               "container registration is closing and accepts no operations",
               &request_id));
         }
-        slot->pending = WorkItem{
-            .kind = kind,
-            .periodic = false,
-            .periodic_sequence = 0,
-            .request_id = request_id,
-            .operation_id = operation_id,
-            .completion = completion,
-            .exception_fallback = make_error(
-                StableErrorCode::resource_exhausted,
-                "checkpoint operation exhausted memory", &request_id, true,
-                kind == WorkKind::create
-                    ? StorageSideEffect::publication_may_be_visible
-                    : StorageSideEffect::none,
-                kind == WorkKind::restore
-                    ? RuntimeSideEffect::incarnation_may_exist
-                    : RuntimeSideEffect::none),
-        };
+        slot->foreground_pending = std::move(item);
+        --slot->foreground_waiters;
       }
       slot->condition.notify_all();
       completion.reset();
@@ -645,9 +783,11 @@ struct CheckpointService::Implementation {
         {
           const std::scoped_lock slot_lock{slot->mutex};
           slot->closing = true;
-          if (slot->pending.has_value() && slot->pending->periodic) {
-            slot->pending.reset();
-          }
+          slot->periodic_create_pending.reset();
+          slot->retention_pending = false;
+          slot->garbage_collection_pending = false;
+          slot->retention_retry_deadline.reset();
+          slot->garbage_collection_retry_deadline.reset();
         }
         slot->condition.notify_all();
       }
@@ -731,44 +871,87 @@ struct CheckpointService::Implementation {
 
       while (true) {
         std::optional<WorkItem> item;
+        std::optional<WorkKind> kind;
+        std::optional<CheckpointErrorDetail> scheduling_error;
         {
           std::unique_lock slot_lock{slot->mutex};
           slot->condition.wait(slot_lock, [&] {
-            return slot->closing || slot->pending.has_value();
+            return slot->closing || slot->foreground_pending.has_value() ||
+                   (slot->foreground_waiters == 0U &&
+                    (slot->periodic_create_pending.has_value() ||
+                     slot->retention_pending ||
+                     slot->garbage_collection_pending));
           });
-          if (!slot->pending.has_value()) {
-            if (slot->closing) {
-              break;
-            }
+
+          auto promoted = promote_due_work_locked(*slot, clock.monotonic_now());
+          scheduling_error = std::move(promoted.scheduling_error);
+
+          if (slot->foreground_pending.has_value()) {
+            item = std::move(*slot->foreground_pending);
+            slot->foreground_pending.reset();
+            kind = item->kind;
+          } else if (slot->foreground_waiters == 0U &&
+                     slot->periodic_create_pending.has_value()) {
+            item = std::move(*slot->periodic_create_pending);
+            slot->periodic_create_pending.reset();
+            kind = WorkKind::create;
+          } else if (slot->foreground_waiters == 0U &&
+                     slot->retention_pending) {
+            slot->retention_pending = false;
+            kind = WorkKind::retention;
+          } else if (slot->foreground_waiters == 0U &&
+                     slot->garbage_collection_pending) {
+            slot->garbage_collection_pending = false;
+            kind = WorkKind::garbage_collection;
+          } else if (slot->closing) {
+            break;
+          } else {
             continue;
           }
-          item = std::move(*slot->pending);
-          slot->pending.reset();
+
           slot->running = true;
+          slot->running_kind = *kind;
         }
         slot->condition.notify_all();
-
-        auto result = execute_item(slot, *item);
-        {
-          const std::scoped_lock slot_lock{slot->mutex};
-          slot->running = false;
+        if (scheduling_error.has_value()) {
+          log_service_failure(logger, "checkpoint scheduling failed",
+                              *scheduling_error,
+                              &slot->registration.container_id);
         }
-        slot->condition.notify_all();
 
-        if (item->completion != nullptr) {
-          try {
-            item->completion->set_value(std::move(result));
-          } catch (const std::future_error &error) {
-            auto detail = make_error(StableErrorCode::internal,
-                                     "deliver checkpoint operation result: " +
-                                         std::string{error.what()});
-            log_service_failure(logger,
-                                "checkpoint worker result delivery failed",
-                                detail, &slot->registration.container_id);
+        if (item.has_value()) {
+          auto result = execute_item(slot, *item);
+          {
+            const std::scoped_lock slot_lock{slot->mutex};
+            slot->running = false;
+            slot->running_kind.reset();
           }
-        } else if (!result) {
-          log_service_failure(logger, "periodic checkpoint failed",
-                              result.error(), &slot->registration.container_id);
+          slot->condition.notify_all();
+
+          if (item->completion != nullptr) {
+            try {
+              item->completion->set_value(std::move(result));
+            } catch (const std::future_error &error) {
+              auto detail = make_error(StableErrorCode::internal,
+                                       "deliver checkpoint operation result: " +
+                                           std::string{error.what()});
+              log_service_failure(logger,
+                                  "checkpoint worker result delivery failed",
+                                  detail, &slot->registration.container_id);
+            }
+          } else if (!result) {
+            log_service_failure(logger, "periodic checkpoint failed",
+                                result.error(),
+                                &slot->registration.container_id);
+          }
+        } else {
+          execute_maintenance(slot, *kind);
+          {
+            const std::scoped_lock slot_lock{slot->mutex};
+            slot->running = false;
+            slot->running_kind.reset();
+          }
+          slot->condition.notify_all();
         }
       }
     } catch (const std::bad_alloc &) {
@@ -881,6 +1064,7 @@ struct CheckpointService::Implementation {
                     .checkpoint_cpu =
                         slot->registration.checkpoint.checkpoint_cpu,
                 },
+            .keep_last = slot->registration.checkpoint.keep_last,
         });
         if (!created) {
           auto error = std::move(created.error());
@@ -890,7 +1074,17 @@ struct CheckpointService::Implementation {
         {
           const std::scoped_lock slot_lock{slot->mutex};
           slot->incarnation = std::move(created->source_incarnation);
+          if (!slot->closing && !stopping.load(std::memory_order_acquire)) {
+            if (!slot->garbage_collection_retry_deadline.has_value()) {
+              slot->garbage_collection_pending = true;
+            }
+            if (!created->retention_complete &&
+                !slot->retention_retry_deadline.has_value()) {
+              slot->retention_pending = true;
+            }
+          }
         }
+        slot->condition.notify_all();
         return {};
       }
 
@@ -963,6 +1157,120 @@ struct CheckpointService::Implementation {
     }
   }
 
+  void schedule_maintenance_retry(const std::shared_ptr<Slot> &slot,
+                                  WorkKind kind) noexcept {
+    const auto now = clock.monotonic_now();
+    const auto retry_interval =
+        std::chrono::duration_cast<IClock::MonotonicTime::duration>(
+            kMaintenanceRetryInterval);
+    const auto deadline = IClock::MonotonicTime::max() - now < retry_interval
+                              ? IClock::MonotonicTime::max()
+                              : now + retry_interval;
+    bool armed = false;
+    {
+      const std::scoped_lock slot_lock{slot->mutex};
+      if (!slot->closing && !stopping.load(std::memory_order_acquire)) {
+        if (kind == WorkKind::retention) {
+          slot->retention_pending = false;
+          slot->retention_retry_deadline = deadline;
+        } else {
+          slot->garbage_collection_pending = false;
+          slot->garbage_collection_retry_deadline = deadline;
+        }
+        armed = true;
+      }
+    }
+    if (armed) {
+      timer.interrupt();
+    }
+  }
+
+  void maintenance_failed(const std::shared_ptr<Slot> &slot, WorkKind kind,
+                          const CheckpointErrorDetail &error) noexcept {
+    log_service_failure(logger,
+                        kind == WorkKind::retention
+                            ? "checkpoint retention failed"
+                            : "checkpoint garbage collection failed",
+                        error, &slot->registration.container_id);
+    if (error.retryable) {
+      schedule_maintenance_retry(slot, kind);
+    }
+  }
+
+  void execute_maintenance(const std::shared_ptr<Slot> &slot,
+                           WorkKind kind) noexcept {
+    try {
+      if (kind == WorkKind::retention) {
+        auto report =
+            operations.apply_retention(slot->registration.container_id,
+                                       slot->registration.checkpoint.keep_last);
+        if (!report) {
+          maintenance_failed(slot, kind, report.error());
+          return;
+        }
+        if (!report->complete) {
+          schedule_maintenance_retry(slot, kind);
+          return;
+        }
+        {
+          const std::scoped_lock slot_lock{slot->mutex};
+          slot->retention_retry_deadline.reset();
+        }
+      } else {
+        auto report =
+            operations.collect_garbage(slot->registration.container_id);
+        if (!report) {
+          maintenance_failed(slot, kind, report.error());
+          return;
+        }
+        {
+          const std::scoped_lock slot_lock{slot->mutex};
+          slot->garbage_collection_retry_deadline.reset();
+          if (!slot->closing && !stopping.load(std::memory_order_acquire)) {
+            slot->garbage_collection_pending =
+                slot->garbage_collection_pending || report->more_work;
+          }
+        }
+      }
+      slot->condition.notify_all();
+    } catch (const std::bad_alloc &) {
+      auto error = exception_error_or_fallback(
+          kind == WorkKind::retention ? "checkpoint retention worker"
+                                      : "checkpoint garbage collection worker",
+          nullptr, nullptr, true, StorageSideEffect::publication_may_be_visible,
+          RuntimeSideEffect::none,
+          kind == WorkKind::retention
+              ? slot->retention_exception_fallback
+              : slot->garbage_collection_exception_fallback);
+      error.retryable = true;
+      maintenance_failed(slot, kind, error);
+    } catch (const std::exception &exception) {
+      auto error = exception_error_or_fallback(
+          kind == WorkKind::retention ? "checkpoint retention worker"
+                                      : "checkpoint garbage collection worker",
+          &exception, nullptr, false,
+          StorageSideEffect::publication_may_be_visible,
+          RuntimeSideEffect::none,
+          kind == WorkKind::retention
+              ? slot->retention_exception_fallback
+              : slot->garbage_collection_exception_fallback);
+      error.retryable = true;
+      maintenance_failed(slot, kind, error);
+    } catch (...) {
+      auto error = exception_error_or_fallback(
+          kind == WorkKind::retention ? "checkpoint retention worker"
+                                      : "checkpoint garbage collection worker",
+          nullptr, nullptr, false,
+          StorageSideEffect::publication_may_be_visible,
+          RuntimeSideEffect::none,
+          kind == WorkKind::retention
+              ? slot->retention_exception_fallback
+              : slot->garbage_collection_exception_fallback);
+      error.retryable = true;
+      maintenance_failed(slot, kind, error);
+    }
+  }
+
   void fail_worker(const std::shared_ptr<Slot> &slot,
                    CheckpointErrorDetail error) noexcept {
     log_service_failure(logger, "checkpoint worker stopped unexpectedly", error,
@@ -977,7 +1285,12 @@ struct CheckpointService::Implementation {
       } else {
         slot->exit_error.emplace(std::move(error));
       }
-      slot->pending.reset();
+      slot->foreground_pending.reset();
+      slot->periodic_create_pending.reset();
+      slot->retention_pending = false;
+      slot->garbage_collection_pending = false;
+      slot->retention_retry_deadline.reset();
+      slot->garbage_collection_retry_deadline.reset();
     }
     slot->condition.notify_all();
   }
@@ -1008,40 +1321,27 @@ struct CheckpointService::Implementation {
                 stop_token.stop_requested()) {
               continue;
             }
-            if (now >= slot->next_deadline) {
-              auto next = next_deadline(
-                  now, slot->registration.checkpoint.interval, nullptr);
-              if (next) {
-                slot->next_deadline = *next;
-              } else {
-                slot->next_deadline = IClock::MonotonicTime::max();
-                scheduling_error = std::move(next.error());
-              }
-              if (!slot->running && !slot->pending.has_value()) {
-                slot->pending = WorkItem{
-                    .kind = WorkKind::create,
-                    .periodic = true,
-                    .periodic_sequence = slot->next_periodic_sequence++,
-                    .request_id = std::nullopt,
-                    .operation_id = std::nullopt,
-                    .completion = nullptr,
-                    .exception_fallback = make_error(
-                        StableErrorCode::resource_exhausted,
-                        "periodic checkpoint exhausted memory", nullptr, true,
-                        StorageSideEffect::publication_may_be_visible),
-                };
-                notify_worker = true;
-              }
+
+            auto promoted = promote_due_work_locked(*slot, now);
+            notify_worker = promoted.notify_worker;
+            scheduling_error = std::move(promoted.scheduling_error);
+
+            earliest = std::min(earliest, slot->next_create_deadline);
+            earliest =
+                std::min(earliest, slot->next_garbage_collection_deadline);
+            if (slot->retention_retry_deadline.has_value()) {
+              earliest = std::min(earliest, *slot->retention_retry_deadline);
             }
-            if (slot->next_deadline < earliest) {
-              earliest = slot->next_deadline;
+            if (slot->garbage_collection_retry_deadline.has_value()) {
+              earliest =
+                  std::min(earliest, *slot->garbage_collection_retry_deadline);
             }
           }
           if (notify_worker) {
             slot->condition.notify_all();
           }
           if (scheduling_error.has_value()) {
-            log_service_failure(logger, "periodic checkpoint scheduling failed",
+            log_service_failure(logger, "checkpoint scheduling failed",
                                 *scheduling_error,
                                 &slot->registration.container_id);
           }

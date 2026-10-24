@@ -8,8 +8,9 @@ remaining lifecycle work.
 
 The repository contains tested implementations of Manifest v1, filesystem storage,
 chunking/reassembly, the Linux process and affinity layer, the Podman adapter,
-checkpoint creation, restore/fallback/cold start, the checkpoint service core, and
-its production composition in `//src/hypervisor:gravesentinel_hypervisor`.
+checkpoint creation, restore/fallback/cold start, retention, chunk garbage
+collection, startup storage recovery, the checkpoint service core, and their
+production composition in `//src/hypervisor:gravesentinel_hypervisor`.
 
 The composition exposes a versioned, bounded request/response JSON protocol over a
 local `AF_UNIX/SOCK_SEQPACKET` socket. The concrete privilege-free scheduler client
@@ -30,10 +31,16 @@ indeterminate. Its in-memory/recovered registry is also bounded and does not evi
 completed history: once full, it rejects new unique submissions while still serving
 known duplicates and status queries.
 
+Committed creates apply `keep_last` retention immediately under their create lease.
+The service retries incomplete retention and runs coalesced, bounded garbage collection
+on the existing per-container workers; startup recovery runs before the service,
+operation journal, and readiness. Background maintenance is internal and does not
+create public operation-journal records.
+
 The remaining important limits are:
 
-- checkpoint retention and garbage collection are not implemented;
-  `CheckpointConfig::keep_last` is validated but has no operational effect;
+- operation-history eviction and administrative pruning are not implemented, so the
+  bounded durable registry can still fill with terminal records;
 - the registration-level optional `RuntimeFingerprint` is validated and carried on
   the wire but is not forwarded into create or restore decisions;
 - an indeterminate operation requires scheduler/operator reconciliation and must not
@@ -53,10 +60,11 @@ daemon-to-Podman/CRIU end-to-end flow has been executed.
 | [Architecture](architecture.md) | Current component status, process boundaries, Bazel graph, IPC/journal behavior, data flows, trust boundaries, and remaining work |
 | [Manifest v1](manifest-v1.md) | Normative persisted manifest schema, canonical JSON, checksum, validation, and limits |
 | [Chunking](chunking.md) | Fixed-size ingest, namespace-local deduplication, immutable tree checks, and verified reassembly |
-| [Filesystem storage](filesystem-storage.md) | On-disk layout, locking, staging, pins, durable publication, reads, cleanup, and known limits |
-| [Checkpoint creation](checkpoint-create.md) | Capture-to-manifest transaction, generation assignment, commit point, cleanup, and indeterminate publication |
+| [Filesystem storage](filesystem-storage.md) | On-disk layout, locking, staging, pins, maintenance records, durable publication/deletion, reads, recovery, and known limits |
+| [Checkpoint creation](checkpoint-create.md) | Capture-to-manifest transaction, generation assignment, commit point, immediate retention, cleanup, and indeterminate publication |
 | [Checkpoint restore](checkpoint-restore.md) | Candidate selection, validation, pinning, absence fence, fallback, cold start, and cleanup |
-| [Service core](service-core.md) | Registration wire schema, CPU validation, workers, periodic scheduling, IPC exposure, concurrency, shutdown, and API limitations |
+| [Maintenance](maintenance.md) | Strict retention, candidate-based chunk GC, startup recovery, scheduling/retry policy, and safety invariants |
+| [Service core](service-core.md) | Registration wire schema, CPU validation, workers, foreground/periodic/maintenance scheduling, IPC exposure, concurrency, shutdown, and API limitations |
 | [Testbed qualification](testbed.md) | Dated Podman/CRIU qualification evidence, exact runtime profile, reproduction commands, and test scope |
 | [ADR 0001](adr/0001-podman-criu-runtime-profile.md) | Accepted rootful Podman/CRIU profile and opaque-artifact decision |
 
@@ -68,8 +76,9 @@ A useful implementation-order reading path is:
 4. [Chunking](chunking.md)
 5. [Checkpoint creation](checkpoint-create.md)
 6. [Checkpoint restore](checkpoint-restore.md)
-7. [Service core](service-core.md)
-8. [Testbed qualification](testbed.md)
+7. [Maintenance](maintenance.md)
+8. [Service core](service-core.md)
+9. [Testbed qualification](testbed.md)
 
 ## Terminology
 
@@ -83,10 +92,10 @@ A useful implementation-order reading path is:
   references.
 - **generation** — positive per-container ordering number. It, not a timestamp,
   determines newest-to-oldest order.
-- **operation** — a create or restore request tracked by the durable IPC operation
-  journal and, when admitted by the service, driving a storage transaction under the
-  per-container lease. Storage reserves operation kinds for retention and GC, but
-  those workflows are not implemented.
+- **operation** — a create or restore request tracked by the durable public IPC
+  operation journal and, when admitted by the service, driving a storage transaction
+  under the per-container lease. Retention and GC use internal lease-only maintenance
+  operations and are not public `OperationStore` records.
 - **candidate** — one committed generation considered during restore.
 - **indeterminate side effect** — an error for which publication may already be
   visible or a runtime incarnation may still exist.
@@ -123,6 +132,15 @@ Fast project checks:
 
 ```text
 bazel test //:checks
+```
+
+Focused stage 11 validation targets include:
+
+```text
+bazel test //tests/unit:checkpoint_maintenance_test
+bazel test //tests/unit:filesystem_storage_test
+bazel test //tests/unit:checkpoint_service_test
+bazel test //tests/unit:checkpoint_creator_test
 ```
 
 Broader repository commands:

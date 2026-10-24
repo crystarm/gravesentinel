@@ -7,8 +7,10 @@ implements storage transactions, immutable file publication, bounded reads,
 per-container locks, operation staging, runtime artifact directories, and
 manifest pins. [Manifest encoding and validation](manifest-v1.md),
 [chunking, chunk hash verification, and reassembly](chunking.md), and the
-implemented create/restore orchestration remain separate layers. Retention,
-garbage collection, and startup recovery are not implemented.
+implemented create/restore orchestration remain separate layers. The backend also
+implements strict retention, candidate-based chunk garbage collection, and conservative
+startup recovery; scheduling policy belongs to `CheckpointService` and
+[`CheckpointMaintenance`](maintenance.md).
 
 The supported MVP profile is a local Linux filesystem that provides:
 
@@ -56,6 +58,9 @@ root/
       manifests/
         <20-digit-generation>.json
         .tmp-<32-lowercase-hex>               # transient or stale manifest temp
+      gc-candidates/
+        <64-lowercase-hex-blake3>             # persisted GC candidate record
+        .tmp-<32-lowercase-hex>               # transient or stale candidate temp
       chunks/
         <two-hex-prefix>/
           <64-lowercase-hex-blake3>
@@ -87,8 +92,9 @@ committed-manifest listing never traverses staging.
 The root-level `tmp/` directory is created, opened, and retained by
 `FilesystemStorage::open`, but the current implementation does not use it.
 Immutable publication creates its hidden temporary in the final destination
-directory so the no-replace operation is necessarily same-filesystem. Consumers
-must not infer a GC or scratch-file contract from the reserved `tmp/` entry.
+directory so the no-replace operation is necessarily same-filesystem. GC state lives
+under each container's `gc-candidates/`; consumers must not infer a scratch-file
+contract from the reserved root `tmp/` entry.
 
 ### Derived keys
 
@@ -109,9 +115,15 @@ values containing `/`, `.` or `..` cannot escape the root.
 
 The immutable `identity` file contains exactly the original `ContainerId` bytes,
 with no header or newline. It binds a container key back to the logical identity
-and makes a key collision or mismatch fail closed with `conflict`. There is no
-corresponding operation identity file: a surviving directory under the derived
-operation key makes reuse fail closed with `conflict`.
+and makes a key collision or mismatch fail closed with `conflict`. During initial
+container creation, `manifests/`, `chunks/`, and `staging/` are made durable before
+`identity` is published last as the namespace completion marker. A crash before
+that publication leaves a partial namespace that startup recovery preserves and a
+later operation can safely complete. Once `identity` exists, every required
+subdirectory must already exist and is opened rather than recreated, so lost
+metadata fails closed instead of being mistaken for a new empty namespace. There
+is no corresponding operation identity file: a surviving directory under the
+derived operation key makes reuse fail closed with `conflict`.
 
 ### Metadata files
 
@@ -121,7 +133,7 @@ format:
 ```text
 format_version=1
 operation_key=<64-lowercase-hex-operation-key>
-kind=<create_checkpoint|restore|retention|garbage_collection>
+kind=<create_checkpoint|restore>
 state=active
 ```
 
@@ -132,7 +144,16 @@ format_version=1
 generation=<unpadded-positive-decimal-generation>
 ```
 
-The pin body is newline-terminated. The lock file is an empty regular file named
+The pin body is newline-terminated. Maintenance uses no staging or `state` file;
+`begin_maintenance` returns only a lease-bound maintenance object.
+
+A GC candidate is named by the exact 64-lowercase-hex chunk hash and contains the
+newline-terminated version, chunk name, first-observed-unreferenced Unix nanoseconds,
+and the observed device, inode, size, `mtime` seconds/nanoseconds, and `ctime`
+seconds/nanoseconds. The normative field order is documented in
+[maintenance.md](maintenance.md#chunk-mark-and-sweep).
+
+The lock file is an empty regular file named
 `<container-key>.lock`. Storage-created regular files request mode `0600`, and
 storage-created directories request mode `0700`; POSIX `openat`/`mkdirat` apply
 the process `umask`, which may remove bits. The implementation does not promise
@@ -141,10 +162,12 @@ exact generated modes under an arbitrary `umask`.
 ### Manifests
 
 Manifest names contain only their zero-padded 20-digit decimal generation and the
-`.json` suffix. This permits newest-to-oldest listing even when a manifest body is
-corrupted and must be rejected later by the strict
-[Manifest v1 decoder](manifest-v1.md#decoder-acceptance-order). Files with other
-names, including generation zero and hidden temporaries, are ignored by listing.
+`.json` suffix. Ordinary restore/create listing ignores other names and leaves body
+validation to the caller, which permits newest-to-oldest fallback even when an older
+body is corrupt. Retention and GC use a stricter root scan: every entry must be a
+canonical positive-generation manifest or the exact `.tmp-<32-lowercase-hex>`
+publication temporary; every manifest is decoded and checked against the namespace and
+filename generation before any deletion.
 A regular file with a valid manifest name but a size greater than 16 MiB causes
 listing to fail as corrupted storage rather than being silently skipped.
 
@@ -156,7 +179,8 @@ generation back to the requested storage reference. A bounded regular old body
 that is malformed, noncanonical, or checksum-invalid remains a listed fallback
 candidate and does not block publication of a strictly newer generation; valid
 old bodies are still checked for namespace binding and `CheckpointId` reuse.
-Published manifests are never replaced or removed by this stage.
+Published manifests are never replaced. Retention durably removes excess manifests
+oldest-first only after the complete strict root and referenced-chunk scan succeeds.
 
 ## Directory-descriptor boundary
 
@@ -185,8 +209,8 @@ identity before returning the operation.
 
 ## Durable immutable publication
 
-Chunks, manifests, container identity, operation state, and pin metadata use the
-same publication primitive:
+Chunks, manifests, GC candidate records, container identity, operation state, and pin
+metadata use the same publication primitive:
 
 1. generate a 128-bit `getrandom` nonce and create the corresponding unique
    hidden file in the destination directory with
@@ -228,20 +252,22 @@ Public read/list paths and chunk reuse additionally sync the relevant data
 directory before reporting durable success. This is not a guarantee that every
 existing regular-file entry is re-synced on every open: in particular, reopening
 an existing permanent lock file does not re-`fsync` the lock file or `locks/`.
-The random temporary namespace does not repeat after process restart; stale
-hidden temporary files remain ignored until conservative GC.
+The random temporary namespace does not repeat after process restart; exact stale
+hidden publication temporaries become eligible for conservative startup recovery after
+the configured grace period.
 
 ## Locks, staging, and pins
 
-`begin_operation` obtains a nonblocking exclusive `flock` on the permanent
-per-container lock file. The lock file is never removed, avoiding split-brain
-locks on different inodes. Create, restore, retention, and conflicting cleanup
-are therefore serialized across both threads and hypervisor processes. A lock
-is held for the lifetime of the move-only `IStorageOperation` and any pin that
-outlives its operation owner.
+`begin_operation` and `begin_maintenance` obtain the same nonblocking exclusive
+`flock` on the permanent per-container lock file; startup recovery takes that lock
+directly. The lock file is never removed, avoiding split-brain locks on different
+inodes. Create, restore, retention, GC, and recovery are therefore serialized across
+both threads and hypervisor processes. A lock is held for the lifetime of the move-only
+operation and any pin that outlives its operation owner. Such an outliving restore pin
+keeps the shared operation state and lease alive, so maintenance is deferred.
 
-Each operation must use a fresh `OperationId`. It creates a unique staging
-directory and a durable, initially empty `runtime-artifact/` child dedicated to
+Each create/restore operation must use a fresh `OperationId`. It creates a unique
+staging directory and a durable, initially empty `runtime-artifact/` child dedicated to
 runtime-produced snapshot data. Non-secret `state` metadata and pin files remain
 in the operation staging root, outside `runtime-artifact/`. The runtime artifact
 path and its captured device/inode identity are exposed separately so adapters
@@ -275,16 +301,20 @@ outcome and must not assume either that staging remains present or that its
 deletion is durable.
 
 A process crash or any surviving staging entry is ignored by committed-manifest
-listing. Conservative stale cleanup and GC policy are intentionally deferred to
-stage 11.
+listing. Startup recovery removes only canonical stale operation-key directories and
+exact stale publication temporaries after its grace period while no live lease exists;
+unknown names and a partial container namespace without `identity` remain untouched.
 
 ## Internal API and errors
 
-`IStorage` owns read-only namespace operations and starts an exclusive
-`IStorageOperation`. Publication is available only through that operation, so a
-caller cannot bypass the required lease:
+`IStorage` owns read-only namespace operations and starts exclusive create/restore and
+lease-only maintenance operations. Concrete `FilesystemStorage` additionally exposes
+startup recovery. Publication is available only through a create/restore operation, so
+a caller cannot bypass the required lease:
 
-- `begin_operation(container, operation, kind)`;
+- `begin_operation(container, operation, create_checkpoint|restore)`, with staging;
+- `begin_maintenance(container, retention|garbage_collection)`, without staging;
+- `recover(options)` on concrete `FilesystemStorage`, before service startup;
 - `contains_chunk` and bounded `read_chunk`;
 - `list_manifests`, returning generations in descending order;
 - bounded `read_manifest(container, generation)`.
@@ -298,7 +328,9 @@ pinning, and cleanup. Algorithm layers use the bound container identity rather
 than a second caller-supplied `ContainerId`, preventing cross-namespace
 read/publish mismatches. Once manifest publication succeeds—or reaches the
 rename-but-directory-fsync indeterminate state—the operation rejects further
-chunk or manifest publication.
+chunk or manifest publication. A confirmed create operation may then invoke immediate
+retention under the same lease. `IStorageMaintenanceOperation` exposes only retention
+or GC for its declared maintenance kind.
 
 Filesystem errors are mapped to stable internal codes: `ENOSPC` and `EDQUOT` to
 `resource_exhausted`; `EACCES`, `EPERM`, and `EROFS` to `permission_denied`;
@@ -310,15 +342,16 @@ they escape the local retry loops. Diagnostics include the failed phase and
 
 ## Verification boundary
 
-Unit tests use a fault-injecting `IFileOperations` decorator over real POSIX
-temporary directories. They cover open/create, partial and interrupted
-read/write, file `fsync`, no-replace rename, directory `fsync`, `ENOSPC`,
-permission errors, re-confirmation after failed directory sync, stale temporary
-files and staging after reopen, opaque mapping of traversal-like IDs, symlink and
-FIFO substitution, missing mandatory namespace entries, generation/body
-binding, tolerance of an older corrupt manifest, immutable chunks, dedicated
-runtime artifact layout and identity, initialization rollback, ordinary cleanup,
-lease lifetime, and RAII pins. These tests require neither root, Podman, nor CRIU.
+`//tests/unit:filesystem_storage_test` uses a fault-injecting `IFileOperations`
+decorator over real POSIX temporary directories. It covers open/create, partial and
+interrupted read/write, file `fsync`, no-replace rename, directory `fsync`, `ENOSPC`,
+permission errors, re-confirmation after failed directory sync, canonical startup
+cleanup, partial/unknown namespace preservation, strict zero-deletion failure,
+oldest-first retention, lease-only maintenance exclusion, two-pass candidate GC,
+identity/root revalidation, deletion bounds, shared chunks, opaque mapping of
+traversal-like IDs, symlink and FIFO substitution, immutable chunks, dedicated runtime
+artifact layout and identity, initialization rollback, ordinary cleanup, lease
+lifetime, and RAII pins. These tests require neither root, Podman, nor CRIU.
 
 The current unit suite does not establish mount-ID containment for storage,
 post-unlink cleanup retry behavior, a differing winner in the chunk no-replace

@@ -23,12 +23,15 @@ The current code includes:
 | IPC codec and server | `//src/ipc:ipc_codec`, `//src/ipc:ipc_server` | implemented, unit-tested |
 | Durable async operation store | `//src/ipc:operation_store` | implemented, unit-tested |
 | Scheduler client | `//src/client:scheduler_client` | implemented, unit-tested |
+| Retention, chunk GC, and startup recovery | `//src/core:checkpoint_maintenance`, `//src/storage:filesystem_storage` | implemented, unit-tested |
 | Production composition | `//src/hypervisor:gravesentinel_hypervisor` | implemented and buildable |
-| Retention and garbage collection | operation kinds are reserved | **not implemented** |
 
 `gravesentinel_hypervisor` constructs filesystem storage, hashing, chunking, the
-Podman adapter, create/restore coordinators, `CheckpointService`, the durable operation
-store, RPC handler, and Unix socket server. Storage runtime-artifact paths and the
+Podman adapter, create/restore coordinators, `CheckpointMaintenance`,
+`CheckpointService`, the durable operation store, RPC handler, and Unix socket server.
+After acquiring the process lock and opening storage, it completes bounded startup
+recovery before constructing the service or journal and before readiness. Storage
+runtime-artifact paths and the
 Podman adapter share `checkpoint-data` as their trusted staging boundary; the adapter
 unit test obtains its capture directory from a real `FilesystemStorage` operation.
 This is a real production composition, not a stub. Unit tests cover its components and
@@ -57,6 +60,7 @@ flowchart TB
     Service[CheckpointService]
     Create[CheckpointCreator]
     Restore[RestoreCoordinator]
+    Maintenance[CheckpointMaintenance]
     Runtime[PodmanAdapter and Linux runtime]
     Storage[FilesystemStorage and chunking]
 
@@ -68,10 +72,12 @@ flowchart TB
     Journal -->|execute accepted create and restore| Service
     Service --> Create
     Service --> Restore
+    Service --> Maintenance
     Create --> Runtime
     Create --> Storage
     Restore --> Runtime
     Restore --> Storage
+    Maintenance --> Storage
 ```
 
 Both ends authenticate their peer with `SO_PEERCRED`. `SchedulerClient` expects the
@@ -108,6 +114,7 @@ flowchart TD
     Service["//src/core:checkpoint_service"]
     Creator["//src/core:checkpoint_creator"]
     Restorer["//src/core:restore_coordinator"]
+    Maintenance["//src/core:checkpoint_maintenance"]
     LinuxRuntime["//src/hypervisor:linux_runtime"]
     Podman["//src/hypervisor:podman_adapter"]
     Chunking["//src/chunking:snapshot_chunker"]
@@ -135,6 +142,7 @@ flowchart TD
     Rpc --> Store
     Service --> Creator
     Service --> Restorer
+    Service --> Maintenance
     Creator --> Chunking
     Creator --> Manifest
     Restorer --> Chunking
@@ -229,9 +237,8 @@ Registration validation requires:
   names and the complete arrays shown above;
 - non-empty fields in the registration-level `RuntimeFingerprint`, if specified.
 
-Two fields currently do not affect the workflow after validation:
+One field currently does not affect the workflow after validation:
 
-- `keep_last`, because retention is not implemented;
 - `ContainerRegistration::runtime_fingerprint`, because create stores the fingerprint
   measured by the adapter, while restore uses the fingerprint from the manifest.
 
@@ -245,8 +252,10 @@ environment. Names and values are validated further; NUL, CR, and LF are prohibi
 `//src/core:ccm_core` declares:
 
 - `ICheckpointService` — synchronous register/unregister/create/restore/shutdown;
-- `IStorage` and `IStorageOperation` — namespace reads, operation leases,
-  publication, pinning, and cleanup;
+- `IStorage`, `IStorageOperation`, and `IStorageMaintenanceOperation` — namespace
+  reads, create/restore leases and staging, lease-only retention/GC, publication,
+  pinning, and cleanup; concrete `FilesystemStorage` additionally exposes startup
+  recovery;
 - `IPodmanAdapter` — compatibility, capture, absence, restore, cold start, and cleanup;
 - `IClock`, `ITimer`, `IHasher`, `IIdGenerator` — injectable dependencies;
 - `ILogger` — structured diagnostic sink;
@@ -271,6 +280,7 @@ following properties apply to the production classes:
 | Same-container serialization within one service | `CheckpointService` |
 | Bounded strict JSON request/response packets | IPC codec and `SOCK_SEQPACKET` server/client |
 | Server and client peer-UID checks | IPC server and `SchedulerClient` via `SO_PEERCRED` |
+| Strict oldest-first retention, candidate-based chunk GC, and startup recovery | `FilesystemStorage` through `CheckpointMaintenance` |
 | Durable operation acceptance, deduplication, and crash classification | `OperationStore` |
 
 All injected implementations must follow the calling layer's thread-safety and
@@ -303,6 +313,7 @@ sequenceDiagram
     C->>C: encode canonical Manifest v1
     C->>F: publish_manifest
     Note over C,F: confirmed publication is the commit point
+    C->>F: apply_retention keep_last under create lease
     C->>F: cleanup staging
     C-->>S: CreatedCheckpoint or structured error
 ```
@@ -311,6 +322,10 @@ The manifest is published last. Before that, published chunks are orphan candida
 and do not constitute a committed checkpoint. A directory-`fsync` failure after the
 manifest rename produces `publication_may_be_visible`: the operation returns failure,
 but the manifest may already appear in the next listing and occupy the generation.
+After confirmed commit, retention strictly validates all roots and removes excess
+manifests oldest-first for `keep_last` `1..3`. Retention failure or exception leaves the
+create successful with `retention_complete = false`; the service schedules a separate
+lease-only retry.
 
 The direct core remains synchronous and does not maintain an idempotency table. In
 the production RPC path, however, `SubmitCreateCheckpoint` is first durably recorded
@@ -375,38 +390,34 @@ Full details: [checkpoint-restore.md](checkpoint-restore.md).
 
 ## Service Core: Concurrency and Scheduling
 
-`CheckpointService` supports at most four registration slots. Each slot has a separate
-persistent worker pinned to `checkpoint_cpu` and a mailbox with capacity one. The
-control caller thread is not rebound.
+`CheckpointService` supports at most four registration slots. Each slot has one
+persistent worker pinned to `checkpoint_cpu`; create, restore, retention, and GC all
+reuse it. There is no fifth CPU-heavy worker. The control caller thread is not rebound.
 
-Guarantees within a single service instance:
+Within a slot, work selection priority is manual foreground, periodic create, retention,
+then GC. Periodic creates skip busy ticks without catch-up. Maintenance uses coalesced
+flags; GC is due every five minutes, and a successful create also requests GC.
+Incomplete immediate retention coalesces a separate retention pass immediately.
+If that pass reports incomplete, or a maintenance pass fails retryably or throws, the
+next retry is delayed by 30 seconds. Non-retryable failures wait for a new create or
+periodic trigger. A GC report with `more_work` coalesces another bounded pass. Continuous
+foreground backlog can delay maintenance until quiescence.
 
-- create and restore for the same `ContainerId` are serialized;
-- operations in different slots may run concurrently;
-- a second synchronous caller waits for the slot to become available;
-- a periodic tick is skipped if the slot is busy, with no catch-up burst;
-- unregister returns a retryable conflict while manual or periodic work is active;
-  otherwise it closes the slot, cancels a pending periodic item, and joins the idle
-  worker before releasing the registration;
-- shutdown closes all slots, stops the scheduler, and joins the workers;
-- a worker catches exceptions from the operation implementation and remains available.
+The same storage `flock` serializes all four operation kinds across threads and
+processes. A restore pin may outlive its operation owner and retains that lease, thereby
+deferring maintenance. Active maintenance makes unregister return a retryable conflict;
+a successful unregister and shutdown drop queued maintenance. Shutdown lets an already
+active bounded pass finish before joining the worker. Background maintenance is logged
+but never entered in the public `OperationStore` journal.
 
-Limitations:
+Limitations remain: FIFO/fairness among foreground callers is not guaranteed; operation
+cancellation and service-level deadlines are absent; a hung collaborator may delay its
+caller and shutdown; periodic/background results are available only through `ILogger`;
+the periodic request ID may repeat after unregister/re-register; scheduler-loop failure
+is not exposed by general health; and affinity restoration errors cannot be reported by
+the destructor.
 
-- FIFO/fairness among multiple manual callers and the scheduler is not guaranteed;
-- operation cancellation and service-level deadlines are not implemented;
-- a hung operation collaborator may delay its operation caller and shutdown
-  indefinitely; unregister rejects an active slot instead of waiting for it;
-- a periodic result is available only through `ILogger`;
-- a periodic `RequestId` is constructed as `periodic-<container>-<slot-sequence>` and
-  may repeat after unregister/re-register; `OperationId` is generated separately;
-- an exception in the scheduler loop is logged and terminates periodic scheduling;
-  the general IPC health response does not expose that specific scheduler-thread
-  failure;
-- affinity restoration may fail, and that error is returned by explicit
-  unregister/shutdown; the destructor cannot report it to the caller.
-
-Details: [service-core.md](service-core.md).
+Details: [service-core.md](service-core.md) and [maintenance.md](maintenance.md).
 
 ## Persistence Boundary
 
@@ -421,6 +432,7 @@ or a chunk. With the production defaults, the daemon-owned persistence layout is
     containers/<container-key>/
       identity
       manifests/<20-digit-generation>.json
+      gc-candidates/<64-hex-blake3>
       chunks/<two-hex-prefix>/<64-hex-blake3>
       staging/<operation-key>/...
     locks/<container-key>.lock
@@ -428,14 +440,25 @@ or a chunk. With the production defaults, the daemon-owned persistence layout is
 ```
 
 Raw checkpoint IDs do not become storage path components: storage uses
-domain-separated BLAKE3 keys and checks the immutable `identity`. The storage
-operation lease is held until the operation state is destroyed; a longer-lived pin
-may extend the lease. Manifest/chunk publication is immutable and no-replace.
+domain-separated BLAKE3 keys and checks the immutable `identity`. The storage operation
+lease is held until the operation state is destroyed; a
+longer-lived pin extends the lease. Manifest/chunk publication and GC candidate
+publication are immutable and no-replace; retention and sweep unlink durably with a
+parent-directory `fsync`.
 
 `hypervisor.lock` is opened without following symlinks, validated as a single-link
 regular file owned by the daemon, forced to mode `0600`, and exclusively locked before
 checkpoint storage or `operations.jsonl` is opened. The lock remains held through
 service shutdown, so a losing second process cannot recover or compact the live journal.
+
+Before `operations.jsonl` or the service is created, startup recovery takes each
+available container lease, removes only exact stale staging/publication-temporary names
+after one hour, and runs GC with at most 128 chunk deletions per container per pass.
+It repeats while `more_work` within a bounded 1024-pass startup loop. There is no
+startup retention because registrations and their `keep_last` values are not available.
+Partial namespaces without `identity` and noncanonical recovery names are left
+untouched; an unknown entry in the manifest root of a complete namespace instead fails
+the strict GC scan.
 
 `operations.jsonl` is a separate mode-`0600`, daemon-owned durable journal. Acceptance,
 the transition to `running`, and terminal state changes are appended and `fsync`ed.
@@ -573,29 +596,31 @@ restart. A `running` record is durably changed to `indeterminate` and requires
 reconciliation. Terminal operations are not rerun.
 
 The registry is intentionally bounded and currently has no eviction or operation
-history retention policy. Once `max_records` is reached, new unique operations are
+history retention policy. Background retention, GC, and startup recovery are not
+public operations and create no records in this journal. Once `max_records` is reached,
+new unique operations are
 rejected even if all existing records are terminal; known duplicates and
 `GetOperation` remain available. Journal compaction bounds transition history but does
 not forget deduplication history. Local IPC is therefore authenticated and validated,
 not implicitly trusted.
 
-## Lifecycle and Features Not Yet Implemented
+## Remaining Lifecycle Limitations
 
-The daemon composition, IPC, scheduler client, durable async journal, and journal
-startup classification are implemented. The remaining lifecycle limitations are:
+Retention, conservative chunk GC, stale staging/publication-temporary startup cleanup,
+and startup pass repetition are implemented. The remaining lifecycle limitations are:
 
-1. retention according to `keep_last`, with pin-aware manifest deletion;
-2. garbage collection of orphan chunks, temporary files, and stale operation staging;
-3. automatic reconciliation of indeterminate checkpoint publications or runtime
+1. automatic reconciliation of indeterminate checkpoint publications or runtime
    incarnations;
-4. operation-history retention/administrative pruning to free bounded registry slots;
-5. cancellation and service-level deadlines for already accepted operations;
-6. a recorded end-to-end execution of the complete production daemon flow in the
+2. operation-history retention/administrative pruning to free bounded registry slots;
+3. cancellation and service-level deadlines for already accepted operations;
+4. a recorded end-to-end execution of the complete production daemon flow in the
    qualified rootful Podman/CRIU environment.
 
-Consequently, `keep_last` does not limit the number of manifests, registry saturation
-rejects new unique operations, and an indeterminate operation remains an explicit
-scheduler/operator responsibility.
+Consequently, `keep_last` does limit committed manifests when immediate retention or a
+retry completes, but registry saturation still rejects new unique public operations and
+an indeterminate operation remains an explicit scheduler/operator responsibility. The
+registration-level runtime fingerprint also remains validated but unused by create and
+restore decisions.
 
 ## Build and Checks
 
@@ -608,7 +633,10 @@ The primary check is:
 bazel test //:checks
 ```
 
-It includes the clang-format test and `//tests/unit:unit_tests`. Broader commands are:
+It includes the clang-format test and `//tests/unit:unit_tests`. Focused stage 11
+targets include `//tests/unit:checkpoint_maintenance_test`,
+`//tests/unit:filesystem_storage_test`, `//tests/unit:checkpoint_service_test`, and
+`//tests/unit:checkpoint_creator_test`. Broader commands are:
 
 ```text
 bazel build //...
@@ -626,4 +654,5 @@ successful build or unit-test run does not imply that the destructive production
 end-to-end flow was executed.
 
 Independent profiles `--config=debug`, `--config=release`, `--config=asan`,
-`--config=ubsan`, and `--config=tsan` are available.
+`--config=ubsan`, and `--config=tsan` are available commands; this document does not
+claim that a sanitizer run was performed.

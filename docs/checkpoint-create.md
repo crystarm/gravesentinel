@@ -3,9 +3,10 @@
 ## Scope
 
 `//src/core:checkpoint_creator` is the synchronous create orchestration layer. It
-connects `IPodmanAdapter`, `ISnapshotChunker`, Manifest v1, and `IStorage`; the
-creator itself does not own periodic scheduling, restore selection, retention,
-operation-journal recovery, or garbage collection. The production
+connects `IPodmanAdapter`, `ISnapshotChunker`, Manifest v1, and `IStorage`. It owns
+post-commit immediate retention under the create lease, but not periodic scheduling,
+restore selection, separate maintenance retries, operation-journal recovery, or
+garbage collection. The production
 `gravesentinel_hypervisor` composition instantiates this layer through
 `CheckpointOperations` and `CheckpointService`, with asynchronous IPC submission
 provided by the outer durable operation store. See [Checkpoint service
@@ -17,11 +18,12 @@ CPU assignment. In the production IPC path, `SubmitCreateCheckpoint` supplies th
 request ID and the operation store deterministically derives the operation ID before
 the synchronous service call. A direct successful `CheckpointCreator::create`
 result identifies the immutable `CheckpointId`, its per-container generation, the
-captured runtime incarnation, and whether post-commit staging cleanup was confirmed.
-The `ICheckpointService::create_checkpoint` facade deliberately returns only
+captured runtime incarnation, whether post-commit retention completed, and whether
+staging cleanup was confirmed. The `ICheckpointService::create_checkpoint` facade
+deliberately returns only
 `CheckpointResult<void>` and retains the source incarnation internally; the IPC
 operation status likewise does not expose checkpoint identity, generation, or the
-cleanup-completion flag.
+retention/staging-completion flags.
 
 ## State machine
 
@@ -51,8 +53,8 @@ Creation begins with
 `IStorage::begin_operation(..., StorageOperationKind::create_checkpoint)`. With
 production `FilesystemStorage`, the returned move-only operation owns an exclusive
 cross-process per-container storage lease until the operation object is destroyed.
-Create, restore, retention, and conflicting cleanup through that backend therefore
-cannot overlap for one logical container, while different containers have
+Create, restore, retention, garbage collection, and startup cleanup through that
+backend therefore cannot overlap for one logical container, while different containers have
 independent leases. An arbitrary `IStorage` implementation must provide equivalent
 semantics for this orchestration guarantee to hold.
 
@@ -126,8 +128,17 @@ succeeds or reaches an indeterminate rename-completed outcome. A custom
 the same manifest-last rule; the type system does not restrict it to chunk-only
 methods.
 
-Only confirmed manifest publication transitions to `COMMITTED`. Previous
-manifests are not removed or modified. Retention is not implemented.
+Only confirmed manifest publication transitions to `COMMITTED`. The creator then
+calls `apply_retention(request.keep_last)` on the still-active create operation before
+staging cleanup. `keep_last` is validated as `1..3`; storage strictly validates all
+manifest roots and referenced chunk sizes, then removes excess manifests oldest-first.
+The create lease remains held for publication, retention, and cleanup, so restore and
+separate maintenance cannot overlap this sequence.
+
+The manifest publication remains the commit point. A retention failure, incomplete
+report, or exception cannot cancel the committed create. The rich result returns
+`retention_complete = false`, and the service schedules a lease-only retention retry;
+the IPC operation itself still succeeds because the checkpoint commit succeeded.
 
 ## Failures, cleanup, and crash behavior
 
@@ -137,11 +148,12 @@ chunking, serialization, or commit error is preserved; a cleanup error is added
 to the diagnostic and changes the terminal transaction state to `INCOMPLETE`.
 The operation object is then destroyed and the lease is released.
 
-After confirmed manifest commit, cleanup failure cannot turn the create result
-into failure: the checkpoint is already immutable and visible. The creator
-returns success with `staging_cleanup_complete = false` and logs the cleanup
-reason, leaving stale staging for future recovery/GC. Returning failure here would
-invite a caller to create an unnecessary duplicate checkpoint.
+After confirmed manifest commit, neither retention nor cleanup failure can turn the
+create result into failure: the checkpoint is already immutable and visible. Retention
+failure or exception is logged and leaves `retention_complete = false`; cleanup is still
+attempted. Cleanup failure leaves `staging_cleanup_complete = false` and stale staging
+for the conservative startup recovery path. Returning failure for either post-commit
+maintenance action would invite a caller to create an unnecessary duplicate checkpoint.
 
 If the process crashes before manifest publication, operation staging may remain
 but is never returned by committed-manifest listing and is never used for restore.
@@ -192,27 +204,31 @@ new destructive request.
 The operation registry is bounded and has no eviction policy. When its record limit is
 reached, new unique create/restore submissions are rejected even if retained records
 are terminal; known duplicate submissions and status polling continue to work.
-Checkpoint retention, operation-history pruning, and garbage collection of orphan
-chunks and stale staging are not implemented.
+Operation-history pruning remains unimplemented. Checkpoint retention, garbage
+collection, and startup stale-staging cleanup are implemented as internal work and do
+not add public operation-journal records.
 
 ## Verification
 
 `//tests/unit:checkpoint_creator_test` uses fake runtime/storage/clock/ID/logger
 collaborators and deterministic chunk data. It verifies the exact state machine,
-lease-bound generation selection, metadata, manifest-last order, retry and chunk
-reuse, independent containers, and faults in capture, source read, hash, chunk
-publication, manifest serialization/commit, and cleanup. Every failed attempt is
+lease-bound generation selection, metadata, manifest-last order, immediate retention,
+post-commit retention failure/exception handling, retry and chunk reuse, independent
+containers, and faults in capture, source read, hash, chunk publication, manifest
+serialization/commit, and cleanup. Every failed attempt is
 checked against three pre-existing canonical checkpoints whose referenced chunks
 are reassembled byte-for-byte with the production reassembler.
 
-The lower-level production storage, chunker, Manifest v1 codec, and Podman adapter
-retain their own unit and opt-in rootful integration tests. `CheckpointCreator` tests
-cover the synchronous creator separately. Operation-store, RPC-handler, and
+The lower-level production storage, maintenance layer, chunker, Manifest v1 codec, and
+Podman adapter retain their own unit and opt-in rootful integration tests. Focused
+maintenance coverage includes `//tests/unit:checkpoint_maintenance_test`,
+`//tests/unit:filesystem_storage_test`, and `//tests/unit:checkpoint_service_test`.
+`CheckpointCreator` tests cover the synchronous creator separately. Operation-store, RPC-handler, and
 server/client tests cover asynchronous submission, deduplication, and polling with
 fake executors or services; no test wires the real `CheckpointCreator` through the
 operation store and IPC stack. The Podman adapter capture test does obtain its artifact
 directory from a real `FilesystemStorage` operation, but this still does not establish
-that the complete production daemon-to-Podman/CRIU flow was executed end to end. The destructive runtime path still requires the qualified
-rootful environment. Creator tests also do not cover every possible collaborator
+that the complete production daemon-to-Podman/CRIU flow was executed end to end. The
+destructive runtime path still requires the qualified rootful environment. Creator tests also do not cover every possible collaborator
 contract violation, such as a foreign pre-populated correlation ID or a mismatched
 source-incarnation reference.

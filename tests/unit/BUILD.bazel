@@ -2,6 +2,14 @@ load("//build_defs:cc.bzl", "gravesentinel_cc_test")
 
 package(default_visibility = ["//visibility:private"])
 
+sh_test(
+    name = "hypervisor_cli_test",
+    srcs = ["hypervisor_cli_test.sh"],
+    args = ["$(location //src/hypervisor:gravesentinel_hypervisor)"],
+    data = ["//src/hypervisor:gravesentinel_hypervisor"],
+    size = "small",
+)
+
 gravesentinel_cc_test(
     name = "value_types_test",
     srcs = ["value_types_test.cxx"],
@@ -193,6 +201,7 @@ test_suite(
         ":config_validation_test",
         ":contracts_compile_test",
         ":filesystem_storage_test",
+        ":hypervisor_cli_test",
         ":hypervisor_rpc_handler_test",
         ":ipc_codec_test",
         ":ipc_server_client_test",

@@ -16,6 +16,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -29,6 +30,7 @@
 #include <sys/types.h>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -45,23 +47,26 @@ struct Config {
   std::optional<uid_t> scheduler_uid;
   std::optional<gid_t> socket_gid;
   unsigned socket_mode{0660};
+  std::chrono::seconds garbage_collection_grace_period{std::chrono::hours{1}};
 };
 
 enum class ParseResult { success, help, error };
 
 void print_usage(std::ostream &output) {
-  output << "Usage: gravesentinel_hypervisor [OPTIONS]\n"
-            "  --socket PATH             Unix socket path\n"
-            "  --storage DIR            Persistent storage root\n"
-            "  --podman PATH            Podman executable (default: "
-            "/usr/bin/podman)\n"
-            "  --criu PATH              CRIU executable (default: "
-            "/usr/sbin/criu)\n"
-            "  --scheduler-uid UID      Authorized scheduler UID\n"
-            "  --socket-gid GID         Group owner for the Unix socket\n"
-            "  --socket-mode OCTAL      Unix socket mode (default: 0660)\n"
-            "  --runtime-profile NAME   Must be podman-criu-rootful-v1\n"
-            "  --help                   Show this help\n";
+  output
+      << "Usage: gravesentinel_hypervisor [OPTIONS]\n"
+         "  --socket PATH             Unix socket path\n"
+         "  --storage DIR            Persistent storage root\n"
+         "  --podman PATH            Podman executable (default: "
+         "/usr/bin/podman)\n"
+         "  --criu PATH              CRIU executable (default: "
+         "/usr/sbin/criu)\n"
+         "  --scheduler-uid UID      Authorized scheduler UID\n"
+         "  --socket-gid GID         Group owner for the Unix socket\n"
+         "  --socket-mode OCTAL      Unix socket mode (default: 0660)\n"
+         "  --runtime-profile NAME   Must be podman-criu-rootful-v1\n"
+         "  --gc-grace-seconds N     Unreferenced chunk grace (default: 3600)\n"
+         "  --help                   Show this help\n";
 }
 
 [[nodiscard]] std::optional<std::uintmax_t>
@@ -101,6 +106,14 @@ parse_unsigned(const std::string_view text, const int base) {
       if (!mode || *mode > 0777U)
         return ParseResult::error;
       config.socket_mode = static_cast<unsigned>(*mode);
+    } else if (argument == "--gc-grace-seconds") {
+      const auto seconds = parse_unsigned(value, 10);
+      const auto maximum_seconds = static_cast<std::uintmax_t>(
+          std::numeric_limits<std::chrono::seconds::rep>::max());
+      if (!seconds || *seconds > maximum_seconds)
+        return ParseResult::error;
+      config.garbage_collection_grace_period = std::chrono::seconds{
+          static_cast<std::chrono::seconds::rep>(*seconds)};
     } else if (argument == "--scheduler-uid") {
       const auto uid = parse_unsigned(value, 10);
       const auto invalid_uid =
@@ -138,6 +151,69 @@ parse_unsigned(const std::string_view text, const int base) {
     return true;
   std::cerr << "cannot create " << purpose << ": " << error.message() << '\n';
   return false;
+}
+
+[[nodiscard]] std::optional<
+    std::vector<gravesentinel::ccm::EnvironmentVariable>>
+inherited_runtime_environment() {
+  constexpr std::array<std::string_view, 4> allowed_names{
+      "DBUS_SESSION_BUS_ADDRESS",
+      "HOME",
+      "PATH",
+      "XDG_RUNTIME_DIR",
+  };
+  constexpr std::size_t maximum_value_bytes = 64U * 1024U;
+
+  std::vector<gravesentinel::ccm::EnvironmentVariable> environment;
+  environment.reserve(allowed_names.size());
+  for (const auto name : allowed_names) {
+    const std::string name_string{name};
+    const char *const value = std::getenv(name_string.c_str());
+    if (value == nullptr)
+      continue;
+    const std::string value_string{value};
+    if (value_string.size() > maximum_value_bytes) {
+      std::cerr << "allowlisted runtime environment value is too large: "
+                << name << '\n';
+      return std::nullopt;
+    }
+    environment.push_back(gravesentinel::ccm::EnvironmentVariable{
+        .name = name_string,
+        .value = value_string,
+    });
+  }
+  return environment;
+}
+
+void write_log_value(std::ostream &output, const std::string_view value) {
+  output << '"';
+  for (const char character : value) {
+    switch (character) {
+    case '\\':
+      output << "\\\\";
+      break;
+    case '"':
+      output << "\\\"";
+      break;
+    case '\n':
+      output << "\\n";
+      break;
+    case '\r':
+      output << "\\r";
+      break;
+    case '\t':
+      output << "\\t";
+      break;
+    default:
+      if (static_cast<unsigned char>(character) < 0x20U) {
+        output << '?';
+      } else {
+        output << character;
+      }
+      break;
+    }
+  }
+  output << '"';
 }
 
 class SystemClock final : public gravesentinel::ccm::IClock {
@@ -215,14 +291,20 @@ class StderrLogger final : public gravesentinel::ccm::ILogger {
 public:
   void log(const gravesentinel::ccm::LogLevel level,
            const std::string_view message,
-           std::span<const gravesentinel::ccm::LogField>) noexcept override {
+           const std::span<const gravesentinel::ccm::LogField> fields) noexcept
+      override {
     const char *const prefix =
         level == gravesentinel::ccm::LogLevel::error     ? "ERROR"
         : level == gravesentinel::ccm::LogLevel::warning ? "WARN"
         : level == gravesentinel::ccm::LogLevel::debug   ? "DEBUG"
                                                          : "INFO";
     const std::lock_guard lock(mutex_);
-    std::cerr << '[' << prefix << "] " << message << '\n';
+    std::cerr << '[' << prefix << "] " << message;
+    for (const auto &field : fields) {
+      std::cerr << ' ' << field.key << '=';
+      write_log_value(std::cerr, field.value);
+    }
+    std::cerr << '\n';
   }
 
 private:
@@ -285,7 +367,7 @@ int main(const int argc, char **const argv) {
   for (std::size_t pass = 0; pass < kMaximumStartupRecoveryPasses; ++pass) {
     auto recovered = storage->recover(StartupRecoveryOptions{
         .now = clock.wall_now(),
-        .grace_period = std::chrono::hours{1},
+        .grace_period = config.garbage_collection_grace_period,
         .maximum_chunk_deletions_per_container = 128,
     });
     if (!recovered) {
@@ -314,18 +396,29 @@ int main(const int argc, char **const argv) {
   StderrLogger logger;
   LinuxAffinityController affinity;
   PosixProcessRunner runner;
+  const auto runtime_environment = inherited_runtime_environment();
+  if (!runtime_environment) {
+    std::cerr << "cannot prepare Podman/CRIU process environment\n";
+    return 6;
+  }
   PodmanAdapterConfig runtime_config{
       .podman_executable = config.podman,
       .criu_executable = config.criu,
       .staging_root = checkpoint_data,
-      .environment = {},
+      .environment = std::move(*runtime_environment),
   };
   PodmanAdapter podman(runner, affinity, logger, std::move(runtime_config));
   Blake3Hasher hasher;
   SnapshotChunker chunker(hasher);
   CheckpointCreator creator(*storage, podman, chunker, clock, ids, logger);
   RestoreCoordinator restore(*storage, podman, hasher, logger);
-  CheckpointMaintenance maintenance(*storage, clock);
+  CheckpointMaintenance maintenance{
+      *storage, clock,
+      CheckpointMaintenanceConfig{
+          .garbage_collection_grace_period =
+              config.garbage_collection_grace_period,
+          .maximum_garbage_deletions_per_pass = 128,
+      }};
   CheckpointOperations operations(creator, restore, maintenance);
   CheckpointService service(operations, clock, timer, ids, affinity, logger);
 

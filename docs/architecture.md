@@ -35,17 +35,20 @@ runtime-artifact paths and the
 Podman adapter share `checkpoint-data` as their trusted staging boundary; the adapter
 unit test obtains its capture directory from a real `FilesystemStorage` operation.
 This is a real production composition, not a stub. Unit tests cover its components and
-IPC behavior; there is no claim that the complete production binary-to-Podman/CRIU path
-has been executed end to end. The
-runtime remains intentionally restricted to a separately qualified destructive
+IPC behavior. The complete production binary-to-Podman/CRIU stage-12 path was
+requalified rootfully against the current recovery code on 2026-10-25. The stage-13
+four-container CPU suite qualified twice and crash/reconnect/recovery qualified once
+on the same date, completing all three current-code rootful acceptance markers. The
+runtime remains intentionally restricted to the separately qualified destructive
 rootful profile.
 
 ## Process Boundary and Privilege Separation
 
 The Scheduler and CCM do not share an address space. The Scheduler owns the desired
 set of registrations and uses the concrete `SchedulerClient` through
-`IHypervisorClient` from the public `//src/scheduler_client:scheduler_client` alias.
-The client is privilege-free and depends only on protocol types plus its private IPC
+`IHypervisorClient` from the public `//:scheduler_client` target and
+`<gravesentinel/scheduler_client.hxx>`. The client is privilege-free and depends only
+on protocol types plus its private IPC
 codec implementation.
 
 The implemented process boundary is:
@@ -103,7 +106,7 @@ The condensed production dependency graph is:
 
 ```mermaid
 flowchart TD
-    PublicClient["//src/scheduler_client:scheduler_client alias"]
+    PublicClient["//:scheduler_client public target"]
     Client["//src/client:scheduler_client"]
     Protocol["//src/protocol:protocol"]
     Codec["//src/ipc:ipc_codec"]
@@ -155,11 +158,11 @@ flowchart TD
     Store --> Crypto
 ```
 
-The executable now has direct edges to the service, orchestration, runtime, IPC, and
-storage targets used by `main.cxx`. `ccm_core` still contains contracts and structured
-errors rather than workflow implementations. The public Scheduler client target is an
-alias for the concrete client; its JSON codec is an implementation dependency rather
-than part of the public API. BLAKE3 `1.8.2.bcr.1`, nlohmann JSON `3.12.0.bcr.2`, and
+The executable's application library has direct edges to the service, orchestration,
+runtime, IPC, and storage targets; `main.cxx` is only the entry point. `ccm_core` still
+contains contracts and structured errors rather than workflow implementations. The
+root `//:scheduler_client` library wraps the concrete client and public include path;
+its JSON codec is an implementation dependency rather than part of the public API. BLAKE3 `1.8.2.bcr.1`, nlohmann JSON `3.12.0.bcr.2`, and
 GoogleTest `1.18.0.bcr.1` are pinned in `MODULE.bazel`.
 `//tests/unit:unit_tests` is an aggregating test suite, not a library node in this
 dependency graph.
@@ -455,8 +458,9 @@ checkpoint storage or `operations.jsonl` is opened. The lock remains held throug
 service shutdown, so a losing second process cannot recover or compact the live journal.
 
 Before `operations.jsonl` or the service is created, startup recovery takes each
-available container lease, removes only exact stale staging/publication-temporary names
-after one hour, and runs GC with at most 128 chunk deletions per container per pass.
+available container lease, immediately removes exact canonical publication temporaries,
+removes stale canonical staging after the configured grace, and runs GC with at most
+128 chunk deletions per container per pass.
 It repeats while `more_work` within a bounded 1024-pass startup loop. There is no
 startup retention because registrations and their `keep_last` values are not available.
 Partial namespaces without `identity` and noncanonical recovery names are left
@@ -612,8 +616,8 @@ not implicitly trusted.
 
 ## Remaining Lifecycle Limitations
 
-Retention, conservative chunk GC, stale staging/publication-temporary startup cleanup,
-and startup pass repetition are implemented. The remaining lifecycle limitations are:
+Retention, conservative chunk GC, immediate canonical publication-temporary cleanup,
+stale staging cleanup, and startup pass repetition are implemented. The remaining lifecycle limitations are:
 
 1. automatic reconciliation of indeterminate checkpoint publications or runtime
    incarnations;
@@ -664,5 +668,6 @@ composed daemon, but a successful build or unit-test run does not imply that the
 destructive production end-to-end flow was executed.
 
 Independent profiles `--config=debug`, `--config=release`, `--config=asan`,
-`--config=ubsan`, and `--config=tsan` are available commands; this document does not
-claim that a sanitizer run was performed.
+`--config=ubsan`, and `--config=tsan` are available. The stage-13 non-privileged
+release gate runs the release build, default tests, and all three unit sanitizer
+profiles; see [release-gate.md](release-gate.md).

@@ -155,8 +155,104 @@ Only a run that finishes cleanup and prints this final marker is stage-12 eviden
 RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed
 ```
 
-On 2026-10-24 the implementation/build/unit checks passed in the development
-workspace, but the available Podman invocation was rootless and the prerequisite gate
-ended with `RESULT: BLOCKED (1 failed prerequisite checks)`; non-interactive rootful
-access was unavailable. Therefore this repository does **not** claim a successful
-stage-12 privileged run yet.
+The rootful wrapper first qualified on 2026-10-24. On 2026-10-25 it completed a
+regression run against the current production recovery code and emitted both:
+
+```text
+PASS: all SchedulerClient/process-boundary scenarios passed
+RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed
+```
+
+This is dated evidence for the measured host, not a portability claim.
+
+## Stage-13 crash/reconnect/recovery acceptance
+
+`//tests/integration:hypervisor_crash_recovery_e2e` starts the real production daemon
+for baseline/recovery/stress passes and a test-only composition with injected file
+operations at controlled crash/failure seams. It covers real daemon `SIGKILL`, durable
+request deduplication, conservative `indeterminate` restore recovery, no blind retry,
+ENOSPC/EACCES/EINTR, reconnect stress, retention/startup GC, and graceful `SIGTERM`.
+Fault controls are not exposed by the production CLI or environment.
+
+Build as the normal user:
+
+```text
+bazel build \
+  //src/hypervisor:gravesentinel_hypervisor \
+  //tests/integration:fault_hypervisor \
+  //tests/integration:hypervisor_crash_recovery_driver \
+  //tests/integration/fixture:counter_fixture
+```
+
+Then run only the wrapper as root:
+
+```text
+sudo env \
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  tests/integration/hypervisor_crash_recovery_e2e.sh \
+  --hypervisor bazel-bin/src/hypervisor/gravesentinel_hypervisor \
+  --fault-hypervisor bazel-bin/tests/integration/fault_hypervisor \
+  --driver bazel-bin/tests/integration/hypervisor_crash_recovery_driver \
+  --fixture-binary bazel-bin/tests/integration/fixture/counter_fixture \
+  --containerfile tests/integration/fixture/Containerfile \
+  --check-script scripts/check_testbed.sh \
+  --gate-script tests/integration/hypervisor_crash_recovery_podman_gate.sh
+```
+
+Only successful assertions plus ownership-checked cleanup produce:
+
+```text
+RESULT: QUALIFIED crash/reconnect/recovery acceptance passed
+```
+
+**Status: QUALIFIED on 2026-10-25.** The run completed all scenarios and strict
+cleanup and emitted the final marker above.
+
+## Stage-13 four-container CPU acceptance
+
+`//tests/integration:hypervisor_four_cpu_e2e` uses the standard pairs `0/1`, `2/3`,
+`4/5`, and `6/7`. It proves deterministic overlap of four checkpoint operations,
+checks container tasks, Podman cpusets, effective cgroup cpusets, daemon worker TIDs,
+control/client affinity and the gated Podman child, rejects a fifth valid registration
+at capacity, then restores all four containers after controlled removal.
+
+Build as the normal user:
+
+```text
+bazel build \
+  //src/hypervisor:gravesentinel_hypervisor \
+  //tests/integration:hypervisor_four_cpu_driver \
+  //tests/integration/fixture:counter_fixture
+```
+
+Then run only the wrapper as root:
+
+```text
+sudo env \
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  tests/integration/hypervisor_four_cpu_e2e.sh \
+  --hypervisor bazel-bin/src/hypervisor/gravesentinel_hypervisor \
+  --driver bazel-bin/tests/integration/hypervisor_four_cpu_driver \
+  --fixture-binary bazel-bin/tests/integration/fixture/counter_fixture \
+  --containerfile tests/integration/fixture/Containerfile \
+  --check-script scripts/check_testbed.sh \
+  --gate-script tests/integration/hypervisor_four_cpu_podman_gate.sh
+```
+
+Only successful assertions plus strict cleanup produce:
+
+```text
+RESULT: QUALIFIED four-container CPU acceptance passed
+```
+
+**Status: QUALIFIED twice on 2026-10-25.** Both runs completed cleanup and emitted
+the final marker above.
+
+## Complete stage-13 suite
+
+`//tests/integration:stage13_acceptance` aggregates stage 12 and both stage-13
+rootful targets for a CI process already running in the qualified rootful context.
+Interactive developers must not use `sudo bazel`; build normally and invoke the
+three wrappers through `sudo env` as shown above. On 2026-10-25, the three constituent
+wrappers all produced their current-code qualification markers: stage 12 once,
+crash/reconnect/recovery once, and four-container CPU acceptance twice.

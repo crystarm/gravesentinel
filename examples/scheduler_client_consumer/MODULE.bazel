@@ -1,0 +1,11 @@
+module(
+    name = "gravesentinel_scheduler_client_consumer",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "gravesentinel", version = "0.1.0")
+
+local_path_override(
+    module_name = "gravesentinel",
+    path = "../..",
+)

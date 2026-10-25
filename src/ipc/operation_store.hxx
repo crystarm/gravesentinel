@@ -80,6 +80,9 @@ struct OperationStoreOptions {
   std::size_t worker_count{4};
   std::size_t max_journal_entries{8192};
   std::size_t max_journal_bytes{64U * 1024U * 1024U};
+  std::size_t max_compaction_scan_entries{4096};
+  std::size_t max_compaction_cleanup_files{128};
+  std::size_t max_compaction_name_attempts{64};
   std::size_t max_identifier_bytes{1024};
   std::size_t max_request_bytes{1024U * 1024U};
   std::size_t max_result_bytes{64U * 1024U};
@@ -145,6 +148,7 @@ private:
   std::size_t in_flight_{0};
   std::size_t journal_entries_{0};
   std::size_t journal_bytes_{0};
+  unsigned long long compact_sequence_{0};
   std::vector<std::thread> workers_;
 };
 

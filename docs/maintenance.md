@@ -8,8 +8,9 @@ Stage 11 maintenance is implemented by `//src/core:checkpoint_maintenance`,
 1. post-commit retention runs immediately inside a successful create transaction;
 2. registered containers receive background retention retries and garbage collection on
    their existing checkpoint worker;
-3. storage startup recovery removes narrowly recognized stale files and runs bounded
-   garbage collection before the service, operation journal, and IPC readiness exist.
+3. storage startup recovery removes narrowly recognized abandoned files and runs
+   bounded garbage collection before the service, operation journal, and IPC readiness
+   exist.
 
 Immediate retention is part of its journaled create, but its completion flag is not
 exposed over IPC. Separate background retention/GC passes and startup recovery are
@@ -154,9 +155,9 @@ takes the same per-container lease and:
 
 - removes only canonical operation-key staging directories whose modification time is
   stale;
-- removes only exact `.tmp-<32-lowercase-hex>` regular publication temporaries whose
-  modification time is stale, in the recognized container, manifest, candidate,
-  staging, and chunk-prefix locations;
+- immediately removes exact `.tmp-<32-lowercase-hex>` regular publication temporaries
+  in the recognized container, manifest, candidate, staging, and chunk-prefix
+  locations; the exclusive lease proves no conforming live operation owns them;
 - runs the same strict, bounded chunk GC used by maintenance;
 - repeats bounded passes while `more_work` is reported, up to the process startup bound
   of 1024 passes.
@@ -168,8 +169,8 @@ values are unavailable.
 
 Recovery deliberately leaves uncertain names alone. A canonical container-key
 directory without an `identity` file is treated as a partial namespace and is
-untouched. An identity entry that exists but is unreadable or invalid fails recovery. Noncanonical container, staging, chunk, candidate, and temporary names are
-also untouched. This tolerance does not weaken the strict manifest-root rule for a
+untouched. An identity entry that exists but is unreadable or invalid fails recovery. Noncanonical container, staging, chunk, candidate, and temporary names are also
+untouched. This tolerance does not weaken the strict manifest-root rule for a
 complete identified namespace: an unknown entry in that `manifests/` directory makes
 its GC pass and startup recovery fail closed.
 

@@ -1,8 +1,8 @@
 # GraveSentinel documentation
 
 This directory documents the implemented Checkpoint Cache Manager (CCM) service,
-its scheduler IPC client, the qualified Podman/CRIU profile, persisted formats, and
-remaining lifecycle work.
+its scheduler IPC client, operations/recovery contract, release gates, the qualified
+Podman/CRIU profile, persisted formats, and remaining lifecycle work.
 
 ## Current status
 
@@ -50,17 +50,25 @@ The remaining important limits are:
   restore flow must run only in a qualified rootful environment.
 
 The binary is buildable and its composed components and IPC behavior are covered by
-unit tests. On 2026-10-24, the manual
-`//tests/integration:hypervisor_scheduler_e2e` harness completed the full
-process/IPC/Podman path in the qualified rootful profile and emitted
-`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. This is dated evidence
-for the measured host; each deployment still requires its own rootful qualification.
+unit tests. On 2026-10-25, the manual
+`//tests/integration:hypervisor_scheduler_e2e` regression harness completed the full
+process/IPC/Podman path against the current production recovery code and emitted
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. The complete
+non-privileged release gate passed on the same date. The four-container CPU acceptance
+qualified twice and crash/reconnect/recovery qualified once on 2026-10-25, so all
+three rootful acceptance markers are current for the code being released. This is
+dated evidence for the measured host; each deployment still requires its own rootful
+qualification.
 
 ## Reading guide
 
 | Document | Purpose |
 | --- | --- |
 | [Architecture](architecture.md) | Current component status, process boundaries, Bazel graph, IPC/journal behavior, data flows, trust boundaries, and remaining work |
+| [SchedulerClient](scheduler-client.md) | Public Bazel/API boundary, async operations, bool wrappers, reconnect and protocol policy |
+| [Operations](operations.md) | CLI/defaults, ownership, systemd, startup/recovery, upgrade, logging, diagnostics, and unsupported modes |
+| [Release gate](release-gate.md) | Non-privileged release gate, rootful suites, success markers, and requalification triggers |
+| [Requirements traceability](requirements-traceability.md) | Exact Bazel evidence for requirements 8.1/8.2 and stage-13 process criteria |
 | [Manifest v1](manifest-v1.md) | Normative persisted manifest schema, canonical JSON, checksum, validation, and limits |
 | [Chunking](chunking.md) | Fixed-size ingest, namespace-local deduplication, immutable tree checks, and verified reassembly |
 | [Filesystem storage](filesystem-storage.md) | On-disk layout, locking, staging, pins, maintenance records, durable publication/deletion, reads, recovery, and known limits |
@@ -74,14 +82,18 @@ for the measured host; each deployment still requires its own rootful qualificat
 A useful implementation-order reading path is:
 
 1. [Architecture](architecture.md)
-2. [Manifest v1](manifest-v1.md)
-3. [Filesystem storage](filesystem-storage.md)
-4. [Chunking](chunking.md)
-5. [Checkpoint creation](checkpoint-create.md)
-6. [Checkpoint restore](checkpoint-restore.md)
-7. [Maintenance](maintenance.md)
-8. [Service core](service-core.md)
-9. [Testbed qualification](testbed.md)
+2. [SchedulerClient](scheduler-client.md)
+3. [Operations](operations.md)
+4. [Manifest v1](manifest-v1.md)
+5. [Filesystem storage](filesystem-storage.md)
+6. [Chunking](chunking.md)
+7. [Checkpoint creation](checkpoint-create.md)
+8. [Checkpoint restore](checkpoint-restore.md)
+9. [Maintenance](maintenance.md)
+10. [Service core](service-core.md)
+11. [Requirements traceability](requirements-traceability.md)
+12. [Release gate](release-gate.md)
+13. [Testbed qualification](testbed.md)
 
 ## Terminology
 
@@ -137,7 +149,7 @@ Fast project checks:
 bazel test //:checks
 ```
 
-Focused maintenance and stage-12 fixture validation targets include:
+Focused maintenance, lifecycle, and fixture validation targets include:
 
 ```text
 bazel test //tests/unit:checkpoint_maintenance_test
@@ -145,6 +157,7 @@ bazel test //tests/unit:filesystem_storage_test
 bazel test //tests/unit:checkpoint_service_test
 bazel test //tests/unit:checkpoint_creator_test
 bazel test //tests/integration/fixture:counter_fixture_test
+bazel test //tests/integration:hypervisor_lifecycle_test
 ```
 
 Broader repository commands:
@@ -173,7 +186,9 @@ bazel test --config=tsan //:unit_tests
 
 The integration fixture is expected to be statically linked for the destructive
 smoke, while sanitizer builds intentionally disable that static-link profile; do
-not assume the smoke is compatible with a sanitizer configuration.
+not assume the smoke is compatible with a sanitizer configuration. Run the complete
+non-privileged sequence with `sh scripts/release_gate.sh`; rootful commands and
+markers are documented separately in [release-gate.md](release-gate.md).
 
 ## Documentation maintenance checklist
 

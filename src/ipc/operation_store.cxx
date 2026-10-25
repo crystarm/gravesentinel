@@ -1,11 +1,11 @@
 #include "src/ipc/operation_store.hxx"
 #include "src/crypto/blake3.hxx"
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <iomanip>
 #include <limits>
@@ -20,7 +20,6 @@
 namespace gravesentinel::ipc {
 namespace {
 constexpr std::size_t digest_hex_size = 64;
-std::atomic<unsigned long long> compact_sequence{0};
 
 class UniqueFd final {
 public:
@@ -206,7 +205,10 @@ validate_options(std::string_view path, const OperationStoreOptions &options) {
   if (options.max_in_flight == 0 || options.max_records == 0 ||
       options.worker_count == 0 || options.worker_count > 64 ||
       options.max_identifier_bytes == 0 || options.max_request_bytes == 0 ||
-      options.max_result_bytes == 0 || options.max_journal_bytes == 0)
+      options.max_result_bytes == 0 || options.max_journal_bytes == 0 ||
+      options.max_compaction_scan_entries == 0 ||
+      options.max_compaction_cleanup_files == 0 ||
+      options.max_compaction_name_attempts == 0)
     return std::unexpected(
         make_error(StoreErrorCode::invalid_argument,
                    "operation store limits must be nonzero"));
@@ -230,6 +232,31 @@ std::string parent_path(std::string_view path) {
   if (slash == 0)
     return "/";
   return std::string(path.substr(0, slash));
+}
+
+std::string basename(std::string_view path) {
+  const auto slash = path.find_last_of('/');
+  return std::string(slash == std::string_view::npos ? path
+                                                     : path.substr(slash + 1));
+}
+
+bool decimal_component(std::string_view value) {
+  return !value.empty() && std::ranges::all_of(value, [](const char byte) {
+    return byte >= '0' && byte <= '9';
+  });
+}
+
+bool stale_compaction_name(std::string_view name,
+                           std::string_view journal_basename) {
+  const auto prefix = std::string(journal_basename) + ".compact.";
+  if (!name.starts_with(prefix))
+    return false;
+  const auto suffix = name.substr(prefix.size());
+  const auto separator = suffix.find('.');
+  return separator != std::string_view::npos &&
+         suffix.find('.', separator + 1) == std::string_view::npos &&
+         decimal_component(suffix.substr(0, separator)) &&
+         decimal_component(suffix.substr(separator + 1));
 }
 
 std::expected<void, StoreError> close_checked(UniqueFd &fd,
@@ -294,6 +321,130 @@ std::expected<void, StoreError> fsync_parent(std::string_view path) {
                                       "journal parent is not a directory"));
   return fsync_checked(directory.get(),
                        "cannot fsync journal parent directory");
+}
+
+std::expected<void, StoreError>
+cleanup_stale_compaction_files(std::string_view journal_path,
+                               const OperationStoreOptions &options) {
+  const auto parent = parent_path(journal_path);
+  const auto journal_basename = basename(journal_path);
+  UniqueFd directory(
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+  if (directory.get() < 0) {
+    return std::unexpected(system_error(StoreErrorCode::journal_io,
+                                        "cannot open journal parent directory",
+                                        errno));
+  }
+
+  struct stat directory_status{};
+  if (::fstat(directory.get(), &directory_status) != 0) {
+    return std::unexpected(system_error(StoreErrorCode::journal_io,
+                                        "cannot stat journal parent directory",
+                                        errno));
+  }
+  if (!S_ISDIR(directory_status.st_mode)) {
+    return std::unexpected(make_error(StoreErrorCode::journal_corrupt,
+                                      "journal parent is not a directory"));
+  }
+
+  const int listing_fd = ::fcntl(directory.get(), F_DUPFD_CLOEXEC, 0);
+  if (listing_fd < 0) {
+    return std::unexpected(system_error(
+        StoreErrorCode::journal_io,
+        "cannot duplicate journal parent for compaction cleanup", errno));
+  }
+  DIR *const listing = ::fdopendir(listing_fd);
+  if (listing == nullptr) {
+    const int open_error = errno;
+    (void)::close(listing_fd);
+    return std::unexpected(system_error(
+        StoreErrorCode::journal_io,
+        "cannot list journal parent for compaction cleanup", open_error));
+  }
+
+  std::size_t scanned = 0;
+  std::size_t removed = 0;
+  std::optional<StoreError> failure;
+  for (;;) {
+    errno = 0;
+    const dirent *const entry = ::readdir(listing);
+    if (entry == nullptr) {
+      if (errno != 0) {
+        failure = system_error(StoreErrorCode::journal_io,
+                               "cannot read journal parent directory", errno);
+      }
+      break;
+    }
+
+    const std::string_view name(entry->d_name);
+    if (name == "." || name == "..")
+      continue;
+    if (scanned == options.max_compaction_scan_entries) {
+      failure = make_error(StoreErrorCode::resource_exhausted,
+                           "journal parent exceeds the configured compaction "
+                           "cleanup scan limit");
+      break;
+    }
+    ++scanned;
+    if (!stale_compaction_name(name, journal_basename))
+      continue;
+
+    struct stat status{};
+    if (::fstatat(directory.get(), entry->d_name, &status,
+                  AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno == ENOENT)
+        continue;
+      failure = system_error(StoreErrorCode::journal_io,
+                             "cannot inspect stale compacted journal", errno);
+      break;
+    }
+    if (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() ||
+        status.st_nlink != 1 ||
+        (status.st_mode & static_cast<mode_t>(0777)) !=
+            static_cast<mode_t>(0600)) {
+      continue;
+    }
+    if (removed == options.max_compaction_cleanup_files) {
+      failure = make_error(
+          StoreErrorCode::resource_exhausted,
+          "stale compacted journals exceed the configured cleanup limit");
+      break;
+    }
+
+    for (;;) {
+      if (::unlinkat(directory.get(), entry->d_name, 0) == 0) {
+        ++removed;
+        break;
+      }
+      if (errno == EINTR)
+        continue;
+      if (errno == ENOENT)
+        break;
+      failure = system_error(StoreErrorCode::journal_io,
+                             "cannot remove stale compacted journal", errno);
+      break;
+    }
+    if (failure)
+      break;
+  }
+
+  const int close_error = ::closedir(listing);
+  if (close_error != 0 && !failure) {
+    failure =
+        system_error(StoreErrorCode::journal_io,
+                     "cannot close journal parent directory listing", errno);
+  }
+  if (removed != 0) {
+    if (auto synced = fsync_checked(
+            directory.get(),
+            "cannot fsync journal parent after compaction cleanup");
+        !synced) {
+      return synced;
+    }
+  }
+  if (failure)
+    return std::unexpected(std::move(*failure));
+  return {};
 }
 
 std::expected<void, StoreError> write_all(int fd, std::string_view data,
@@ -621,6 +772,9 @@ OperationStore::create(std::string path, Executor executor,
 std::expected<void, StoreError> OperationStore::initialize() {
   if (auto valid = validate_options(journal_path_, options_); !valid)
     return valid;
+  if (auto cleaned = cleanup_stale_compaction_files(journal_path_, options_);
+      !cleaned)
+    return cleaned;
   if (auto recovered = recover(); !recovered)
     return recovered;
 
@@ -837,16 +991,31 @@ std::expected<void, StoreError> OperationStore::compact_locked() {
     compacted += *line;
   }
 
-  const auto sequence = compact_sequence.fetch_add(1);
-  const auto temporary = journal_path_ + ".compact." +
-                         std::to_string(::getpid()) + "." +
-                         std::to_string(sequence);
-  UniqueFd output(::open(temporary.c_str(),
-                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                         0600));
-  if (output.get() < 0)
-    return std::unexpected(system_error(
-        StoreErrorCode::journal_io, "cannot create compacted journal", errno));
+  std::string temporary;
+  UniqueFd output;
+  for (std::size_t attempt = 0; attempt < options_.max_compaction_name_attempts;
+       ++attempt) {
+    temporary = journal_path_ + ".compact." + std::to_string(::getpid()) + "." +
+                std::to_string(compact_sequence_++);
+    const int descriptor =
+        ::open(temporary.c_str(),
+               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor >= 0) {
+      output = UniqueFd(descriptor);
+      break;
+    }
+    if (errno != EEXIST) {
+      return std::unexpected(system_error(StoreErrorCode::journal_io,
+                                          "cannot create compacted journal",
+                                          errno));
+    }
+  }
+  if (output.get() < 0) {
+    return std::unexpected(make_error(
+        StoreErrorCode::resource_exhausted,
+        "cannot allocate a unique compacted journal name within the configured "
+        "attempt limit"));
+  }
   const auto output_status = validate_regular_file(output.get());
   if (!output_status) {
     (void)::unlink(temporary.c_str());

@@ -55,9 +55,10 @@ gravesentinel_cc_library(
     ],
 )
 
-gravesentinel_cc_binary(
-    name = "gravesentinel_hypervisor",
-    srcs = ["main.cxx"],
+gravesentinel_cc_library(
+    name = "application",
+    srcs = ["application.cxx"],
+    hdrs = ["application.hxx"],
     deps = [
         "//src/chunking:snapshot_chunker",
         "//src/core:blake3_hasher",
@@ -72,12 +73,24 @@ gravesentinel_cc_binary(
         "//src/storage:filesystem_storage",
         "@nlohmann_json//:json",
     ],
+    visibility = [
+        "//src/hypervisor:__pkg__",
+        "//tests/integration:__pkg__",
+    ],
+)
+
+gravesentinel_cc_binary(
+    name = "gravesentinel_hypervisor",
+    srcs = ["main.cxx"],
+    deps = [":application"],
     visibility = ["//visibility:public"],
 )
 
 filegroup(
     name = "format_sources",
     srcs = [
+        "application.cxx",
+        "application.hxx",
         "linux_affinity_controller.cxx",
         "linux_affinity_controller.hxx",
         "main.cxx",

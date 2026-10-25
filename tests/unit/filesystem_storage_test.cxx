@@ -902,7 +902,7 @@ TEST(FilesystemStorageTest, EnforcesExclusiveContainerLockAcrossInstances) {
 }
 
 TEST(FilesystemStorageTest,
-     RecoveryRemovesOnlyStaleCanonicalStagingAndPublicationTemps) {
+     RecoveryRemovesStaleStagingAndAllCanonicalPublicationTemps) {
   TemporaryDirectory root;
   auto injected = std::make_shared<FaultInjectingFileOperations>(
       make_posix_file_operations());
@@ -930,16 +930,24 @@ TEST(FilesystemStorageTest,
       manifests / ".tmp-00000000000000000000000000000000";
   const auto fresh_temporary =
       manifests / ".tmp-11111111111111111111111111111111";
+  const auto chunk_prefix =
+      fresh_path.parent_path().parent_path() / "chunks" / "ab";
+  ASSERT_TRUE(std::filesystem::create_directory(chunk_prefix));
+  const auto fresh_chunk_temporary =
+      chunk_prefix / ".tmp-22222222222222222222222222222222";
   {
     std::ofstream stale_file{stale_temporary};
     std::ofstream fresh_file{fresh_temporary};
+    std::ofstream chunk_file{fresh_chunk_temporary};
     ASSERT_TRUE(stale_file.good());
     ASSERT_TRUE(fresh_file.good());
+    ASSERT_TRUE(chunk_file.good());
   }
   set_file_timestamp(stale_path, 800);
   set_file_timestamp(fresh_path, 950);
   set_file_timestamp(stale_temporary, 800);
   set_file_timestamp(fresh_temporary, 950);
+  set_file_timestamp(fresh_chunk_temporary, 950);
 
   const StartupRecoveryOptions options{
       .now = std::chrono::system_clock::time_point{std::chrono::seconds{1000}},
@@ -950,18 +958,20 @@ TEST(FilesystemStorageTest,
   ASSERT_TRUE(recovered);
   EXPECT_EQ(recovered->containers_scanned, 1U);
   EXPECT_EQ(recovered->staging_entries_deleted, 1U);
-  EXPECT_EQ(recovered->temporary_entries_deleted, 1U);
+  EXPECT_EQ(recovered->temporary_entries_deleted, 3U);
   EXPECT_FALSE(std::filesystem::exists(stale_path));
   EXPECT_TRUE(std::filesystem::exists(fresh_path));
   EXPECT_FALSE(std::filesystem::exists(stale_temporary));
-  EXPECT_TRUE(std::filesystem::exists(fresh_temporary));
+  EXPECT_FALSE(std::filesystem::exists(fresh_temporary));
+  EXPECT_FALSE(std::filesystem::exists(fresh_chunk_temporary));
 
   const auto repeated = storage->recover(options);
   ASSERT_TRUE(repeated);
   EXPECT_EQ(repeated->staging_entries_deleted, 0U);
   EXPECT_EQ(repeated->temporary_entries_deleted, 0U);
   EXPECT_TRUE(std::filesystem::exists(fresh_path));
-  EXPECT_TRUE(std::filesystem::exists(fresh_temporary));
+  EXPECT_FALSE(std::filesystem::exists(fresh_temporary));
+  EXPECT_FALSE(std::filesystem::exists(fresh_chunk_temporary));
 }
 
 TEST(FilesystemStorageTest, MapsTraversalIdentifiersToOpaqueNamespaces) {

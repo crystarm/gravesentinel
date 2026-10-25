@@ -20,6 +20,7 @@ gravesentinel_cc_library(
     visibility = [
         "//src/chunking:__pkg__",
         "//src/hypervisor:__pkg__",
+        "//tests/integration:__pkg__",
         "//tests/unit:__pkg__",
     ],
 )

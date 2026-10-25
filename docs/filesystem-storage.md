@@ -252,9 +252,9 @@ Public read/list paths and chunk reuse additionally sync the relevant data
 directory before reporting durable success. This is not a guarantee that every
 existing regular-file entry is re-synced on every open: in particular, reopening
 an existing permanent lock file does not re-`fsync` the lock file or `locks/`.
-The random temporary namespace does not repeat after process restart; exact stale
-hidden publication temporaries become eligible for conservative startup recovery after
-the configured grace period.
+The random temporary namespace does not repeat after process restart. Startup recovery
+holds the exclusive container lease and immediately removes exact canonical hidden
+publication temporaries before readiness; no active conforming writer can own them.
 
 ## Locks, staging, and pins
 
@@ -301,9 +301,10 @@ outcome and must not assume either that staging remains present or that its
 deletion is durable.
 
 A process crash or any surviving staging entry is ignored by committed-manifest
-listing. Startup recovery removes only canonical stale operation-key directories and
-exact stale publication temporaries after its grace period while no live lease exists;
-unknown names and a partial container namespace without `identity` remain untouched.
+listing. While no live lease exists, startup recovery immediately removes exact
+canonical publication temporaries and removes canonical stale operation-key directories
+after its grace period. Unknown names and a partial container namespace without
+`identity` remain untouched.
 
 ## Internal API and errors
 

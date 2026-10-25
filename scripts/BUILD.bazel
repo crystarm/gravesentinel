@@ -11,6 +11,7 @@ sh_test(
         "$(locations //src/crypto:format_sources)",
         "$(locations //src/hypervisor:format_sources)",
         "$(locations //src/manifest:format_sources)",
+        "$(locations //:public_client_headers)",
         "$(locations //src/protocol:format_sources)",
         "$(locations //src/scheduler_client:format_sources)",
         "$(locations //src/storage:format_sources)",
@@ -27,6 +28,7 @@ sh_test(
         "//src/crypto:format_sources",
         "//src/hypervisor:format_sources",
         "//src/manifest:format_sources",
+        "//:public_client_headers",
         "//src/protocol:format_sources",
         "//src/scheduler_client:format_sources",
         "//src/storage:format_sources",
@@ -39,15 +41,36 @@ sh_test(
 )
 
 sh_binary(
+    name = "check_scheduler_client_boundary",
+    srcs = ["check_scheduler_client_boundary.sh"],
+    visibility = ["//visibility:public"],
+)
+
+sh_binary(
+    name = "check_scheduler_client_consumer_runtime",
+    srcs = ["check_scheduler_client_consumer_runtime.sh"],
+    visibility = ["//visibility:public"],
+)
+
+sh_binary(
     name = "check_testbed",
     srcs = ["check_testbed.sh"],
-    visibility = ["//tests/integration:__pkg__"],
+    visibility = ["//visibility:public"],
+)
+
+sh_binary(
+    name = "release_gate",
+    srcs = ["release_gate.sh"],
+    visibility = ["//visibility:public"],
 )
 
 filegroup(
     name = "scripts",
     srcs = [
         "check_clang_format.sh",
+        "check_scheduler_client_boundary.sh",
+        "check_scheduler_client_consumer_runtime.sh",
         "check_testbed.sh",
+        "release_gate.sh",
     ],
 )

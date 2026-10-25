@@ -1,0 +1,19 @@
+package(default_visibility = ["//visibility:private"])
+
+cc_library(
+    name = "forbidden_core",
+    tags = ["manual"],
+    deps = ["@gravesentinel//src/core:ccm_core"],
+)
+
+cc_library(
+    name = "forbidden_storage",
+    tags = ["manual"],
+    deps = ["@gravesentinel//src/storage:filesystem_storage"],
+)
+
+cc_library(
+    name = "forbidden_podman",
+    tags = ["manual"],
+    deps = ["@gravesentinel//src/hypervisor:podman_adapter"],
+)

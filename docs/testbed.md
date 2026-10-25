@@ -10,11 +10,20 @@ progress, removal of the original container before restore, in-memory state
 continuity after import, CPU affinity, negative-restore cleanup, cgroup cleanup,
 and idempotent resource cleanup.
 
-**QUALIFIED for stage 12 on 2026-10-24.** The production hypervisor subprocess
-and `SchedulerClient` completed the full process/IPC/Podman suite with
-`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`.
+**QUALIFIED for stage 12 against the current recovery code on 2026-10-25.** The
+production hypervisor subprocess and `SchedulerClient` completed the full
+process/IPC/Podman regression suite with
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. The path first qualified
+on 2026-10-24.
 
-These are historical qualification records for the measured host on those dates,
+**QUALIFIED for both new stage-13 acceptance suites on 2026-10-25.** The
+four-container CPU acceptance completed twice and emitted
+`RESULT: QUALIFIED four-container CPU acceptance passed`. The crash/reconnect/recovery
+suite completed all crash, reconciliation, storage-fault, stress, GC, shutdown, and
+cleanup scenarios and emitted
+`RESULT: QUALIFIED crash/reconnect/recovery acceptance passed`.
+
+The qualified entries are historical qualification records for the measured host on those dates,
 not statements that the current host or current runtime installation has been
 rechecked. Qualification applies only to the exact runtime profile and command
 boundary in this document. A `+CRIU` feature in `crun --version` means that the
@@ -88,7 +97,8 @@ adapter helper still tests the runtime layer directly. The opt-in
 binary and drives functional operations through `SchedulerClient`.
 
 The process-boundary target completed successfully in the qualified rootful context
-on 2026-10-24 and emitted
+on 2026-10-24 and was requalified against the current production recovery code on
+2026-10-25. Both runs emitted
 `RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. This is the stage-12
 production-daemon E2E evidence; the older direct and adapter qualification records
 remain evidence for their narrower boundaries.
@@ -112,6 +122,9 @@ do not run Bazel as root:
 ```text
 bazel build \
   //src/hypervisor:gravesentinel_hypervisor \
+  //tests/integration:fault_hypervisor \
+  //tests/integration:hypervisor_crash_recovery_driver \
+  //tests/integration:hypervisor_four_cpu_driver \
   //tests/integration:hypervisor_e2e_driver \
   //tests/integration/fixture:counter_fixture
 ```
@@ -159,6 +172,8 @@ bazel test //tests/integration:podman_checkpoint_smoke \
 bazel test //tests/integration:podman_adapter_smoke \
   --test_output=streamed
 bazel test //tests/integration:hypervisor_scheduler_e2e \
+  --test_output=streamed
+bazel test //tests/integration:stage13_acceptance \
   --test_output=streamed
 ```
 
@@ -371,8 +386,8 @@ a best-effort destructor retry.
 
 ## Stage 12 production hypervisor + SchedulerClient E2E
 
-**QUALIFIED on 2026-10-24.** The manual rootful
-`//tests/integration:hypervisor_scheduler_e2e` run ended with:
+**QUALIFIED on current recovery code on 2026-10-25.** The manual rootful
+`//tests/integration:hypervisor_scheduler_e2e` regression run ended with:
 
 ```text
 PASS: all SchedulerClient/process-boundary scenarios passed
@@ -388,6 +403,35 @@ three-generation retention with grace-based chunk collection. Every scenario
 checked CPU placement and single runtime incarnation. The final marker also
 requires successful cleanup of owned containers, images, processes, cgroups,
 mounts, sockets, and temporary storage.
+
+## Stage 13 crash/reconnect and four-container acceptance
+
+The stage-13 manual targets are:
+
+```text
+//tests/integration:hypervisor_crash_recovery_e2e
+//tests/integration:hypervisor_four_cpu_e2e
+//tests/integration:stage13_acceptance
+```
+
+The crash suite uses a test-only dependency injection binary to block or fail
+storage operations without adding fault flags to the production CLI. It exercises
+real daemon `SIGKILL` during chunk writes and around manifest publication, restore
+crashes before/after runtime side effects, request deduplication, explicit
+`indeterminate` reconciliation, controlled ENOSPC/EACCES/EINTR, reconnect stress,
+retention/startup GC, and graceful shutdown. The production daemon remains the
+binary used for baseline, restart, stress, and final recovery passes.
+
+The four-container suite registers CPU pairs `0/1`, `2/3`, `4/5`, and `6/7`, proves
+four checkpoint operations overlap, inspects Podman/task/cgroup/worker affinity,
+rejects a fifth valid registration while all four slots are occupied, removes each
+runtime under ownership checks, and restores all four through `SchedulerClient`.
+
+Exact direct-wrapper commands and cleanup behavior are in
+`tests/integration/README.md`. On 2026-10-25, the four-container suite qualified
+twice, the crash/recovery suite qualified once, and the stage-12 regression wrapper
+qualified against the current startup-recovery code. These three current-code markers
+complete the stage-13 rootful acceptance evidence.
 
 ## Adapter operation limits
 
@@ -427,8 +471,9 @@ The qualification does not establish compatibility for remote Podman, a
 different kernel/package/runtime version, another architecture, cgroup v1,
 another cgroup manager, another CRIU capability profile, SELinux/AppArmor policy
 changes, a different seccomp policy, GPUs/devices, TCP connections, or critically
-mutable shared volumes. Only CPU 0 was exercised by the smoke; availability of
-CPUs `0..7` was checked for the planned MVP allocation profile.
+mutable shared volumes. The earlier direct smoke exercised CPU 0 and stage 12
+exercised its configured pair; availability of CPUs `0..7` was checked, but full
+the four-pair runtime acceptance qualified on 2026-10-25.
 
 Any change to the kernel, Podman, CRIU, crun, privilege model, cgroup setup,
 security policy, source-image semantics, or command profile requires the

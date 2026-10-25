@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -31,15 +32,49 @@ void remove_path(const std::string &path) {
 }
 
 std::string read_text(const std::string &path) {
+  constexpr std::uintmax_t maximum_bytes = 128U * 1024U * 1024U;
+  const auto size = std::filesystem::file_size(path);
+  if (size > maximum_bytes)
+    throw std::runtime_error("operation store test file exceeds read bound");
   std::ifstream input(path, std::ios::binary);
-  return {std::istreambuf_iterator<char>(input),
-          std::istreambuf_iterator<char>()};
+  if (!input)
+    throw std::runtime_error("cannot open operation store test file");
+  std::string contents(static_cast<std::size_t>(size), '\0');
+  if (!contents.empty()) {
+    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    if (input.gcount() != static_cast<std::streamsize>(contents.size()))
+      throw std::runtime_error("operation store test file is truncated");
+  }
+  return contents;
 }
 
 void write_text(const std::string &path, std::string_view contents,
                 std::ios::openmode mode = std::ios::trunc) {
   std::ofstream output(path, std::ios::binary | mode);
   output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+}
+
+std::filesystem::path temp_directory(std::string_view suffix = {}) {
+  auto path = std::filesystem::path(temp_path(suffix));
+  path += ".directory";
+  remove_path(path.string());
+  if (!std::filesystem::create_directory(path))
+    throw std::runtime_error("cannot create operation store test directory");
+  return path;
+}
+
+void write_mode(const std::filesystem::path &path, std::string_view contents,
+                mode_t mode) {
+  write_text(path.string(), contents);
+  if (::chmod(path.c_str(), mode) != 0)
+    throw std::runtime_error("cannot set operation store test file mode");
+}
+
+std::filesystem::path compaction_path(const std::filesystem::path &journal,
+                                      unsigned long long process,
+                                      unsigned long long sequence) {
+  return journal.string() + ".compact." + std::to_string(process) + "." +
+         std::to_string(sequence);
 }
 
 std::size_t line_count(std::string_view contents) {
@@ -599,6 +634,182 @@ TEST(OperationStoreTest, CompactsDuringRuntimeToStrictEntryBound) {
   reopened->reset();
   EXPECT_EQ(line_count(read_text(path)), options.max_records);
   remove_path(path);
+}
+
+TEST(OperationStoreTest,
+     StartupRemovesOnlyExactSafeStaleCompactionFilesAndRetriesCollisions) {
+  const auto directory = temp_directory("-stale-compaction");
+  const auto journal = directory / "operations.jsonl";
+  {
+    OperationStore store(journal.string(), successful_executor());
+  }
+
+  const auto safe_first = compaction_path(journal, 123U, 456U);
+  const auto safe_second = compaction_path(journal, 0U, 7U);
+  write_mode(safe_first, "stale", 0600);
+  write_mode(safe_second, "stale", 0600);
+
+  const auto malformed =
+      std::filesystem::path(journal.string() + ".compact.123");
+  const auto extra_component =
+      std::filesystem::path(journal.string() + ".compact.1.2.3");
+  const auto nondigit =
+      std::filesystem::path(journal.string() + ".compact.pid.1");
+  const auto foreign = directory / "other.jsonl.compact.1.2";
+  write_mode(malformed, "unknown", 0600);
+  write_mode(extra_component, "unknown", 0600);
+  write_mode(nondigit, "unknown", 0600);
+  write_mode(foreign, "unknown", 0600);
+
+  const auto unsafe_mode = compaction_path(journal, 10U, 20U);
+  write_mode(unsafe_mode, "unsafe", 0644);
+  const auto hard_link_source = directory / "hard-link-source";
+  const auto hard_link = compaction_path(journal, 30U, 40U);
+  write_mode(hard_link_source, "unsafe", 0600);
+  std::filesystem::create_hard_link(hard_link_source, hard_link);
+  const auto directory_candidate = compaction_path(journal, 50U, 60U);
+  ASSERT_TRUE(std::filesystem::create_directory(directory_candidate));
+
+  const auto symlink_target = directory / "symlink-target";
+  write_mode(symlink_target, "target", 0600);
+  const auto sequence_collision =
+      compaction_path(journal, static_cast<unsigned long long>(::getpid()), 0U);
+  std::filesystem::create_symlink(symlink_target, sequence_collision);
+
+  auto reopened =
+      OperationStore::create(journal.string(), successful_executor());
+  ASSERT_TRUE(reopened) << reopened.error().message;
+  reopened->reset();
+
+  EXPECT_FALSE(std::filesystem::exists(safe_first));
+  EXPECT_FALSE(std::filesystem::exists(safe_second));
+  EXPECT_TRUE(std::filesystem::exists(malformed));
+  EXPECT_TRUE(std::filesystem::exists(extra_component));
+  EXPECT_TRUE(std::filesystem::exists(nondigit));
+  EXPECT_TRUE(std::filesystem::exists(foreign));
+  EXPECT_TRUE(std::filesystem::exists(unsafe_mode));
+  EXPECT_TRUE(std::filesystem::exists(hard_link));
+  EXPECT_TRUE(std::filesystem::is_directory(directory_candidate));
+  EXPECT_TRUE(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(sequence_collision)));
+  EXPECT_TRUE(std::filesystem::exists(symlink_target));
+  remove_path(directory.string());
+}
+
+TEST(OperationStoreTest, BoundedStaleCleanupCompletesAcrossReopens) {
+  const auto directory = temp_directory("-bounded-stale-compaction");
+  const auto journal = directory / "operations.jsonl";
+  std::string operation_id;
+  {
+    OperationStore store(journal.string(), successful_executor("persisted"));
+    auto submitted = store.submit(
+        "req-before-cleanup", "SubmitCreateCheckpoint", "container", "payload");
+    ASSERT_TRUE(submitted);
+    operation_id = submitted->operation_id;
+    ASSERT_TRUE(wait_for_terminal(store, operation_id));
+  }
+
+  std::vector<std::filesystem::path> stale_files;
+  for (unsigned long long sequence = 1U; sequence <= 3U; ++sequence) {
+    stale_files.push_back(compaction_path(journal, 999U, sequence));
+    write_mode(stale_files.back(), "stale", 0600);
+  }
+  const auto remaining = [&] {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(stale_files, [](const auto &path) {
+          return std::filesystem::exists(path);
+        }));
+  };
+
+  OperationStoreOptions options;
+  options.max_compaction_scan_entries = 16;
+  options.max_compaction_cleanup_files = 1;
+  options.max_compaction_name_attempts = 4;
+
+  auto first =
+      OperationStore::create(journal.string(), successful_executor(), options);
+  ASSERT_FALSE(first);
+  EXPECT_EQ(first.error().code, StoreErrorCode::resource_exhausted);
+  EXPECT_EQ(remaining(), 2U);
+
+  auto second =
+      OperationStore::create(journal.string(), successful_executor(), options);
+  ASSERT_FALSE(second);
+  EXPECT_EQ(second.error().code, StoreErrorCode::resource_exhausted);
+  EXPECT_EQ(remaining(), 1U);
+
+  auto third =
+      OperationStore::create(journal.string(), successful_executor(), options);
+  ASSERT_TRUE(third) << third.error().message;
+  EXPECT_EQ(remaining(), 0U);
+  const auto recovered = (*third)->get(operation_id);
+  ASSERT_TRUE(recovered);
+  EXPECT_EQ(recovered->state, OperationState::succeeded);
+  EXPECT_EQ(recovered->result, "persisted");
+  third->reset();
+  remove_path(directory.string());
+}
+
+TEST(OperationStoreTest, CompactionCleanupScanBoundIsReopenSafe) {
+  const auto directory = temp_directory("-compaction-scan-bound");
+  const auto journal = directory / "operations.jsonl";
+  {
+    OperationStore store(journal.string(), successful_executor());
+  }
+  const auto unrelated = directory / "unrelated-entry";
+  write_mode(unrelated, "preserve", 0600);
+
+  OperationStoreOptions options;
+  options.max_compaction_scan_entries = 1;
+  auto bounded =
+      OperationStore::create(journal.string(), successful_executor(), options);
+  ASSERT_FALSE(bounded);
+  EXPECT_EQ(bounded.error().code, StoreErrorCode::resource_exhausted);
+  EXPECT_TRUE(std::filesystem::exists(unrelated));
+
+  options.max_compaction_scan_entries = 8;
+  auto reopened =
+      OperationStore::create(journal.string(), successful_executor(), options);
+  ASSERT_TRUE(reopened) << reopened.error().message;
+  reopened->reset();
+  EXPECT_TRUE(std::filesystem::exists(unrelated));
+  remove_path(directory.string());
+}
+
+TEST(OperationStoreTest, CompactionNameRetriesAreBoundedAndReopenSafe) {
+  const auto directory = temp_directory("-compaction-name-retry");
+  const auto journal = directory / "operations.jsonl";
+  const auto target = directory / "collision-target";
+  write_mode(target, "target", 0600);
+  const auto process = static_cast<unsigned long long>(::getpid());
+  const auto first_collision = compaction_path(journal, process, 0U);
+  const auto second_collision = compaction_path(journal, process, 1U);
+  std::filesystem::create_symlink(target, first_collision);
+  std::filesystem::create_symlink(target, second_collision);
+
+  OperationStoreOptions options;
+  options.max_compaction_scan_entries = 16;
+  options.max_compaction_cleanup_files = 4;
+  options.max_compaction_name_attempts = 2;
+
+  auto exhausted =
+      OperationStore::create(journal.string(), successful_executor(), options);
+  ASSERT_FALSE(exhausted);
+  EXPECT_EQ(exhausted.error().code, StoreErrorCode::resource_exhausted);
+  EXPECT_TRUE(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(first_collision)));
+  EXPECT_TRUE(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(second_collision)));
+
+  ASSERT_TRUE(std::filesystem::remove(second_collision));
+  auto reopened =
+      OperationStore::create(journal.string(), successful_executor(), options);
+  ASSERT_TRUE(reopened) << reopened.error().message;
+  reopened->reset();
+  EXPECT_TRUE(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(first_collision)));
+  EXPECT_TRUE(std::filesystem::exists(target));
+  remove_path(directory.string());
 }
 
 TEST(OperationStoreTest, TerminalPersistFailureCannotAppearSucceeded) {

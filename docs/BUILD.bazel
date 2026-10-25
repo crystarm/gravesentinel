@@ -55,6 +55,30 @@ filegroup(
 )
 
 filegroup(
+    name = "scheduler_client",
+    srcs = ["scheduler-client.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "operations",
+    srcs = ["operations.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "release_gate",
+    srcs = ["release-gate.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "requirements_traceability",
+    srcs = ["requirements-traceability.md"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "testbed",
     srcs = [
         "adr/0001-podman-criu-runtime-profile.md",
@@ -75,6 +99,10 @@ filegroup(
         "filesystem-storage.md",
         "maintenance.md",
         "manifest-v1.md",
+        "operations.md",
+        "release-gate.md",
+        "requirements-traceability.md",
+        "scheduler-client.md",
         "service-core.md",
         "testbed.md",
     ],

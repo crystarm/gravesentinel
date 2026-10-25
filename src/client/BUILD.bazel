@@ -12,8 +12,10 @@ gravesentinel_cc_library(
     ],
     deps = ["//src/protocol:protocol"],
     visibility = [
+        "//:__pkg__",
+        "//src/scheduler_client:__pkg__",
+        "//tests/integration:__pkg__",
         "//tests/unit:__pkg__",
-        "//visibility:public",
     ],
 )
 

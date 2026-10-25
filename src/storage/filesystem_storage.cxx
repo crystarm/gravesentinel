@@ -2218,12 +2218,10 @@ open_recovery_container(const std::shared_ptr<StorageContext> &context,
   }};
 }
 
-[[nodiscard]] CheckpointResult<std::size_t>
-remove_stale_temporaries(const std::shared_ptr<IFileOperations> &operations,
-                         int directory_fd,
-                         const StartupRecoveryOptions &options) {
+[[nodiscard]] CheckpointResult<std::size_t> remove_publication_temporaries(
+    const std::shared_ptr<IFileOperations> &operations, int directory_fd) {
   auto entries = list_directory(operations, directory_fd,
-                                "list directory for stale publication files");
+                                "list directory for publication temporaries");
   if (!entries) {
     return std::unexpected(entries.error());
   }
@@ -2240,22 +2238,22 @@ remove_stale_temporaries(const std::shared_ptr<IFileOperations> &operations,
         continue;
       }
       return std::unexpected(
-          filesystem_error("open stale publication temporary", opened.error()));
+          filesystem_error("open publication temporary", opened.error()));
     }
     UniqueFileDescriptor file{operations, *opened};
     auto status =
         retry_interrupted([&] { return operations->status(file.get()); });
     if (!status) {
-      return std::unexpected(filesystem_error(
-          "inspect stale publication temporary", status.error()));
+      return std::unexpected(
+          filesystem_error("inspect publication temporary", status.error()));
     }
-    if (status->type != FileType::regular_file || !is_stale(*status, options)) {
+    if (status->type != FileType::regular_file) {
       continue;
     }
     file.reset();
     auto removed = durable_remove_file(
-        operations, directory_fd, entry, "remove stale publication temporary",
-        "sync stale publication temporary removal", true);
+        operations, directory_fd, entry, "remove publication temporary",
+        "sync publication temporary removal", true);
     if (!removed) {
       return std::unexpected(removed.error());
     }
@@ -2271,7 +2269,7 @@ recover_staging(const std::shared_ptr<IFileOperations> &operations,
                 int staging_fd, const StartupRecoveryOptions &options,
                 std::size_t &temporary_entries_deleted) {
   auto root_temporaries =
-      remove_stale_temporaries(operations, staging_fd, options);
+      remove_publication_temporaries(operations, staging_fd);
   if (!root_temporaries) {
     return std::unexpected(root_temporaries.error());
   }
@@ -2306,7 +2304,7 @@ recover_staging(const std::shared_ptr<IFileOperations> &operations,
     }
     if (!is_stale(*status, options)) {
       auto temporaries =
-          remove_stale_temporaries(operations, operation.get(), options);
+          remove_publication_temporaries(operations, operation.get());
       if (!temporaries) {
         return std::unexpected(temporaries.error());
       }
@@ -2337,9 +2335,8 @@ recover_staging(const std::shared_ptr<IFileOperations> &operations,
 
 [[nodiscard]] CheckpointResult<std::size_t>
 recover_chunk_temporaries(const std::shared_ptr<IFileOperations> &operations,
-                          int chunks_fd,
-                          const StartupRecoveryOptions &options) {
-  auto root_removed = remove_stale_temporaries(operations, chunks_fd, options);
+                          int chunks_fd) {
+  auto root_removed = remove_publication_temporaries(operations, chunks_fd);
   if (!root_removed) {
     return std::unexpected(root_removed.error());
   }
@@ -2364,7 +2361,7 @@ recover_chunk_temporaries(const std::shared_ptr<IFileOperations> &operations,
           "open chunk prefix for temporary recovery", opened.error()));
     }
     UniqueFileDescriptor prefix{operations, *opened};
-    auto removed = remove_stale_temporaries(operations, prefix.get(), options);
+    auto removed = remove_publication_temporaries(operations, prefix.get());
     if (!removed) {
       return std::unexpected(removed.error());
     }
@@ -2389,14 +2386,14 @@ recover_container_files(const std::shared_ptr<IFileOperations> &operations,
                                              directories.manifests.get(),
                                              candidates->get()};
   for (const int directory_fd : publication_roots) {
-    auto removed = remove_stale_temporaries(operations, directory_fd, options);
+    auto removed = remove_publication_temporaries(operations, directory_fd);
     if (!removed) {
       return std::unexpected(removed.error());
     }
     report.temporary_entries_deleted += *removed;
   }
   auto chunk_temporaries =
-      recover_chunk_temporaries(operations, directories.chunks.get(), options);
+      recover_chunk_temporaries(operations, directories.chunks.get());
   if (!chunk_temporaries) {
     return std::unexpected(chunk_temporaries.error());
   }

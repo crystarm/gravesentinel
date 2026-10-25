@@ -1,0 +1,8 @@
+package(default_visibility = ["//visibility:private"])
+
+cc_binary(
+    name = "scheduler_client_consumer",
+    srcs = ["main.cxx"],
+    copts = ["-std=c++23"],
+    deps = ["@gravesentinel//:scheduler_client"],
+)

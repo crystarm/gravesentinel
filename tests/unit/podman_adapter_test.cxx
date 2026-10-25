@@ -11,10 +11,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -36,6 +36,27 @@ constexpr std::string_view kEnvironmentFilePlaceholder =
 
 [[nodiscard]] std::string image_identity() {
   return "sha256:" + std::string(kImageDigest);
+}
+
+[[nodiscard]] std::string read_test_file(const std::filesystem::path &path) {
+  constexpr std::uintmax_t maximum_bytes = 1024U * 1024U;
+  const auto size = std::filesystem::file_size(path);
+  if (size > maximum_bytes) {
+    throw std::runtime_error("test file exceeds its read bound");
+  }
+
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open test file");
+  }
+  std::string contents(static_cast<std::size_t>(size), '\0');
+  if (!contents.empty()) {
+    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    if (input.gcount() != static_cast<std::streamsize>(contents.size())) {
+      throw std::runtime_error("test file ended before its recorded size");
+    }
+  }
+  return contents;
 }
 
 [[nodiscard]] CheckpointErrorDetail test_error(StableErrorCode code) {
@@ -510,9 +531,7 @@ TEST(PodmanAdapterTest,
             EXPECT_EQ(status.permissions() & std::filesystem::perms::all,
                       std::filesystem::perms::owner_read |
                           std::filesystem::perms::owner_write);
-            std::ifstream input(observed_environment_file, std::ios::binary);
-            const std::string contents{std::istreambuf_iterator<char>(input),
-                                       std::istreambuf_iterator<char>()};
+            const auto contents = read_test_file(observed_environment_file);
             EXPECT_EQ(contents,
                       "APP_SECRET=" + secret + "\nLD_PRELOAD=" + preload +
                           "\nCONTAINERS_CONF=" + containers_conf + "\n");
@@ -877,9 +896,7 @@ TEST(PodmanAdapterTest, ColdStartFailureDoesNotExposeEnvironmentValue) {
             EXPECT_EQ(request.environment, config.environment);
             ASSERT_GE(request.argv.size(), 16U);
             observed_environment_file = request.argv[15];
-            std::ifstream input(observed_environment_file, std::ios::binary);
-            const std::string contents{std::istreambuf_iterator<char>(input),
-                                       std::istreambuf_iterator<char>()};
+            const auto contents = read_test_file(observed_environment_file);
             EXPECT_EQ(contents, "TOKEN=" + secret + "\n");
             for (const auto &argument : request.argv) {
               EXPECT_EQ(argument.find("TOKEN"), std::string::npos);

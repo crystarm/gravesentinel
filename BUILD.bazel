@@ -16,6 +16,7 @@ filegroup(
         ".gitignore",
         "AGENTS.md",
         "MODULE.bazel",
+        "README.md",
     ],
 )
 
@@ -31,10 +32,18 @@ alias(
     visibility = ["//visibility:public"],
 )
 
-alias(
+cc_library(
     name = "scheduler_client",
-    actual = "//src/client:scheduler_client",
+    hdrs = ["include/gravesentinel/scheduler_client.hxx"],
+    strip_include_prefix = "include",
+    deps = ["//src/client:scheduler_client"],
     visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "public_client_headers",
+    srcs = ["include/gravesentinel/scheduler_client.hxx"],
+    visibility = ["//scripts:__pkg__"],
 )
 
 test_suite(

@@ -135,8 +135,8 @@ restore. Creation records the fingerprint returned by the runtime adapter, and r
 validates the fingerprint stored in the selected manifest.
 
 The service schedules retention and bounded garbage collection for registered
-containers. Conservative stale staging/publication cleanup occurs earlier in startup
-storage recovery, before registrations exist.
+containers. Conservative stale staging and immediate canonical publication-temporary
+cleanup occur earlier in startup storage recovery, before registrations exist.
 
 ## IPC durability, bounds, and recovery
 

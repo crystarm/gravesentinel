@@ -1,0 +1,61 @@
+name: Unit tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: unit-default
+          repository-cache: true
+
+      - name: Run unit tests
+        run: bazel test //:unit_tests --nocache_test_results
+
+  sanitizers:
+    name: Unit tests (${{ matrix.config }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - asan
+          - ubsan
+          - tsan
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: unit-${{ matrix.config }}
+          repository-cache: true
+
+      - name: Run unit tests with ${{ matrix.config }}
+        run: >-
+          bazel test --config=${{ matrix.config }} //:unit_tests
+          --nocache_test_results

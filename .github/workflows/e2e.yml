@@ -1,0 +1,54 @@
+name: E2E tests
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gravesentinel-e2e
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: Rootful acceptance tests
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - gravesentinel-e2e
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: e2e
+          repository-cache: true
+
+      - name: Verify qualified rootful testbed
+        run: |
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "The E2E runner must run as uid 0; do not elevate Bazel with sudo." >&2
+            exit 1
+          fi
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+          sh scripts/check_testbed.sh
+
+      - name: Run rootful acceptance tests
+        run: |
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+          bazel test \
+            //tests/integration:hypervisor_scheduler_e2e \
+            //tests/integration:hypervisor_crash_recovery_e2e \
+            //tests/integration:hypervisor_four_cpu_e2e \
+            --test_output=streamed \
+            --nocache_test_results

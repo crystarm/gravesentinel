@@ -139,6 +139,26 @@ public:
     return restore_result_;
   }
 
+  [[nodiscard]] CheckpointResult<ccm::RuntimeStatus>
+  get_runtime_status(const ContainerId &container_id,
+                     const RequestId &request_id) override {
+    const std::lock_guard lock(mutex_);
+    status_container_ = container_id.value();
+    status_request_ = request_id.value();
+    return runtime_status_result_;
+  }
+
+  [[nodiscard]] CheckpointResult<void>
+  stop_container(const ContainerId &container_id, const RequestId &request_id,
+                 const OperationId &operation_id) override {
+    const std::lock_guard lock(mutex_);
+    ++stop_calls_;
+    stopped_container_ = container_id.value();
+    stop_request_ = request_id.value();
+    stop_operation_ = operation_id.value();
+    return stop_result_;
+  }
+
   [[nodiscard]] CheckpointResult<void> shutdown() override { return {}; }
 
   void set_registration_result(CheckpointResult<void> result) {
@@ -159,6 +179,11 @@ public:
   void set_restore_result(CheckpointResult<void> result) {
     const std::lock_guard lock(mutex_);
     restore_result_ = std::move(result);
+  }
+
+  void set_runtime_status_result(CheckpointResult<ccm::RuntimeStatus> result) {
+    const std::lock_guard lock(mutex_);
+    runtime_status_result_ = std::move(result);
   }
 
   [[nodiscard]] std::optional<ContainerRegistration> registration() const {
@@ -201,12 +226,46 @@ public:
     return restore_operation_;
   }
 
+  [[nodiscard]] std::string status_container() const {
+    const std::lock_guard lock(mutex_);
+    return status_container_;
+  }
+
+  [[nodiscard]] std::string status_request() const {
+    const std::lock_guard lock(mutex_);
+    return status_request_;
+  }
+
+  [[nodiscard]] int stop_calls() const {
+    const std::lock_guard lock(mutex_);
+    return stop_calls_;
+  }
+
+  [[nodiscard]] std::string stopped_container() const {
+    const std::lock_guard lock(mutex_);
+    return stopped_container_;
+  }
+
+  [[nodiscard]] std::string stop_request() const {
+    const std::lock_guard lock(mutex_);
+    return stop_request_;
+  }
+
+  [[nodiscard]] std::string stop_operation() const {
+    const std::lock_guard lock(mutex_);
+    return stop_operation_;
+  }
+
 private:
   mutable std::mutex mutex_;
   CheckpointResult<void> registration_result_{};
   CheckpointResult<void> unregister_result_{};
   CheckpointResult<void> create_result_{};
   CheckpointResult<void> restore_result_{};
+  CheckpointResult<ccm::RuntimeStatus> runtime_status_result_{
+      ccm::RuntimeStatus{.state = ccm::RuntimeState::absent,
+                         .exit_code = std::nullopt}};
+  CheckpointResult<void> stop_result_{};
   std::optional<ContainerRegistration> registration_;
   int registration_calls_{};
   std::string registration_request_;
@@ -218,6 +277,12 @@ private:
   std::string restored_container_;
   std::string restore_request_;
   std::string restore_operation_;
+  std::string status_container_;
+  std::string status_request_;
+  int stop_calls_{};
+  std::string stopped_container_;
+  std::string stop_request_;
+  std::string stop_operation_;
 };
 
 [[nodiscard]] std::string temporary_journal_path() {
@@ -313,6 +378,20 @@ TEST_F(HypervisorRpcHandlerTest,
   ASSERT_TRUE(captured);
   EXPECT_EQ(*captured, *expected);
   EXPECT_EQ(service_.registration_request(), "register-valid");
+}
+
+TEST_F(HypervisorRpcHandlerTest, ReturnsExactRuntimeStatusJson) {
+  service_.set_runtime_status_result(ccm::RuntimeStatus{
+      .state = ccm::RuntimeState::exited,
+      .exit_code = 137,
+  });
+  RpcHandler handler(service_, *store_);
+
+  const auto status = handler(request("GetRuntimeStatus", "status-request",
+                                      {{"container_id", "container-1"}}));
+  EXPECT_EQ(status, nlohmann::json({{"state", "exited"}, {"exit_code", 137}}));
+  EXPECT_EQ(service_.status_container(), "container-1");
+  EXPECT_EQ(service_.status_request(), "status-request");
 }
 
 TEST_F(HypervisorRpcHandlerTest,
@@ -414,6 +493,33 @@ TEST_F(HypervisorRpcHandlerTest, PreservesEveryStableOperationErrorCode) {
     EXPECT_EQ(operation.at("state"), "failed") << errors[index].name;
     EXPECT_EQ(operation.at("error_code"), errors[index].name);
   }
+}
+
+TEST_F(HypervisorRpcHandlerTest,
+       DurableStopReachesServiceAndDeduplicatesRequestId) {
+  RpcHandler handler(service_, *store_);
+  const auto submission = handler(request("SubmitStopContainer", "stop-request",
+                                          {{"container_id", "container-1"}}));
+  ASSERT_TRUE(submission.is_object());
+  ASSERT_TRUE(submission.contains("operation_id")) << submission.dump();
+  ASSERT_EQ(submission.size(), 2U);
+  EXPECT_FALSE(submission.at("duplicate").get<bool>());
+  const auto operation_id = submission.at("operation_id").get<std::string>();
+
+  const auto duplicate = handler(request("SubmitStopContainer", "stop-request",
+                                         {{"container_id", "container-1"}}));
+  EXPECT_EQ(duplicate, nlohmann::json({{"operation_id", operation_id},
+                                       {"duplicate", true}}));
+
+  const auto terminal = wait_for_terminal(handler, operation_id);
+  ASSERT_FALSE(terminal.is_null());
+  EXPECT_EQ(terminal, nlohmann::json({{"operation_id", operation_id},
+                                      {"state", "succeeded"},
+                                      {"error_code", nullptr}}));
+  EXPECT_EQ(service_.stop_calls(), 1);
+  EXPECT_EQ(service_.stopped_container(), "container-1");
+  EXPECT_EQ(service_.stop_request(), "stop-request");
+  EXPECT_EQ(service_.stop_operation(), operation_id);
 }
 
 TEST_F(HypervisorRpcHandlerTest,

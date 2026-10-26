@@ -180,6 +180,15 @@ struct ContainerRegistration {
   bool operator==(const ContainerRegistration &) const = default;
 };
 
+enum class RuntimeState : std::uint8_t { absent, running, exited };
+
+struct RuntimeStatus {
+  RuntimeState state;
+  std::optional<int> exit_code;
+
+  bool operator==(const RuntimeStatus &) const = default;
+};
+
 enum class StableErrorCode : std::uint8_t {
   invalid_argument,
   not_found,

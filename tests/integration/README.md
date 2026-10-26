@@ -103,8 +103,11 @@ the gate and complete smoke whenever the runtime or host profile changes.
 stage-02 direct Podman smoke and stage-06 adapter helper, it starts the real
 `gravesentinel_hypervisor` subprocess with unique socket and storage roots. Every
 functional lifecycle request uses `SchedulerClient`: handshake, health, register,
-async create/restore submission, `GetOperation` polling, and unregister. Direct
-Podman access is limited to building the fixture image, read-only observations, fault
+async create/restore submission, `GetOperation` polling, and unregister. The recorded
+2026-10-25 marker predates protocol-v3 `GetRuntimeStatus` and durable
+`SubmitStopContainer`; extend and rerun this harness before treating those paths as
+rootfully qualified. Direct Podman access is limited to building the fixture image,
+read-only observations, fault
 oracles, and final ownership-checked cleanup after the daemon has stopped.
 
 The harness covers:

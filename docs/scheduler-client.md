@@ -65,7 +65,7 @@ client checks the connected server with `SO_PEERCRED`. The hypervisor separately
 checks the scheduler UID; socket mode/group permissions only control whether the
 connection can be attempted.
 
-`connect()` performs an eager connection and protocol-v2 handshake. Public RPC
+`connect()` performs an eager connection and protocol-v3 handshake. Public RPC
 methods also open and handshake a connection when no descriptor is active, so an
 explicit `connect()` is useful for readiness but is not required before every
 call. The class serializes calls with an internal mutex. It is movable, not
@@ -122,7 +122,7 @@ from hidden defaults. Mutable shared-volume contents are not checkpointed by CCM
 
 `register_container()` and `unregister_container()` are synchronous boolean
 operations. Overloads accepting a `RequestId` provide correlation but these
-mutations are not stored in the durable operation journal. Protocol v2 maps
+mutations are not stored in the durable operation journal. Protocol v3 maps
 service-side registration failures to `request_failed`, and the boolean API
 returns only `false`; reconcile scheduler desired state before retrying an
 ambiguous register/unregister exchange.
@@ -138,8 +138,14 @@ submit_create_checkpoint(const ContainerId &, const RequestId &);
 std::expected<OperationId, RpcFailure>
 submit_restore_or_restart(const ContainerId &, const RequestId &);
 
+std::expected<OperationId, RpcFailure>
+submit_stop_container(const ContainerId &, const RequestId &);
+
 std::expected<OperationStatus, RpcFailure>
 get_operation(const OperationId &);
+
+std::expected<RuntimeStatus, RpcFailure>
+get_runtime_status(const ContainerId &);
 ```
 
 Submission is acknowledged only after a `queued` record is durable. The
@@ -159,17 +165,51 @@ Poll until one of the terminal states:
 
 After restart, a recovered `queued` operation becomes a definite interrupted
 failure and is not executed. A recovered `running` operation becomes
-`indeterminate`. The MVP deliberately does not infer success from an observed
-runtime or publication phase and never automatically retries destructive work.
+`indeterminate`. The same applies when a stop/remove command may have changed the
+runtime but its final absence cannot be proven. The MVP deliberately does not infer
+success from an observed runtime or publication phase and never automatically retries
+destructive work.
 
 A robust scheduler stores `{RequestId, OperationId}` before losing its own state,
 reconnects after transport failure, and resumes `get_operation(OperationId)`. If
 submission response delivery was ambiguous and no `OperationId` was received,
 resubmit the exact operation with the same `RequestId`.
 
+## Runtime observation and adoption
+
+`get_runtime_status()` is a read-only RPC for a registered logical container. Its
+strict result is one of:
+
+| State | `exit_code` | Meaning |
+| --- | --- | --- |
+| `absent` | absent | Neither the normal nor external Podman namespace contains the configured runtime name. |
+| `running` | absent | The owned runtime incarnation is present and running. |
+| `exited` | integer | The owned runtime incarnation is present but its process exited with this code. |
+
+A present result is returned only after the hypervisor validates GraveSentinel
+ownership labels, the registered container cpuset, and the immutable Podman runtime
+ID. The service stores that incarnation as its current in-memory fence. An `absent`
+result clears any cached incarnation. Status inspection runs on the same per-container
+worker as create, restore, and stop, so it cannot race those operations inside the
+service.
+
+Registrations are not persisted. After a daemon restart, reconnect, replay each desired
+registration, then call `get_runtime_status()` before making a new runtime decision.
+This inspect-and-adopt sequence lets later checkpoint, restore, or stop use the observed
+incarnation rather than assuming that daemon memory reflects Podman state.
+
+`submit_stop_container()` is a durable desired-state operation. It stops the expected
+owned incarnation when running, removes it, and proves absence in both normal and
+external Podman namespaces. If daemon memory has no incarnation after restart, the
+operation first inspects and adopts the owned runtime; an already absent runtime is a
+successful no-op. Foreign ownership, a changed runtime ID, a wrong cpuset, or external
+presence fails closed. If mutation may have begun but final absence is not proven, the
+operation is `indeterminate` and the scheduler must inspect again.
+
 ## Boolean wrappers
 
-`create_checkpoint()` and `restore_or_restart()` are convenience methods. Each:
+`create_checkpoint()`, `restore_or_restart()`, and `stop_container()` are convenience
+methods. Each:
 
 1. creates a random request ID;
 2. submits the durable operation;
@@ -189,8 +229,8 @@ Each packet operation is bounded by `rpc_timeout`; wrapper polling is also
 bounded by `operation_timeout`. The client closes a descriptor on unavailable,
 deadline, or protocol errors and reconnects when a later call needs transport.
 It may make one transport retry when connection failed before an exchange.
-Async submission and read-only calls can repeat an ambiguous exchange safely
-because request IDs deduplicate the mutation. Register/unregister disable retry
+Async submission can repeat an ambiguous exchange safely because caller-owned request
+IDs deduplicate the mutation. Read-only calls may also be repeated. Register/unregister disable retry
 after a request may have reached the server.
 
 The server bounds packet size, accepted-peer queue, requests per connection, and
@@ -199,8 +239,8 @@ and handshakes a new connection on the next call.
 
 ## Protocol compatibility
 
-The current wire protocol is exactly version 2. Handshake requires both version
-2 and service name `gravesentinel_hypervisor`. There is no version negotiation
+The current wire protocol is exactly version 3. Handshake requires both version
+3 and service name `gravesentinel_hypervisor`. There is no version negotiation
 or TCP transport. Unknown versions, envelope fields, methods, and malformed or
 oversized packets are rejected. Upgrade scheduler and hypervisor as a compatible
 pair; see [`operations.md`](operations.md) for the stop/upgrade/re-register

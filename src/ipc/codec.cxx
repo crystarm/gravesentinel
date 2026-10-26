@@ -254,8 +254,9 @@ validate_request_message(const nlohmann::json &message) {
   }
   if (method == "Register")
     return validate_registration(parameters);
-  if (method == "Unregister" || method == "SubmitCreateCheckpoint" ||
-      method == "SubmitRestoreOrRestart") {
+  if (method == "Unregister" || method == "GetRuntimeStatus" ||
+      method == "SubmitCreateCheckpoint" ||
+      method == "SubmitRestoreOrRestart" || method == "SubmitStopContainer") {
     if (!has_exact_keys(parameters, {"container_id"}) ||
         !parameters.at("container_id").is_string() ||
         !valid_identifier(

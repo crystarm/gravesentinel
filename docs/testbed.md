@@ -23,10 +23,11 @@ suite completed all crash, reconciliation, storage-fault, stress, GC, shutdown, 
 cleanup scenarios and emitted
 `RESULT: QUALIFIED crash/reconnect/recovery acceptance passed`.
 
-The qualified entries are historical qualification records for the measured host on those dates,
-not statements that the current host or current runtime installation has been
-rechecked. Qualification applies only to the exact runtime profile and command
-boundary in this document. A `+CRIU` feature in `crun --version` means that the
+The qualified entries are historical qualification records for the measured host on
+those dates, not statements that the current host or current runtime installation has
+been rechecked. They also predate protocol v3 runtime status/adoption and durable
+stop/remove, so they do not qualify those current-code paths. Qualification applies
+only to the exact runtime profile and command boundary in this document. A `+CRIU` feature in `crun --version` means that the
 OCI runtime was compiled with CRIU integration; the successful smoke, not that
 feature flag, is the evidence that the complete workflow works.
 
@@ -99,9 +100,11 @@ binary and drives functional operations through `SchedulerClient`.
 The process-boundary target completed successfully in the qualified rootful context
 on 2026-10-24 and was requalified against the current production recovery code on
 2026-10-25. Both runs emitted
-`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. This is the stage-12
-production-daemon E2E evidence; the older direct and adapter qualification records
-remain evidence for their narrower boundaries.
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. This is historical
+stage-12 production-daemon E2E evidence for protocol v2; it must be rerun and extended
+to exercise protocol-v3 status/adoption and durable stop/remove before it qualifies the
+current lifecycle boundary. The older direct and adapter qualification records remain
+evidence for their narrower boundaries.
 
 `scripts/check_testbed.sh` is a prerequisite screen, not an exact implementation
 of the adapter fingerprint. It checks Linux/x86-64, the exact kernel, CPU

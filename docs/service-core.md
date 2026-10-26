@@ -3,7 +3,7 @@
 ## Scope and API boundary
 
 `//src/core:checkpoint_service` owns registrations and dispatches synchronous
-create/restore orchestration plus internal maintenance implemented by
+create/restore/status/stop orchestration plus internal maintenance implemented by
 [`CheckpointCreator`](checkpoint-create.md),
 [`RestoreCoordinator`](checkpoint-restore.md), and
 [`CheckpointMaintenance`](maintenance.md). The production
@@ -13,10 +13,11 @@ operation store, RPC handler, and Unix socket server.
 
 `ICheckpointService` itself remains an in-process synchronous interface with
 `register_container`, `unregister_container`, `create_checkpoint`,
-`restore_or_restart`, and `shutdown`. Direct create/restore calls supply both
-`RequestId` and `OperationId` and return `CheckpointResult<void>` only after a
-terminal result. The core does not enforce global ID uniqueness or provide replay;
-a direct retry with new IDs is a new operation.
+`restore_or_restart`, `get_runtime_status`, `stop_container`, and `shutdown`. Direct
+create/restore/stop calls supply both `RequestId` and `OperationId` and return
+`CheckpointResult<void>` only after a terminal result; status supplies a `RequestId`
+and returns `RuntimeStatus`. The core does not enforce global ID uniqueness or provide
+replay; a direct retry with new IDs is a new operation.
 
 The production RPC boundary deliberately adds different semantics around this core:
 
@@ -24,14 +25,16 @@ The production RPC boundary deliberately adds different semantics around this co
   and `SchedulerClient` does not transport-retry either mutation after an exchange
   may already have reached the server. A false/ambiguous result requires scheduler
   reconciliation of desired registration state.
-- `SubmitCreateCheckpoint` and `SubmitRestoreOrRestart` durably enqueue work and
-  return a deterministic `OperationId`; `GetOperation` polls `queued`, `running`,
-  `succeeded`, `failed`, or `indeterminate`.
-- the high-level synchronous client methods for create/restore are implemented as a
-  bounded submit-and-poll loop and return `true` only after confirmed success.
+- `SubmitCreateCheckpoint`, `SubmitRestoreOrRestart`, and `SubmitStopContainer`
+  durably enqueue work and return a deterministic `OperationId`; `GetOperation` polls
+  `queued`, `running`, `succeeded`, `failed`, or `indeterminate`.
+- `GetRuntimeStatus` synchronously inspects a registered runtime through its worker and
+  returns `absent`, `running`, or `exited` plus an exit code only for `exited`.
+- the high-level synchronous client methods for create/restore/stop are implemented as
+  a bounded submit-and-poll loop and return `true` only after confirmed success.
 
 The operation journal is outside `CheckpointService`. It deduplicates equal
-create/restore submissions by `RequestId` and canonical method/container payload,
+create/restore/stop submissions by `RequestId` and canonical method/container payload,
 preserves results across restart, and passes its deterministic operation ID into the
 synchronous service call. This distinction is important: calling the core directly
 does not acquire IPC idempotency merely because the production daemon has it.
@@ -50,7 +53,7 @@ its `ICheckpointOperations` seam without constructing storage or Podman.
 
 ## `ContainerRegistration` wire schema
 
-In protocol v2, the `Register` method carries the complete registration as its `params`
+In protocol v3, the `Register` method carries the complete registration as its `params`
 object. The schema is exact: all keys shown below are required, no extra keys are
 accepted, and optional C++ values are encoded as `null` or a complete object.
 
@@ -147,7 +150,7 @@ accepts the configured scheduler UID (or its own effective UID when none is
 configured). The socket GID is optional and its mode defaults to `0660`; filesystem
 access and the exact peer-UID check both have to pass.
 
-For create/restore, the default operation-store limits are 64 in-flight operations,
+For create/restore/stop, the default operation-store limits are 64 in-flight operations,
 4096 retained records, at most 8192 append-log entries before the entry limit forces
 compaction, and a 64 MiB journal. The store persists and `fsync`s acceptance as `queued` before
 returning an operation ID, persists `running` before execution, and persists the
@@ -169,7 +172,7 @@ its registrations do not yet exist, so startup performs no retention because no
 
 At operation-journal startup, a record left `queued` by a crash becomes `failed` with an
 interrupted-before-execution classification and is not run. A record left `running`
-becomes `indeterminate`, because its create/restore side effects cannot be inferred
+becomes `indeterminate`, because its create/restore/stop side effects cannot be inferred
 from the journal. `indeterminate` requires scheduler/operator reconciliation of
 manifest publication and runtime presence; it is not permission to submit another
 destructive attempt blindly.
@@ -193,7 +196,7 @@ contract.
 One worker per slot provides both limits without a global unbounded queue:
 
 - no more than four container operations can execute simultaneously;
-- create, restore, retention, and GC for one `ContainerId` are serialized;
+- create, restore, status, stop, retention, and GC for one `ContainerId` are serialized;
 - operations for different IDs can execute concurrently;
 - maintenance reuses the same `checkpoint_cpu` affinity; there is no fifth CPU-heavy
   worker or separate maintenance pool.
@@ -215,10 +218,19 @@ retryable conflict so the scheduler can retry after the operation finishes.
 
 After a successful create, the returned source `RuntimeIncarnation` is retained in
 memory and supplied to the next restore as the exact source fence. A successful
-restore replaces it with the restored incarnation. A failed restore clears this
-hint, forcing the next attempt through the coordinator's conservative absence
-proof. The service itself neither persists cold-start environment values nor adds
-them to log fields; the collaborator-diagnostic constraint below still applies.
+restore replaces it with the restored incarnation. A failed restore clears this hint,
+forcing the next attempt through the coordinator's conservative absence proof.
+
+A successful runtime-status inspection also updates this fence: `running` or `exited`
+adopts the validated immutable incarnation, while `absent` clears it. This is required
+after daemon restart because registrations and incarnation hints are in memory. Stop
+consumes the cached incarnation; when none is cached, production operations inspect
+and adopt first. Already absent is success. Stop/removal errors after a Podman mutation
+may have begun carry `incarnation_may_exist`, causing the durable public operation to
+be `indeterminate`.
+
+The service itself neither persists cold-start environment values nor adds them to log
+fields; the collaborator-diagnostic constraint below still applies.
 
 ## Periodic creation and maintenance scheduling
 
@@ -265,13 +277,14 @@ scheduling.
 ## Unregister and shutdown
 
 `unregister_container` first examines the slot under its mutex. If foreground work is
-pending or any create/restore/maintenance item is active, it returns a retryable
+pending or any create/restore/status/stop/maintenance item is active, it returns a retryable
 `conflict` without closing or removing the registration. Otherwise it atomically marks
 the slot closing, drops pending periodic-create and coalesced maintenance work, clears
 retry deadlines, rejects new work, and joins the idle worker.
 The worker restores its affinity and exits before the registry slot and CPU assignment
 are released. Register, unregister, and shutdown calls are globally serialized by the
-lifecycle mutex, while manual create/restore admission proceeds through per-slot locks.
+lifecycle mutex, while manual create/restore/status/stop admission proceeds through
+per-slot locks.
 
 `shutdown` is idempotent. It marks every slot closing, drops queued periodic and
 maintenance work, clears retry deadlines, stops and joins the scheduler, drains an

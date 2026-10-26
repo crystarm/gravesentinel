@@ -170,7 +170,7 @@ bool valid_json_string(std::string_view value) {
 
 bool valid_method(std::string_view method) {
   return method == "SubmitCreateCheckpoint" ||
-         method == "SubmitRestoreOrRestart";
+         method == "SubmitRestoreOrRestart" || method == "SubmitStopContainer";
 }
 
 std::expected<void, StoreError>

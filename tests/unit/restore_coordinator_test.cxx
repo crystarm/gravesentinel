@@ -682,6 +682,13 @@ public:
                                            "capture is not under test"));
   }
 
+  [[nodiscard]] CheckpointResult<RuntimeObservation>
+  inspect_runtime(const ContainerId &, const RuntimeContainerRef &,
+                  RuntimeCpuAssignment) override {
+    return std::unexpected(make_test_error(
+        StableErrorCode::internal, "runtime inspection is not under test"));
+  }
+
   [[nodiscard]] CheckpointResult<void>
   stop_and_remove(const ContainerId &,
                   const RuntimeIncarnation &expected_incarnation,

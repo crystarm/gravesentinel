@@ -75,6 +75,32 @@ TEST(IpcCodecTest, AcceptsNoArgumentRequestOnlyWithObjectParams) {
   EXPECT_FALSE(decode_request(null_parameters.dump()));
 }
 
+TEST(IpcCodecTest, AcceptsExactRuntimeStatusAndStopContainerRequests) {
+  for (const std::string method : {"GetRuntimeStatus", "SubmitStopContainer"}) {
+    const auto message =
+        request(method, {{"container_id", "container-runtime"}});
+    const auto encoded = encode_request(message);
+    ASSERT_TRUE(encoded) << method << ": " << encoded.error().message;
+
+    const auto decoded = decode_request(*encoded);
+    ASSERT_TRUE(decoded) << method << ": " << decoded.error().message;
+    EXPECT_EQ(*decoded, message);
+  }
+}
+
+TEST(IpcCodecTest, RejectsInexactRuntimeStatusAndStopContainerRequests) {
+  for (const std::string method : {"GetRuntimeStatus", "SubmitStopContainer"}) {
+    const auto missing = request(method, nlohmann::json::object());
+    EXPECT_FALSE(encode_request(missing)) << method;
+    EXPECT_FALSE(decode_request(missing.dump())) << method;
+
+    auto extra = request(method, {{"container_id", "container-runtime"}});
+    extra["params"]["unexpected"] = true;
+    EXPECT_FALSE(encode_request(extra)) << method;
+    EXPECT_FALSE(decode_request(extra.dump())) << method;
+  }
+}
+
 TEST(IpcCodecTest, RequestAndResponseSchemasAreDistinctAndExact) {
   auto extra_request = request("GetHealth", nlohmann::json::object());
   extra_request["unknown"] = true;

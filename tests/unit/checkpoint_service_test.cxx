@@ -366,6 +366,8 @@ private:
 enum class ObservedOperationKind : std::uint8_t {
   create,
   restore,
+  status,
+  stop,
   retention,
   garbage_collection,
 };
@@ -449,6 +451,11 @@ public:
     next_create_callback_ = std::move(callback);
   }
 
+  void set_runtime_observation(RuntimeObservation observation) {
+    const std::scoped_lock lock{mutex_};
+    runtime_observation_ = std::move(observation);
+  }
+
   void wait_for_active_calls(std::size_t expected_count) {
     std::unique_lock lock{mutex_};
     condition_.wait(lock, [&] { return active_calls_ >= expected_count; });
@@ -521,6 +528,12 @@ public:
     return restore_requests_;
   }
 
+  [[nodiscard]] std::vector<std::optional<RuntimeIncarnation>>
+  stop_expected_incarnations() const {
+    const std::scoped_lock lock{mutex_};
+    return stop_expected_incarnations_;
+  }
+
   [[nodiscard]] std::vector<std::size_t> retention_keep_last_values() const {
     const std::scoped_lock lock{mutex_};
     return retention_keep_last_values_;
@@ -584,6 +597,28 @@ public:
         .pin_release_complete = true,
         .staging_cleanup_complete = true,
     };
+  }
+
+  [[nodiscard]] CheckpointResult<RuntimeObservation>
+  inspect_runtime(const ContainerRegistration &registration) override {
+    auto context = enter_runtime(ObservedOperationKind::status, registration);
+    wait_if_blocked(context.blocked);
+    leave_call(context.container_id);
+    const std::scoped_lock lock{mutex_};
+    return runtime_observation_;
+  }
+
+  [[nodiscard]] CheckpointResult<void> stop_runtime(
+      const ContainerRegistration &registration,
+      const std::optional<RuntimeIncarnation> &expected_incarnation) override {
+    auto context = enter_runtime(ObservedOperationKind::stop, registration);
+    {
+      const std::scoped_lock lock{mutex_};
+      stop_expected_incarnations_.push_back(expected_incarnation);
+    }
+    wait_if_blocked(context.blocked);
+    leave_call(context.container_id);
+    return {};
   }
 
   [[nodiscard]] CheckpointResult<RetentionReport>
@@ -678,6 +713,17 @@ private:
     return enter_call_locked(ObservedOperationKind::restore,
                              request.container_id.value(), current_thread_id,
                              worker_cpu, throw_exception, fail_operation, false,
+                             true);
+  }
+
+  [[nodiscard]] CallContext
+  enter_runtime(ObservedOperationKind kind,
+                const ContainerRegistration &registration) {
+    const auto worker_cpu = affinity_.current_cpu();
+    const auto current_thread_id = std::this_thread::get_id();
+    std::scoped_lock lock{mutex_};
+    return enter_call_locked(kind, registration.container_id.value(),
+                             current_thread_id, worker_cpu, false, false, false,
                              true);
   }
 
@@ -800,6 +846,12 @@ private:
   std::vector<OperationObservation> observations_;
   std::vector<CheckpointCreateRequest> create_requests_;
   std::vector<RestoreRequest> restore_requests_;
+  RuntimeObservation runtime_observation_{
+      .status = RuntimeStatus{.state = RuntimeState::absent,
+                              .exit_code = std::nullopt},
+      .incarnation = std::nullopt,
+  };
+  std::vector<std::optional<RuntimeIncarnation>> stop_expected_incarnations_;
   std::vector<std::size_t> retention_keep_last_values_;
 };
 
@@ -1008,6 +1060,167 @@ TEST(CheckpointServiceTest, SerializesOperationsForTheSameContainer) {
   EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::restore), 1U);
   EXPECT_EQ(rig.operations.maximum_active_calls_for(registration.container_id),
             1U);
+  EXPECT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest,
+     RuntimeStatusRunsOnWorkerAndAdoptsIncarnationForStop) {
+  TestRig rig;
+  const auto registration = make_registration("status-container", 0U, 1U);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-status-container")));
+  const RuntimeIncarnation observed_incarnation{
+      .reference = registration.runtime_container,
+      .runtime_id = "observed-runtime-id",
+  };
+  rig.operations.set_runtime_observation(RuntimeObservation{
+      .status = RuntimeStatus{.state = RuntimeState::running,
+                              .exit_code = std::nullopt},
+      .incarnation = observed_incarnation,
+  });
+
+  const auto status = rig.service.get_runtime_status(
+      registration.container_id, make_request("inspect-status-container"));
+  ASSERT_TRUE(status);
+  EXPECT_EQ(status->state, RuntimeState::running);
+  EXPECT_FALSE(status->exit_code.has_value());
+  ASSERT_TRUE(rig.service.stop_container(
+      registration.container_id, make_request("stop-status-container"),
+      make_operation("stop-status-operation")));
+
+  const auto observations = rig.operations.observations();
+  ASSERT_EQ(observations.size(), 2U);
+  EXPECT_EQ(observations[0].kind, ObservedOperationKind::status);
+  EXPECT_EQ(observations[1].kind, ObservedOperationKind::stop);
+  for (const auto &observation : observations) {
+    EXPECT_NE(observation.thread_id, rig.control_thread_id);
+    EXPECT_EQ(observation.thread_id, observations.front().thread_id);
+    ASSERT_TRUE(observation.worker_cpu.has_value());
+    EXPECT_EQ(*observation.worker_cpu, registration.checkpoint.checkpoint_cpu);
+  }
+
+  const auto stop_incarnations = rig.operations.stop_expected_incarnations();
+  ASSERT_EQ(stop_incarnations.size(), 1U);
+  ASSERT_TRUE(stop_incarnations.front().has_value());
+  EXPECT_EQ(*stop_incarnations.front(), observed_incarnation);
+  EXPECT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest, RuntimeStatusSerializesWithActiveCreate) {
+  TestRig rig;
+  const auto registration = make_registration("status-serial", 0U, 1U);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-status-serial")));
+  rig.operations.block_next_calls(ObservedOperationKind::create, 1U);
+
+  std::optional<CheckpointResult<void>> create_result;
+  std::jthread create_caller([&] {
+    create_result = rig.service.create_checkpoint(
+        registration.container_id, make_request("create-before-status"),
+        make_operation("create-before-status-operation"));
+  });
+  rig.operations.wait_for_active_calls(1U);
+
+  std::latch status_started{1};
+  std::optional<CheckpointResult<RuntimeStatus>> status_result;
+  std::jthread status_caller([&] {
+    status_started.count_down();
+    status_result = rig.service.get_runtime_status(
+        registration.container_id, make_request("status-after-create"));
+  });
+  status_started.wait();
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::status), 0U);
+
+  rig.operations.release_blocked_calls();
+  create_caller.join();
+  status_caller.join();
+  ASSERT_TRUE(create_result.has_value());
+  ASSERT_TRUE(status_result.has_value());
+  EXPECT_TRUE(*create_result);
+  EXPECT_TRUE(*status_result);
+  EXPECT_EQ(rig.operations.maximum_active_calls_for(registration.container_id),
+            1U);
+
+  const auto creates =
+      rig.operations.observations(ObservedOperationKind::create);
+  const auto statuses =
+      rig.operations.observations(ObservedOperationKind::status);
+  ASSERT_EQ(creates.size(), 1U);
+  ASSERT_EQ(statuses.size(), 1U);
+  EXPECT_EQ(statuses.front().thread_id, creates.front().thread_id);
+  EXPECT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest, StopSerializesWithActiveRestore) {
+  TestRig rig;
+  const auto registration = make_registration("stop-serial", 0U, 1U);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-stop-serial")));
+  rig.operations.block_next_calls(ObservedOperationKind::restore, 1U);
+
+  std::optional<CheckpointResult<void>> restore_result;
+  std::jthread restore_caller([&] {
+    restore_result = rig.service.restore_or_restart(
+        registration.container_id, make_request("restore-before-stop"),
+        make_operation("restore-before-stop-operation"));
+  });
+  rig.operations.wait_for_active_calls(1U);
+
+  std::latch stop_started{1};
+  std::optional<CheckpointResult<void>> stop_result;
+  std::jthread stop_caller([&] {
+    stop_started.count_down();
+    stop_result = rig.service.stop_container(
+        registration.container_id, make_request("stop-after-restore"),
+        make_operation("stop-after-restore-operation"));
+  });
+  stop_started.wait();
+  EXPECT_EQ(rig.operations.total_calls(ObservedOperationKind::stop), 0U);
+
+  rig.operations.release_blocked_calls();
+  restore_caller.join();
+  stop_caller.join();
+  ASSERT_TRUE(restore_result.has_value());
+  ASSERT_TRUE(stop_result.has_value());
+  EXPECT_TRUE(*restore_result);
+  EXPECT_TRUE(*stop_result);
+  EXPECT_EQ(rig.operations.maximum_active_calls_for(registration.container_id),
+            1U);
+
+  const auto restores =
+      rig.operations.observations(ObservedOperationKind::restore);
+  const auto stops = rig.operations.observations(ObservedOperationKind::stop);
+  ASSERT_EQ(restores.size(), 1U);
+  ASSERT_EQ(stops.size(), 1U);
+  EXPECT_EQ(stops.front().thread_id, restores.front().thread_id);
+  EXPECT_TRUE(rig.service.shutdown());
+}
+
+TEST(CheckpointServiceTest, AbsentRuntimeStatusClearsCachedIncarnation) {
+  TestRig rig;
+  const auto registration = make_registration("absent-status", 0U, 1U);
+  ASSERT_TRUE(rig.service.register_container(
+      registration, make_request("register-absent-status")));
+  ASSERT_TRUE(rig.service.restore_or_restart(
+      registration.container_id, make_request("restore-before-absent-status"),
+      make_operation("restore-before-absent-status-operation")));
+  rig.operations.set_runtime_observation(RuntimeObservation{
+      .status = RuntimeStatus{.state = RuntimeState::absent,
+                              .exit_code = std::nullopt},
+      .incarnation = std::nullopt,
+  });
+
+  const auto status = rig.service.get_runtime_status(
+      registration.container_id, make_request("inspect-absent-status"));
+  ASSERT_TRUE(status);
+  EXPECT_EQ(status->state, RuntimeState::absent);
+  ASSERT_TRUE(rig.service.stop_container(
+      registration.container_id, make_request("stop-after-absent-status"),
+      make_operation("stop-after-absent-status-operation")));
+
+  const auto stop_incarnations = rig.operations.stop_expected_incarnations();
+  ASSERT_EQ(stop_incarnations.size(), 1U);
+  EXPECT_FALSE(stop_incarnations.front().has_value());
   EXPECT_TRUE(rig.service.shutdown());
 }
 

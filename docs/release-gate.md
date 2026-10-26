@@ -93,11 +93,12 @@ not rootful qualification.
 
 ## Qualification status
 
-The non-privileged release gate produced its marker on 2026-10-25. On the same date,
-stage 12 was requalified against the current production startup-recovery code, the
-four-container CPU suite qualified twice, and the crash/reconnect/recovery suite
-qualified once. All three current-code rootful acceptance markers are recorded, so
-stage 13 and the MVP are qualified for the dated testbed.
+The non-privileged release gate and all three rootful acceptance suites produced their
+markers on 2026-10-25 for the then-current protocol-v2 code. Protocol v3 subsequently
+added runtime status/adoption and durable stop/remove, changing IPC, journal admission,
+per-container service work, and privileged cleanup. The old markers are historical and
+do not qualify the current code. Rerun the non-privileged gate and all affected rootful
+suites before release.
 
 ## Requalification triggers
 
@@ -105,8 +106,8 @@ Repeat the non-privileged gate after source, build, dependency, public API, or
 protocol changes. Repeat the rootful prerequisite and all affected destructive
 suites after changes to:
 
-- hypervisor composition, IPC, storage, journal, create/restore, maintenance, or
-  runtime code;
+- hypervisor composition, IPC, storage, journal, create/restore/status/stop,
+  maintenance, or runtime code;
 - kernel, Podman, crun, CRIU, cgroup, CPU, privilege, AppArmor, SELinux, seccomp,
   or capability profile;
 - runtime command argv, fixture, container security options, or cleanup logic.

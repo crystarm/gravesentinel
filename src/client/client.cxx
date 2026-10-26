@@ -7,7 +7,9 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <poll.h>
@@ -587,6 +589,45 @@ parse_health(const nlohmann::json &result) {
   return HealthStatus{health, queue, gravesentinel::ipc::protocol_version};
 }
 
+[[nodiscard]] std::expected<RuntimeStatus, RpcFailure>
+parse_runtime_status(const nlohmann::json &result) {
+  if (!has_exact_keys(result, {"state", "exit_code"}) ||
+      !result.at("state").is_string() ||
+      (!result.at("exit_code").is_null() &&
+       !result.at("exit_code").is_number_integer())) {
+    return std::unexpected(failure(RpcFailureCode::protocol_error,
+                                   "invalid runtime status response"));
+  }
+  RuntimeState state;
+  const auto &state_text = result.at("state").get_ref<const std::string &>();
+  if (state_text == "absent")
+    state = RuntimeState::absent;
+  else if (state_text == "running")
+    state = RuntimeState::running;
+  else if (state_text == "exited")
+    state = RuntimeState::exited;
+  else
+    return std::unexpected(
+        failure(RpcFailureCode::protocol_error, "unknown runtime state"));
+
+  std::optional<int> exit_code;
+  if (result.at("exit_code").is_number_integer()) {
+    const auto value = result.at("exit_code").get<std::int64_t>();
+    if (value < std::numeric_limits<int>::min() ||
+        value > std::numeric_limits<int>::max()) {
+      return std::unexpected(failure(RpcFailureCode::protocol_error,
+                                     "runtime exit code is out of range"));
+    }
+    exit_code = static_cast<int>(value);
+  }
+  if ((state == RuntimeState::exited) != exit_code.has_value()) {
+    return std::unexpected(
+        failure(RpcFailureCode::protocol_error,
+                "runtime status has an inconsistent exit code"));
+  }
+  return RuntimeStatus{.state = state, .exit_code = exit_code};
+}
+
 [[nodiscard]] RpcFailure moved_client_failure() {
   return failure(RpcFailureCode::unavailable, "client has been moved");
 }
@@ -671,6 +712,18 @@ SchedulerClient::submit_restore_or_restart(const ContainerId &container_id,
   return parse_submission(*result);
 }
 
+std::expected<OperationId, RpcFailure>
+SchedulerClient::submit_stop_container(const ContainerId &container_id,
+                                       const RequestId &request_id) {
+  if (!impl_)
+    return std::unexpected(moved_client_failure());
+  auto result = impl_->call("SubmitStopContainer", request_id.value(),
+                            {{"container_id", container_id.value()}});
+  if (!result)
+    return std::unexpected(result.error());
+  return parse_submission(*result);
+}
+
 std::expected<OperationStatus, RpcFailure>
 SchedulerClient::get_operation(const OperationId &operation_id) {
   if (!impl_)
@@ -695,6 +748,20 @@ std::expected<HealthStatus, RpcFailure> SchedulerClient::get_health() {
   if (!result)
     return std::unexpected(result.error());
   return parse_health(*result);
+}
+
+std::expected<RuntimeStatus, RpcFailure>
+SchedulerClient::get_runtime_status(const ContainerId &container_id) {
+  if (!impl_)
+    return std::unexpected(moved_client_failure());
+  auto request_id = random_request_id();
+  if (!request_id)
+    return std::unexpected(request_id.error());
+  auto result = impl_->call("GetRuntimeStatus", *request_id,
+                            {{"container_id", container_id.value()}});
+  if (!result)
+    return std::unexpected(result.error());
+  return parse_runtime_status(*result);
 }
 
 bool SchedulerClient::create_checkpoint(const ContainerId &container_id) {
@@ -749,6 +816,49 @@ bool SchedulerClient::restore_or_restart(const ContainerId &container_id) {
     return false;
   auto submitted =
       impl_->call("SubmitRestoreOrRestart", *request_id,
+                  {{"container_id", container_id.value()}}, deadline);
+  if (!submitted)
+    return false;
+  auto operation_id = parse_submission(*submitted);
+  if (!operation_id)
+    return false;
+
+  while (Clock::now() < deadline) {
+    auto poll_id = random_request_id();
+    if (!poll_id)
+      return false;
+    auto result =
+        impl_->call("GetOperation", *poll_id,
+                    {{"operation_id", operation_id->value()}}, deadline);
+    if (!result)
+      return false;
+    auto status = parse_operation(*result, *operation_id);
+    if (!status)
+      return false;
+    if (status->state == OperationState::succeeded)
+      return true;
+    if (status->state == OperationState::failed ||
+        status->state == OperationState::indeterminate)
+      return false;
+    const auto remaining = deadline - Clock::now();
+    if (remaining <= Clock::duration::zero())
+      return false;
+    std::this_thread::sleep_for(
+        std::min(std::chrono::milliseconds{25},
+                 std::chrono::ceil<std::chrono::milliseconds>(remaining)));
+  }
+  return false;
+}
+
+bool SchedulerClient::stop_container(const ContainerId &container_id) {
+  if (!impl_)
+    return false;
+  const auto deadline = Clock::now() + impl_->operation_timeout;
+  auto request_id = random_request_id();
+  if (!request_id)
+    return false;
+  auto submitted =
+      impl_->call("SubmitStopContainer", *request_id,
                   {{"container_id", container_id.value()}}, deadline);
   if (!submitted)
     return false;

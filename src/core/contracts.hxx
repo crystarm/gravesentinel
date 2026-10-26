@@ -32,6 +32,13 @@ struct RuntimeIncarnation {
   bool operator==(const RuntimeIncarnation &) const = default;
 };
 
+struct RuntimeObservation {
+  RuntimeStatus status;
+  std::optional<RuntimeIncarnation> incarnation;
+
+  bool operator==(const RuntimeObservation &) const = default;
+};
+
 struct CapturedSnapshot {
   std::filesystem::path artifact_path;
   std::string source_image_identity;
@@ -188,6 +195,10 @@ public:
           const RuntimeContainerRef &runtime_container,
           const std::filesystem::path &staging_directory,
           RuntimeCpuAssignment cpu_assignment) = 0;
+  [[nodiscard]] virtual CheckpointResult<RuntimeObservation>
+  inspect_runtime(const ContainerId &container_id,
+                  const RuntimeContainerRef &runtime_container,
+                  RuntimeCpuAssignment cpu_assignment) = 0;
   [[nodiscard]] virtual CheckpointResult<void>
   stop_and_remove(const ContainerId &container_id,
                   const RuntimeIncarnation &expected_incarnation,
@@ -349,6 +360,12 @@ public:
   restore_or_restart(const ContainerId &container_id,
                      const RequestId &request_id,
                      const OperationId &operation_id) = 0;
+  [[nodiscard]] virtual CheckpointResult<RuntimeStatus>
+  get_runtime_status(const ContainerId &container_id,
+                     const RequestId &request_id) = 0;
+  [[nodiscard]] virtual CheckpointResult<void>
+  stop_container(const ContainerId &container_id, const RequestId &request_id,
+                 const OperationId &operation_id) = 0;
   [[nodiscard]] virtual CheckpointResult<void> shutdown() = 0;
 };
 

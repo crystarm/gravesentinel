@@ -266,6 +266,20 @@ parse_runtime_id_output(std::string output) {
   return value->get<bool>();
 }
 
+[[nodiscard]] std::optional<int> int_member(const Json &object,
+                                            std::string_view name) {
+  const auto *value = member(object, name);
+  if (value == nullptr || !value->is_number_integer()) {
+    return std::nullopt;
+  }
+  const auto number = value->get<std::int64_t>();
+  if (number < std::numeric_limits<int>::min() ||
+      number > std::numeric_limits<int>::max()) {
+    return std::nullopt;
+  }
+  return static_cast<int>(number);
+}
+
 [[nodiscard]] std::vector<std::string> split_lines(std::string_view value) {
   std::vector<std::string> lines;
   std::size_t begin = 0U;
@@ -363,6 +377,7 @@ struct ContainerInspection {
   std::string runtime_id;
   std::string image_identity;
   bool running;
+  int exit_code;
   std::string cpuset;
   std::string managed;
   std::string logical_id;
@@ -495,6 +510,71 @@ public:
         });
   }
 
+  [[nodiscard]] CheckpointResult<RuntimeObservation>
+  inspect_runtime(const ContainerId &container_id,
+                  const RuntimeContainerRef &runtime_container,
+                  RuntimeCpuAssignment cpu_assignment) {
+    return with_affinity<RuntimeObservation>(
+        cpu_assignment, "inspect runtime",
+        [&]() -> CheckpointResult<RuntimeObservation> {
+          if (const auto reference =
+                  validate_runtime_reference(runtime_container);
+              !reference) {
+            return std::unexpected(reference.error());
+          }
+          if (const auto logical_id = validate_logical_id(container_id);
+              !logical_id) {
+            return std::unexpected(logical_id.error());
+          }
+          const auto presence =
+              container_presence(runtime_container.value(), cpu_assignment,
+                                 StableErrorCode::unavailable);
+          if (!presence) {
+            return std::unexpected(presence.error());
+          }
+          if (!presence->normal) {
+            if (presence->external) {
+              return std::unexpected(make_error(
+                  StableErrorCode::conflict,
+                  "an external container prevents runtime reconciliation"));
+            }
+            return RuntimeObservation{
+                .status = RuntimeStatus{.state = RuntimeState::absent,
+                                        .exit_code = std::nullopt},
+                .incarnation = std::nullopt,
+            };
+          }
+          const auto inspection =
+              inspect_container(runtime_container.value(),
+                                StableErrorCode::unavailable, cpu_assignment);
+          if (!inspection) {
+            return std::unexpected(inspection.error());
+          }
+          if (const auto valid =
+                  validate_owned_container(*inspection, container_id,
+                                           cpu_assignment.container_cpu, false);
+              !valid) {
+            return std::unexpected(valid.error());
+          }
+          return RuntimeObservation{
+              .status =
+                  RuntimeStatus{
+                      .state = inspection->running ? RuntimeState::running
+                                                   : RuntimeState::exited,
+                      .exit_code =
+                          inspection->running
+                              ? std::nullopt
+                              : std::optional<int>{inspection->exit_code},
+                  },
+              .incarnation =
+                  RuntimeIncarnation{
+                      .reference = runtime_container,
+                      .runtime_id = inspection->runtime_id,
+                  },
+          };
+        });
+  }
+
   [[nodiscard]] CheckpointResult<void>
   stop_and_remove(const ContainerId &container_id,
                   const RuntimeIncarnation &expected_incarnation,
@@ -532,36 +612,52 @@ public:
                 StableErrorCode::conflict,
                 "runtime incarnation was replaced before container stop"));
           }
-          if (const auto stopped =
-                  stop_container(before->runtime_id, cpu_assignment);
-              !stopped) {
-            return stopped;
-          }
+          const auto indeterminate =
+              [](CheckpointErrorDetail error) -> CheckpointResult<void> {
+            error.runtime_side_effect =
+                RuntimeSideEffect::incarnation_may_exist;
+            return std::unexpected(std::move(error));
+          };
 
-          const auto stopped_container = inspect_container(
-              before->runtime_id, StableErrorCode::unavailable, cpu_assignment);
-          if (!stopped_container) {
-            return CheckpointResult<void>{
-                std::unexpected(stopped_container.error())};
-          }
-          if (const auto valid =
-                  validate_owned_container(*stopped_container, container_id,
-                                           cpu_assignment.container_cpu, false);
-              !valid) {
-            return valid;
-          }
-          if (stopped_container->runtime_id != before->runtime_id) {
-            return std::unexpected(make_error(
-                StableErrorCode::conflict,
-                "runtime incarnation changed before container removal"));
+          auto stopped_container = *before;
+          if (before->running) {
+            if (const auto stopped =
+                    stop_container(before->runtime_id, cpu_assignment);
+                !stopped) {
+              return indeterminate(stopped.error());
+            }
+
+            const auto inspected =
+                inspect_container(before->runtime_id,
+                                  StableErrorCode::unavailable, cpu_assignment);
+            if (!inspected) {
+              return indeterminate(inspected.error());
+            }
+            stopped_container = *inspected;
+            if (const auto valid = validate_owned_container(
+                    stopped_container, container_id,
+                    cpu_assignment.container_cpu, false);
+                !valid) {
+              return indeterminate(valid.error());
+            }
+            if (stopped_container.runtime_id != before->runtime_id) {
+              return indeterminate(make_error(
+                  StableErrorCode::conflict,
+                  "runtime incarnation changed before container removal"));
+            }
           }
           if (const auto removed =
                   remove_container(before->runtime_id, cpu_assignment);
               !removed) {
-            return removed;
+            return indeterminate(removed.error());
           }
-          return prove_absence(expected_incarnation.reference.value(),
-                               cpu_assignment, StableErrorCode::unavailable);
+          const auto absent =
+              prove_absence(expected_incarnation.reference.value(),
+                            cpu_assignment, StableErrorCode::unavailable);
+          if (!absent) {
+            return indeterminate(absent.error());
+          }
+          return {};
         });
   }
 
@@ -1570,6 +1666,8 @@ private:
                              : member(*container_config, "Labels");
     const auto running =
         state == nullptr ? std::nullopt : bool_member(*state, "Running");
+    const auto exit_code =
+        state == nullptr ? std::nullopt : int_member(*state, "ExitCode");
     const auto cpuset = host_config == nullptr
                             ? std::nullopt
                             : string_member(*host_config, "CpusetCpus");
@@ -1582,7 +1680,7 @@ private:
     const auto canonical_image =
         image ? canonical_image_id(*image) : std::nullopt;
     if (!runtime_id || !is_valid_runtime_id(*runtime_id) || !canonical_image ||
-        !running || !cpuset || !managed || !logical_id) {
+        !running || !exit_code || !cpuset || !managed || !logical_id) {
       return std::unexpected(make_error(
           failure_code, "container inspect JSON is incomplete or malformed"));
     }
@@ -1590,6 +1688,7 @@ private:
         .runtime_id = *runtime_id,
         .image_identity = *canonical_image,
         .running = *running,
+        .exit_code = *exit_code,
         .cpuset = *cpuset,
         .managed = *managed,
         .logical_id = *logical_id,
@@ -1817,6 +1916,14 @@ PodmanAdapter::capture(const ContainerId &container_id,
                        RuntimeCpuAssignment cpu_assignment) {
   return impl_->capture(container_id, runtime_container, staging_directory,
                         cpu_assignment);
+}
+
+CheckpointResult<RuntimeObservation>
+PodmanAdapter::inspect_runtime(const ContainerId &container_id,
+                               const RuntimeContainerRef &runtime_container,
+                               RuntimeCpuAssignment cpu_assignment) {
+  return impl_->inspect_runtime(container_id, runtime_container,
+                                cpu_assignment);
 }
 
 CheckpointResult<void>

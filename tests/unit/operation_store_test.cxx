@@ -111,6 +111,25 @@ OperationStore::Executor successful_executor(std::string result = "ok") {
 }
 } // namespace
 
+TEST(OperationStoreTest, AcceptsDurableStopMethod) {
+  const auto path = temp_path();
+  remove_path(path);
+  {
+    OperationStore store(path, successful_executor("stopped"));
+
+    const auto submitted = store.submit("req-stop", "SubmitStopContainer",
+                                        "container-1", "Stop:container-1");
+
+    ASSERT_TRUE(submitted) << submitted.error().message;
+    const auto terminal = wait_for_terminal(store, submitted->operation_id);
+    ASSERT_TRUE(terminal);
+    EXPECT_EQ(terminal->method, "SubmitStopContainer");
+    EXPECT_EQ(terminal->state, OperationState::succeeded);
+    EXPECT_EQ(terminal->result, "stopped");
+  }
+  remove_path(path);
+}
+
 TEST(OperationStoreTest,
      DeduplicatesSameRequestAndRejectsDifferentPayloadOrIdentity) {
   const auto path = temp_path();

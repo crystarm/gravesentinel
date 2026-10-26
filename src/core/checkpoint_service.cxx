@@ -177,9 +177,9 @@ next_deadline(IClock::MonotonicTime now, std::chrono::seconds interval,
 
 CheckpointOperations::CheckpointOperations(
     CheckpointCreator &creator, RestoreCoordinator &restore_coordinator,
-    ICheckpointMaintenance &maintenance) noexcept
+    ICheckpointMaintenance &maintenance, IPodmanAdapter &runtime) noexcept
     : creator_(creator), restore_coordinator_(restore_coordinator),
-      maintenance_(maintenance) {}
+      maintenance_(maintenance), runtime_(runtime) {}
 
 CheckpointResult<CreatedCheckpoint>
 CheckpointOperations::create(const CheckpointCreateRequest &request) {
@@ -189,6 +189,43 @@ CheckpointOperations::create(const CheckpointCreateRequest &request) {
 CheckpointResult<RestoredContainer>
 CheckpointOperations::restore_or_restart(const RestoreRequest &request) {
   return restore_coordinator_.restore_or_restart(request);
+}
+
+CheckpointResult<RuntimeObservation> CheckpointOperations::inspect_runtime(
+    const ContainerRegistration &registration) {
+  return runtime_.inspect_runtime(
+      registration.container_id, registration.runtime_container,
+      RuntimeCpuAssignment{
+          .container_cpu = registration.checkpoint.container_cpu,
+          .checkpoint_cpu = registration.checkpoint.checkpoint_cpu,
+      });
+}
+
+CheckpointResult<void> CheckpointOperations::stop_runtime(
+    const ContainerRegistration &registration,
+    const std::optional<RuntimeIncarnation> &expected_incarnation) {
+  auto target = expected_incarnation;
+  if (!target.has_value()) {
+    auto observation = inspect_runtime(registration);
+    if (!observation) {
+      return std::unexpected(observation.error());
+    }
+    if (observation->status.state == RuntimeState::absent) {
+      return {};
+    }
+    if (!observation->incarnation.has_value()) {
+      return std::unexpected(make_error(
+          StableErrorCode::internal,
+          "runtime observation did not provide a present incarnation"));
+    }
+    target = std::move(observation->incarnation);
+  }
+  return runtime_.stop_and_remove(
+      registration.container_id, *target,
+      RuntimeCpuAssignment{
+          .container_cpu = registration.checkpoint.container_cpu,
+          .checkpoint_cpu = registration.checkpoint.checkpoint_cpu,
+      });
 }
 
 CheckpointResult<RetentionReport>
@@ -245,6 +282,8 @@ struct CheckpointService::Implementation {
   enum class WorkKind : std::uint8_t {
     create,
     restore,
+    status,
+    stop,
     retention,
     garbage_collection,
   };
@@ -256,6 +295,8 @@ struct CheckpointService::Implementation {
     std::optional<RequestId> request_id;
     std::optional<OperationId> operation_id;
     std::shared_ptr<std::promise<CheckpointResult<void>>> completion;
+    std::shared_ptr<std::promise<CheckpointResult<RuntimeStatus>>>
+        status_completion;
     CheckpointErrorDetail exception_fallback;
   };
 
@@ -375,6 +416,7 @@ struct CheckpointService::Implementation {
             .request_id = std::nullopt,
             .operation_id = std::nullopt,
             .completion = nullptr,
+            .status_completion = nullptr,
             .exception_fallback =
                 make_error(StableErrorCode::resource_exhausted,
                            "periodic checkpoint exhausted memory", nullptr,
@@ -675,13 +717,14 @@ struct CheckpointService::Implementation {
           .request_id = request_id,
           .operation_id = operation_id,
           .completion = completion,
+          .status_completion = nullptr,
           .exception_fallback = make_error(
               StableErrorCode::resource_exhausted,
               "checkpoint operation exhausted memory", &request_id, true,
               kind == WorkKind::create
                   ? StorageSideEffect::publication_may_be_visible
                   : StorageSideEffect::none,
-              kind == WorkKind::restore
+              kind == WorkKind::restore || kind == WorkKind::stop
                   ? RuntimeSideEffect::incarnation_may_exist
                   : RuntimeSideEffect::none),
       };
@@ -725,24 +768,111 @@ struct CheckpointService::Implementation {
           kind == WorkKind::create
               ? StorageSideEffect::publication_may_be_visible
               : StorageSideEffect::none,
-          kind == WorkKind::restore ? RuntimeSideEffect::incarnation_may_exist
-                                    : RuntimeSideEffect::none));
+          kind == WorkKind::restore || kind == WorkKind::stop
+              ? RuntimeSideEffect::incarnation_may_exist
+              : RuntimeSideEffect::none));
     } catch (const std::exception &error) {
       return std::unexpected(exception_error(
           "dispatch checkpoint operation", &error, &request_id, false,
           kind == WorkKind::create
               ? StorageSideEffect::publication_may_be_visible
               : StorageSideEffect::none,
-          kind == WorkKind::restore ? RuntimeSideEffect::incarnation_may_exist
-                                    : RuntimeSideEffect::none));
+          kind == WorkKind::restore || kind == WorkKind::stop
+              ? RuntimeSideEffect::incarnation_may_exist
+              : RuntimeSideEffect::none));
     } catch (...) {
       return std::unexpected(exception_error(
           "dispatch checkpoint operation", nullptr, &request_id, false,
           kind == WorkKind::create
               ? StorageSideEffect::publication_may_be_visible
               : StorageSideEffect::none,
-          kind == WorkKind::restore ? RuntimeSideEffect::incarnation_may_exist
-                                    : RuntimeSideEffect::none));
+          kind == WorkKind::restore || kind == WorkKind::stop
+              ? RuntimeSideEffect::incarnation_may_exist
+              : RuntimeSideEffect::none));
+    }
+  }
+
+  [[nodiscard]] CheckpointResult<RuntimeStatus>
+  runtime_status(const ContainerId &container_id, const RequestId &request_id) {
+    try {
+      if (worker_context == this) {
+        return std::unexpected(make_error(
+            StableErrorCode::conflict,
+            "a checkpoint worker cannot inspect its own runtime", &request_id));
+      }
+      if (stopping.load(std::memory_order_acquire)) {
+        return std::unexpected(make_error(
+            StableErrorCode::unavailable,
+            "checkpoint service is shutting down and accepts no operations",
+            &request_id));
+      }
+
+      std::shared_ptr<Slot> slot;
+      {
+        const std::scoped_lock registry_lock{registry_mutex};
+        const auto found = registry.find(container_id.value());
+        if (found == registry.end()) {
+          return std::unexpected(make_error(StableErrorCode::not_found,
+                                            "container is not registered",
+                                            &request_id));
+        }
+        slot = found->second;
+      }
+
+      auto completion =
+          std::make_shared<std::promise<CheckpointResult<RuntimeStatus>>>();
+      auto future = completion->get_future();
+      WorkItem item{
+          .kind = WorkKind::status,
+          .periodic = false,
+          .periodic_sequence = 0,
+          .request_id = request_id,
+          .operation_id = std::nullopt,
+          .completion = nullptr,
+          .status_completion = completion,
+          .exception_fallback = make_error(
+              StableErrorCode::resource_exhausted,
+              "runtime inspection exhausted memory", &request_id, true),
+      };
+      {
+        std::unique_lock slot_lock{slot->mutex};
+        ++slot->foreground_waiters;
+        slot->condition.wait(slot_lock, [&] {
+          return slot->closing || stopping.load(std::memory_order_acquire) ||
+                 (!slot->running && !slot->foreground_pending.has_value());
+        });
+        if (slot->closing || stopping.load(std::memory_order_acquire)) {
+          --slot->foreground_waiters;
+          slot_lock.unlock();
+          slot->condition.notify_all();
+          return std::unexpected(make_error(
+              StableErrorCode::unavailable,
+              "container registration is closing and accepts no operations",
+              &request_id));
+        }
+        slot->foreground_pending = std::move(item);
+        --slot->foreground_waiters;
+      }
+      slot->condition.notify_all();
+      completion.reset();
+
+      auto result = future.get();
+      if (!result) {
+        attach_correlation(result.error(), request_id);
+      }
+      return result;
+    } catch (const std::bad_alloc &) {
+      return std::unexpected(exception_error(
+          "inspect container runtime", nullptr, &request_id, true,
+          StorageSideEffect::none, RuntimeSideEffect::none));
+    } catch (const std::exception &error) {
+      return std::unexpected(exception_error(
+          "inspect container runtime", &error, &request_id, false,
+          StorageSideEffect::none, RuntimeSideEffect::none));
+    } catch (...) {
+      return std::unexpected(exception_error(
+          "inspect container runtime", nullptr, &request_id, false,
+          StorageSideEffect::none, RuntimeSideEffect::none));
     }
   }
 
@@ -920,29 +1050,49 @@ struct CheckpointService::Implementation {
         }
 
         if (item.has_value()) {
-          auto result = execute_item(slot, *item);
-          {
-            const std::scoped_lock slot_lock{slot->mutex};
-            slot->running = false;
-            slot->running_kind.reset();
-          }
-          slot->condition.notify_all();
-
-          if (item->completion != nullptr) {
+          if (item->status_completion != nullptr) {
+            auto result = execute_status_item(slot, *item);
+            {
+              const std::scoped_lock slot_lock{slot->mutex};
+              slot->running = false;
+              slot->running_kind.reset();
+            }
+            slot->condition.notify_all();
             try {
-              item->completion->set_value(std::move(result));
+              item->status_completion->set_value(std::move(result));
             } catch (const std::future_error &error) {
               auto detail = make_error(StableErrorCode::internal,
-                                       "deliver checkpoint operation result: " +
+                                       "deliver runtime status result: " +
                                            std::string{error.what()});
-              log_service_failure(logger,
-                                  "checkpoint worker result delivery failed",
+              log_service_failure(logger, "runtime status delivery failed",
                                   detail, &slot->registration.container_id);
             }
-          } else if (!result) {
-            log_service_failure(logger, "periodic checkpoint failed",
-                                result.error(),
-                                &slot->registration.container_id);
+          } else {
+            auto result = execute_item(slot, *item);
+            {
+              const std::scoped_lock slot_lock{slot->mutex};
+              slot->running = false;
+              slot->running_kind.reset();
+            }
+            slot->condition.notify_all();
+
+            if (item->completion != nullptr) {
+              try {
+                item->completion->set_value(std::move(result));
+              } catch (const std::future_error &error) {
+                auto detail =
+                    make_error(StableErrorCode::internal,
+                               "deliver checkpoint operation result: " +
+                                   std::string{error.what()});
+                log_service_failure(logger,
+                                    "checkpoint worker result delivery failed",
+                                    detail, &slot->registration.container_id);
+              }
+            } else if (!result) {
+              log_service_failure(logger, "periodic checkpoint failed",
+                                  result.error(),
+                                  &slot->registration.container_id);
+            }
           }
         } else {
           execute_maintenance(slot, *kind);
@@ -1018,12 +1168,52 @@ struct CheckpointService::Implementation {
     }
   }
 
+  [[nodiscard]] CheckpointResult<RuntimeStatus>
+  execute_status_item(const std::shared_ptr<Slot> &slot, WorkItem &item) {
+    try {
+      auto observation = operations.inspect_runtime(slot->registration);
+      if (!observation) {
+        auto error = std::move(observation.error());
+        attach_correlation(error, *item.request_id);
+        return std::unexpected(std::move(error));
+      }
+      {
+        const std::scoped_lock slot_lock{slot->mutex};
+        slot->incarnation = observation->incarnation;
+      }
+      return observation->status;
+    } catch (const std::bad_alloc &) {
+      return std::unexpected(exception_error_or_fallback(
+          "runtime status worker", nullptr, &*item.request_id, true,
+          StorageSideEffect::none, RuntimeSideEffect::none,
+          item.exception_fallback));
+    } catch (const std::exception &error) {
+      return std::unexpected(exception_error_or_fallback(
+          "runtime status worker", &error, &*item.request_id, false,
+          StorageSideEffect::none, RuntimeSideEffect::none,
+          item.exception_fallback));
+    } catch (...) {
+      return std::unexpected(exception_error_or_fallback(
+          "runtime status worker", nullptr, &*item.request_id, false,
+          StorageSideEffect::none, RuntimeSideEffect::none,
+          item.exception_fallback));
+    }
+  }
+
   [[nodiscard]] CheckpointResult<void>
   execute_item(const std::shared_ptr<Slot> &slot, WorkItem &item) {
     std::optional<RequestId> generated_request;
     std::optional<OperationId> generated_operation;
     const RequestId *request_id = nullptr;
     const OperationId *operation_id = nullptr;
+    const auto worker_name =
+        item.kind == WorkKind::create ? "create checkpoint worker"
+        : item.kind == WorkKind::stop ? "stop container worker"
+                                      : "restore checkpoint worker";
+    const auto runtime_side_effect =
+        item.kind == WorkKind::restore || item.kind == WorkKind::stop
+            ? RuntimeSideEffect::incarnation_may_exist
+            : RuntimeSideEffect::none;
 
     try {
       if (item.periodic) {
@@ -1094,6 +1284,17 @@ struct CheckpointService::Implementation {
         expected_incarnation = std::move(slot->incarnation);
         slot->incarnation.reset();
       }
+      if (item.kind == WorkKind::stop) {
+        auto stopped =
+            operations.stop_runtime(slot->registration, expected_incarnation);
+        if (!stopped) {
+          auto error = std::move(stopped.error());
+          attach_correlation(error, *request_id);
+          return std::unexpected(std::move(error));
+        }
+        return {};
+      }
+
       auto restored = operations.restore_or_restart(RestoreRequest{
           .request_id = *request_id,
           .operation_id = *operation_id,
@@ -1120,40 +1321,25 @@ struct CheckpointService::Implementation {
       return {};
     } catch (const std::bad_alloc &) {
       return std::unexpected(exception_error_or_fallback(
-          item.kind == WorkKind::create ? "create checkpoint worker"
-                                        : "restore checkpoint worker",
-          nullptr, request_id, true,
+          worker_name, nullptr, request_id, true,
           item.kind == WorkKind::create
               ? StorageSideEffect::publication_may_be_visible
               : StorageSideEffect::none,
-          item.kind == WorkKind::restore
-              ? RuntimeSideEffect::incarnation_may_exist
-              : RuntimeSideEffect::none,
-          item.exception_fallback));
+          runtime_side_effect, item.exception_fallback));
     } catch (const std::exception &error) {
       return std::unexpected(exception_error_or_fallback(
-          item.kind == WorkKind::create ? "create checkpoint worker"
-                                        : "restore checkpoint worker",
-          &error, request_id, false,
+          worker_name, &error, request_id, false,
           item.kind == WorkKind::create
               ? StorageSideEffect::publication_may_be_visible
               : StorageSideEffect::none,
-          item.kind == WorkKind::restore
-              ? RuntimeSideEffect::incarnation_may_exist
-              : RuntimeSideEffect::none,
-          item.exception_fallback));
+          runtime_side_effect, item.exception_fallback));
     } catch (...) {
       return std::unexpected(exception_error_or_fallback(
-          item.kind == WorkKind::create ? "create checkpoint worker"
-                                        : "restore checkpoint worker",
-          nullptr, request_id, false,
+          worker_name, nullptr, request_id, false,
           item.kind == WorkKind::create
               ? StorageSideEffect::publication_may_be_visible
               : StorageSideEffect::none,
-          item.kind == WorkKind::restore
-              ? RuntimeSideEffect::incarnation_may_exist
-              : RuntimeSideEffect::none,
-          item.exception_fallback));
+          runtime_side_effect, item.exception_fallback));
     }
   }
 
@@ -1417,6 +1603,20 @@ CheckpointService::restore_or_restart(const ContainerId &container_id,
                                       const OperationId &operation_id) {
   return implementation_->run_manual(container_id, request_id, operation_id,
                                      Implementation::WorkKind::restore);
+}
+
+CheckpointResult<RuntimeStatus>
+CheckpointService::get_runtime_status(const ContainerId &container_id,
+                                      const RequestId &request_id) {
+  return implementation_->runtime_status(container_id, request_id);
+}
+
+CheckpointResult<void>
+CheckpointService::stop_container(const ContainerId &container_id,
+                                  const RequestId &request_id,
+                                  const OperationId &operation_id) {
+  return implementation_->run_manual(container_id, request_id, operation_id,
+                                     Implementation::WorkKind::stop);
 }
 
 CheckpointResult<void> CheckpointService::shutdown() {

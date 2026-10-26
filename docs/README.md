@@ -16,15 +16,17 @@ The composition exposes a versioned, bounded request/response JSON protocol over
 local `AF_UNIX/SOCK_SEQPACKET` socket. The concrete privilege-free scheduler client
 verifies the server peer UID (UID 0 by default); the server verifies the connecting
 scheduler UID with `SO_PEERCRED` and supports a configured socket GID and mode.
-Create and restore are durable asynchronous submit operations followed by
-`GetOperation` polling. Register and unregister remain synchronous and are not
+Create, restore, and stop/remove are durable asynchronous submit operations followed
+by `GetOperation` polling. Read-only `GetRuntimeStatus` reports `absent`, `running`, or
+`exited` and adopts a successfully validated runtime incarnation into the service after
+a registration replay. Register and unregister remain synchronous and are not
 transport-retried after an exchange may have reached the server. At the core boundary,
-a busy unregister returns a retryable conflict instead of waiting; protocol v2 exposes
+a busy unregister returns a retryable conflict instead of waiting; protocol v3 exposes
 all synchronous register/unregister service failures only as `request_failed`, so the
 scheduler must reconcile state before deciding whether to retry.
 
 The operation journal is durable and bounded. It derives deterministic operation
-IDs from request IDs, deduplicates identical create/restore submissions across
+IDs from request IDs, deduplicates identical create/restore/stop submissions across
 restarts, compacts its JSONL history, marks a crash-interrupted queued operation as
 failed before execution, and marks a crash-interrupted running operation as
 indeterminate. Its in-memory/recovered registry is also bounded and does not evict
@@ -52,13 +54,13 @@ The remaining important limits are:
 The binary is buildable and its composed components and IPC behavior are covered by
 unit tests. On 2026-10-25, the manual
 `//tests/integration:hypervisor_scheduler_e2e` regression harness completed the full
-process/IPC/Podman path against the current production recovery code and emitted
-`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. The complete
-non-privileged release gate passed on the same date. The four-container CPU acceptance
-qualified twice and crash/reconnect/recovery qualified once on 2026-10-25, so all
-three rootful acceptance markers are current for the code being released. This is
-dated evidence for the measured host; each deployment still requires its own rootful
-qualification.
+process/IPC/Podman path and emitted
+`RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`; the non-privileged release
+gate, four-container CPU acceptance, and crash/reconnect/recovery suites also passed on
+that date. Those markers predate protocol v3, runtime status/adoption, and durable
+stop/remove and therefore are historical rather than current-code qualification. The
+non-privileged gate and affected rootful suites must be rerun before release. Every
+deployment still requires its own rootful qualification.
 
 ## Reading guide
 
@@ -107,10 +109,10 @@ A useful implementation-order reading path is:
   references.
 - **generation** — positive per-container ordering number. It, not a timestamp,
   determines newest-to-oldest order.
-- **operation** — a create or restore request tracked by the durable public IPC
-  operation journal and, when admitted by the service, driving a storage transaction
-  under the per-container lease. Retention and GC use internal lease-only maintenance
-  operations and are not public `OperationStore` records.
+- **operation** — a create, restore, or stop/remove request tracked by the durable
+  public IPC operation journal and serialized by the per-container worker. Create and
+  restore may drive storage transactions under the lease; retention and GC use internal
+  lease-only maintenance operations and are not public `OperationStore` records.
 - **candidate** — one committed generation considered during restore.
 - **indeterminate side effect** — an error for which publication may already be
   visible or a runtime incarnation may still exist.

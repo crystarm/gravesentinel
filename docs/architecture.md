@@ -35,10 +35,10 @@ runtime-artifact paths and the
 Podman adapter share `checkpoint-data` as their trusted staging boundary; the adapter
 unit test obtains its capture directory from a real `FilesystemStorage` operation.
 This is a real production composition, not a stub. Unit tests cover its components and
-IPC behavior. The complete production binary-to-Podman/CRIU stage-12 path was
-requalified rootfully against the current recovery code on 2026-10-25. The stage-13
-four-container CPU suite qualified twice and crash/reconnect/recovery qualified once
-on the same date, completing all three current-code rootful acceptance markers. The
+IPC behavior. The complete production binary-to-Podman/CRIU stage-12 path and both
+stage-13 suites qualified rootfully on 2026-10-25 for the then-current protocol-v2
+code. Protocol v3 added runtime status/adoption and durable stop/remove, so those
+markers are historical and affected rootful suites must be rerun before release. The
 runtime remains intentionally restricted to the separately qualified destructive
 rootful profile.
 
@@ -72,7 +72,7 @@ flowchart TB
     Socket --> Hypervisor
     Hypervisor --> Journal
     Hypervisor --> Service
-    Journal -->|execute accepted create and restore| Service
+    Journal -->|execute accepted create restore and stop| Service
     Service --> Create
     Service --> Restore
     Service --> Maintenance
@@ -254,12 +254,13 @@ environment. Names and values are validated further; NUL, CR, and LF are prohibi
 
 `//src/core:ccm_core` declares:
 
-- `ICheckpointService` — synchronous register/unregister/create/restore/shutdown;
+- `ICheckpointService` — synchronous register/unregister/create/restore/status/stop/shutdown;
 - `IStorage`, `IStorageOperation`, and `IStorageMaintenanceOperation` — namespace
   reads, create/restore leases and staging, lease-only retention/GC, publication,
   pinning, and cleanup; concrete `FilesystemStorage` additionally exposes startup
   recovery;
-- `IPodmanAdapter` — compatibility, capture, absence, restore, cold start, and cleanup;
+- `IPodmanAdapter` — compatibility, capture, runtime inspection, absence, restore,
+  cold start, and ownership-fenced stop/remove;
 - `IClock`, `ITimer`, `IHasher`, `IIdGenerator` — injectable dependencies;
 - `ILogger` — structured diagnostic sink;
 - `IAffinityController` and `IThreadAffinityBinding` — CPU validation/binding;
@@ -499,7 +500,12 @@ The main safety rules are:
 
 - capture uses an opaque `checkpoint.tar` and `--leave-running`;
 - the source image must remain available in the local Podman image store for restore;
-- stop/remove is permitted only for the expected incarnation;
+- runtime status validates ownership labels, cpuset, and immutable runtime ID before
+  reporting `running`/`exited`; a successful service-level inspection adopts that
+  incarnation, while `absent` clears the cached fence;
+- stop/remove is permitted only for the expected incarnation; after daemon restart it
+  first inspects/adopts when no incarnation is cached, and an already absent runtime is
+  a successful desired state;
 - `confirm_absence` performs both regular and external read-only existence probes;
 - destructive failed-restore cleanup is permitted only after its own attempt, which
   began when absence had been proven under a continuous per-container lease;
@@ -531,8 +537,8 @@ The two side-effect flags cannot be inferred from the error code alone:
 
 - `publication_may_be_visible` means that an immutable publication may have become
   visible even though durability was not confirmed;
-- `incarnation_may_exist` means that a runtime incarnation may have been created or
-  its absence was not proven.
+- `incarnation_may_exist` means that a runtime incarnation may have been created,
+  stopped, removed, or its final absence was not proven.
 
 After such a result, a destructive action must not be retried automatically without
 reconciliation/absence proof. The service conservatively adds these flags to
@@ -551,29 +557,30 @@ new destructive attempt.
 ## Implemented IPC and Async Operation Contract
 
 IPC is local `AF_UNIX/SOCK_SEQPACKET` request/response transport. Each JSON request and
-response occupies one packet and is limited to 256 KiB. The protocol-v2 envelopes are:
+response occupies one packet and is limited to 256 KiB. The protocol-v3 envelopes are:
 
 ```text
-request  = {"version": 2, "method": string, "request_id": string,
+request  = {"version": 3, "method": string, "request_id": string,
             "params": object}
-success  = {"version": 2, "request_id": string, "ok": true,
+success  = {"version": 3, "request_id": string, "ok": true,
             "result": object, "close_connection": bool}
-failure  = {"version": 2, "request_id": string, "ok": false,
+failure  = {"version": 3, "request_id": string, "ok": false,
             "error_code": string, "close_connection": bool}
 ```
 
 The codec rejects unknown envelope fields, methods, protocol versions, malformed or
 oversized packets, invalid identifier syntax, and method parameters outside their
 exact schema. `SchedulerClient` starts each connection with `Handshake`;
-`GetHealth`, `Register`, `Unregister`, `SubmitCreateCheckpoint`,
-`SubmitRestoreOrRestart`, and `GetOperation` are implemented. Individual packet
+`GetHealth`, `Register`, `Unregister`, `GetRuntimeStatus`,
+`SubmitCreateCheckpoint`, `SubmitRestoreOrRestart`, `SubmitStopContainer`, and
+`GetOperation` are implemented. Individual packet
 reads/writes have deadlines, the server has a bounded accepted-peer queue, and each
 connection serves a bounded number of requests. The final allowed response sets
 `close_connection=true`; the client closes that descriptor before issuing another
 request, avoiding a race where a mutating packet could be accepted by the kernel after
 the server had stopped reading that connection.
 
-Create and restore use durable asynchronous submission:
+Create, restore, and stop/remove use durable asynchronous submission:
 
 1. submission with a caller `RequestId` persists `queued` before success is returned;
 2. the operation ID is deterministically `op-` plus the BLAKE3 digest of the request
@@ -596,7 +603,7 @@ fails ambiguously it does not transport-retry that mutation. It returns failure 
 the scheduler must reconcile registration state rather than assume the request did or
 did not execute. At the in-process core boundary, `Unregister` returns
 `StableErrorCode::conflict` with `retryable=true` without changing a registration that
-has active work. Protocol v2 intentionally collapses synchronous Register/Unregister
+has active work. Protocol v3 intentionally collapses synchronous Register/Unregister
 service failures to `request_failed`, and the boolean client returns `false`; the
 scheduler must reconcile state and decide whether to retry.
 
@@ -620,13 +627,15 @@ Retention, conservative chunk GC, immediate canonical publication-temporary clea
 stale staging cleanup, and startup pass repetition are implemented. The remaining lifecycle limitations are:
 
 1. automatic reconciliation of indeterminate checkpoint publications or runtime
-   incarnations;
+   incarnations (runtime status/adoption supplies the primitive, but policy remains a
+   scheduler responsibility);
 2. operation-history retention/administrative pruning to free bounded registry slots;
 3. cancellation and service-level deadlines for already accepted operations.
 
 The implemented `//tests/integration:hypervisor_scheduler_e2e` process-boundary
-target completed successfully in the qualified rootful Podman/CRIU environment on
-2026-10-24 with `RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`.
+target completed successfully in the qualified rootful Podman/CRIU environment before
+the protocol-v3 status/stop extension. That result is historical; affected rootful
+suites must be rerun before releasing the current runtime lifecycle code.
 
 Consequently, `keep_last` does limit committed manifests when immediate retention or a
 retry completes, but registry saturation still rejects new unique public operations and

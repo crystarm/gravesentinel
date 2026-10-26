@@ -61,6 +61,61 @@ using gravesentinel::ccm::RuntimeContainerRef;
   return fd;
 }
 
+[[nodiscard]] int listen_raw(const std::string &path) {
+  const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    return -1;
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  if (path.size() >= sizeof(address.sun_path)) {
+    ::close(fd);
+    return -1;
+  }
+  std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+  if (::bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) !=
+          0 ||
+      ::listen(fd, 1) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+[[nodiscard]] std::optional<nlohmann::json> receive_request(const int peer) {
+  std::string packet(gravesentinel::ipc::max_message_bytes, '\0');
+  const auto received = ::recv(peer, packet.data(), packet.size(), 0);
+  if (received <= 0)
+    return std::nullopt;
+  packet.resize(static_cast<std::size_t>(received));
+  auto decoded = gravesentinel::ipc::decode_request(packet);
+  if (!decoded)
+    return std::nullopt;
+  return std::move(*decoded);
+}
+
+[[nodiscard]] bool send_success_response(const int peer,
+                                         const nlohmann::json &request,
+                                         nlohmann::json result) {
+  const nlohmann::json response{
+      {"version", gravesentinel::ipc::protocol_version},
+      {"request_id", request.at("request_id")},
+      {"ok", true},
+      {"result", std::move(result)},
+      {"close_connection", false},
+  };
+  const auto encoded = gravesentinel::ipc::encode_response(response);
+  return encoded &&
+         ::send(peer, encoded->data(), encoded->size(), MSG_NOSIGNAL) ==
+             static_cast<ssize_t>(encoded->size());
+}
+
+[[nodiscard]] bool serve_handshake(const int peer) {
+  const auto request = receive_request(peer);
+  return request && request->at("method") == "Handshake" &&
+         request->at("params") == nlohmann::json::object() &&
+         send_success_response(peer, *request, handshake_result());
+}
+
 [[nodiscard]] ContainerRegistration complete_registration() {
   gravesentinel::ccm::ColdStartSpec cold_start{
       .image_reference = "registry.example/worker:latest",
@@ -172,6 +227,25 @@ protected:
                        << server_result_.load();
   }
 
+  void start_raw_server(std::function<bool(int)> handler) {
+    const int listener = listen_raw(socket_path_);
+    ASSERT_GE(listener, 0);
+    server_result_.store(-1);
+    server_thread_ =
+        std::thread([this, listener, handler = std::move(handler)]() mutable {
+          const int peer = ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+          if (peer < 0) {
+            ::close(listener);
+            server_result_.store(1);
+            return;
+          }
+          const bool handled = handler(peer);
+          ::close(peer);
+          ::close(listener);
+          server_result_.store(handled ? 0 : 1);
+        });
+  }
+
   void stop_server() {
     if (server_thread_.joinable()) {
       stop_requested_.store(true);
@@ -236,6 +310,115 @@ TEST_F(IpcServerClientTest, HandshakeAndHealthUseOnePersistentConnection) {
   EXPECT_EQ(health->queue, gravesentinel::ccm::QueueState::available);
   EXPECT_EQ(handshakes.load(), 1);
   EXPECT_EQ(health_calls.load(), 1);
+}
+
+TEST_F(IpcServerClientTest, ParsesEveryRuntimeStatusState) {
+  const std::vector<nlohmann::json> responses{
+      {{"state", "absent"}, {"exit_code", nullptr}},
+      {{"state", "running"}, {"exit_code", nullptr}},
+      {{"state", "exited"}, {"exit_code", 17}},
+  };
+  start_raw_server([responses](const int peer) {
+    if (!serve_handshake(peer))
+      return false;
+    for (const auto &response : responses) {
+      const auto request = receive_request(peer);
+      if (!request || request->at("method") != "GetRuntimeStatus" ||
+          request->at("params") !=
+              nlohmann::json{{"container_id", "container-status"}} ||
+          !send_success_response(peer, *request, response)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  gravesentinel::ccm::SchedulerClient client(socket_path_, 300ms, 1s,
+                                             ::geteuid());
+  const auto container = ContainerId::create("container-status").value();
+
+  const auto absent = client.get_runtime_status(container);
+  ASSERT_TRUE(absent) << absent.error().message;
+  EXPECT_EQ(absent->state, gravesentinel::ccm::RuntimeState::absent);
+  EXPECT_FALSE(absent->exit_code);
+
+  const auto running = client.get_runtime_status(container);
+  ASSERT_TRUE(running) << running.error().message;
+  EXPECT_EQ(running->state, gravesentinel::ccm::RuntimeState::running);
+  EXPECT_FALSE(running->exit_code);
+
+  const auto exited = client.get_runtime_status(container);
+  ASSERT_TRUE(exited) << exited.error().message;
+  EXPECT_EQ(exited->state, gravesentinel::ccm::RuntimeState::exited);
+  ASSERT_TRUE(exited->exit_code);
+  EXPECT_EQ(*exited->exit_code, 17);
+  stop_server();
+}
+
+TEST_F(IpcServerClientTest,
+       RejectsMalformedRuntimeStatusStateAndExitCodeCombinations) {
+  const std::vector<nlohmann::json> responses{
+      {{"state", "unknown"}, {"exit_code", nullptr}},
+      {{"state", "absent"}, {"exit_code", 0}},
+      {{"state", "running"}, {"exit_code", -1}},
+      {{"state", "exited"}, {"exit_code", nullptr}},
+  };
+  start_raw_server([responses](const int peer) {
+    if (!serve_handshake(peer))
+      return false;
+    for (const auto &response : responses) {
+      const auto request = receive_request(peer);
+      if (!request || request->at("method") != "GetRuntimeStatus" ||
+          !send_success_response(peer, *request, response)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  gravesentinel::ccm::SchedulerClient client(socket_path_, 300ms, 1s,
+                                             ::geteuid());
+  const auto container = ContainerId::create("container-malformed").value();
+  for (std::size_t index = 0; index < responses.size(); ++index) {
+    const auto status = client.get_runtime_status(container);
+    ASSERT_FALSE(status) << "malformed response index " << index;
+    EXPECT_EQ(status.error().code,
+              gravesentinel::ccm::RpcFailureCode::protocol_error)
+        << "malformed response index " << index;
+  }
+  stop_server();
+}
+
+TEST_F(IpcServerClientTest, SubmitStopContainerEmitsExactRequest) {
+  nlohmann::json captured;
+  start_raw_server([&captured](const int peer) {
+    if (!serve_handshake(peer))
+      return false;
+    const auto request = receive_request(peer);
+    if (!request)
+      return false;
+    captured = *request;
+    return send_success_response(
+        peer, *request,
+        {{"operation_id", "operation-stop"}, {"duplicate", false}});
+  });
+
+  gravesentinel::ccm::SchedulerClient client(socket_path_, 300ms, 1s,
+                                             ::geteuid());
+  const auto container = ContainerId::create("container-stop").value();
+  const auto request_id = RequestId::create("stop-request").value();
+  const auto submitted = client.submit_stop_container(container, request_id);
+  stop_server();
+
+  ASSERT_TRUE(submitted) << submitted.error().message;
+  EXPECT_EQ(submitted->value(), "operation-stop");
+  const nlohmann::json expected{
+      {"version", gravesentinel::ipc::protocol_version},
+      {"method", "SubmitStopContainer"},
+      {"request_id", "stop-request"},
+      {"params", {{"container_id", "container-stop"}}},
+  };
+  EXPECT_EQ(captured, expected);
 }
 
 TEST_F(IpcServerClientTest, MapsOperationStoreSaturationToServerBusy) {

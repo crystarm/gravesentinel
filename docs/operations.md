@@ -118,9 +118,11 @@ Do not treat process existence as readiness. Use `SchedulerClient::connect()` an
 `get_health()`. A second daemon on the same storage exits with code 4. Storage or
 journal initialization failures exit before readiness.
 
-Registrations are in memory, not persisted. After every daemon restart, the
-scheduler must reconnect and replay its desired registrations before submitting
-new operations.
+Registrations and runtime-incarnation fences are in memory, not persisted. After every
+daemon restart, the scheduler must reconnect, replay its desired registrations, and
+call `get_runtime_status()` for each registration before submitting new destructive
+runtime operations. A successful present status adopts the owned immutable Podman
+incarnation; `absent` clears the fence.
 
 ## Graceful and crash recovery
 
@@ -142,15 +144,16 @@ Operation journal recovery is conservative:
 - repeating the same canonical request with the same `RequestId` returns the same
   `OperationId` and does not duplicate the side effect.
 
-For `indeterminate`, inspect the logical container's committed manifests and the
-owned Podman runtime incarnation, then make an explicit scheduler/operator
-decision. Never submit a new destructive request ID merely because the old client
-connection disappeared. The current MVP does not perform phase-aware automatic
-classification of an interrupted restore as succeeded.
+For `indeterminate`, inspect the logical container's committed manifests and call
+`get_runtime_status()` to reconcile the owned Podman runtime incarnation, then make an
+explicit scheduler/operator decision. Never submit a new destructive request ID merely
+because the old client connection disappeared. Resubmit an ambiguously acknowledged
+operation only with its original `RequestId`. The current MVP does not perform
+phase-aware automatic classification of interrupted restore or stop as succeeded.
 
 ## Upgrade policy
 
-Protocol version 2 has exact envelopes and no negotiation. The persisted manifest,
+Protocol version 3 has exact envelopes and no negotiation. The persisted manifest,
 storage layout, and operation journal are compatibility-sensitive. Unless release
 notes explicitly state compatibility, do not perform a rolling mixed-version
 upgrade and do not let two versions touch the same storage.
@@ -165,12 +168,16 @@ Safe single-host sequence:
 6. install a scheduler/hypervisor pair supporting the same protocol and persisted
    formats;
 7. run the non-privileged release gate and requalify the rootful testbed after any
-   runtime, kernel, security, or command-profile change;
-8. start the hypervisor and require healthy protocol-v2 response;
-9. replay desired registrations, then resume operations.
+   protocol, lifecycle, runtime, kernel, security, or command-profile change;
+8. start the hypervisor and require a healthy protocol-v3 response;
+9. replay desired registrations and inspect/adopt runtime state;
+10. reconcile known `indeterminate` operations, then resume new operations.
 
 If the old daemon crashed rather than stopped cleanly, reconcile every recovered
-`indeterminate` operation before allowing a logically equivalent new request.
+`indeterminate` operation before allowing a logically equivalent new request. Protocol
+v3 runtime status and stop/remove changed privileged lifecycle behavior, so the
+2026-10-25 rootful markers from protocol v2 do not qualify the current code; rerun all
+affected destructive suites before release.
 There is no online journal migration, cross-host failover, or inter-host checkpoint
 migration in the MVP.
 

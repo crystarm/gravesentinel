@@ -127,18 +127,25 @@ The example module uses a development `local_path_override` and can be built wit
 sh scripts/check_scheduler_client_boundary.sh
 ```
 
-The async API submits create/restore with a caller-owned `RequestId`, receives a
-durable `OperationId`, and polls `get_operation()`. The convenience `bool`
-wrappers generate a request ID, submit, poll until the configured operation
-timeout, and return `true` only for `succeeded`; `false` intentionally collapses
-transport, protocol, terminal failure, timeout, and `indeterminate`. Use the
-async API when the scheduler needs reconciliation detail.
+Protocol v3 exposes durable async create, restore/restart, and stop/remove.
+Each submission uses a caller-owned `RequestId`, returns a durable `OperationId`,
+and is observed through `get_operation()`. The convenience `bool` wrappers
+generate a request ID, submit, poll until the configured operation timeout, and
+return `true` only for `succeeded`; `false` intentionally collapses transport,
+protocol, terminal failure, timeout, and `indeterminate`. Use the async API when
+the scheduler needs reconciliation detail.
+
+`get_runtime_status()` reports `absent`, `running`, or `exited`; only `exited`
+contains an exit code. A successful inspection validates ownership, cpuset, and
+the immutable Podman runtime ID, then adopts that incarnation into the service's
+in-memory fence. This is how a scheduler restores runtime knowledge after replaying
+a registration following daemon restart.
 
 Connections are authenticated and recreated after closure. A disconnect does
 not cancel accepted work. Resubmit an ambiguous async request only with the same
 `RequestId`; never invent a new request ID for an operation that may already have
-started. A recovered running operation is conservatively `indeterminate` and is
-not replayed automatically.
+started. A recovered running operation or a stop/remove whose final runtime state
+cannot be proven is conservatively `indeterminate` and is not replayed automatically.
 
 See [`docs/scheduler-client.md`](docs/scheduler-client.md) for registration,
 cold-start, retry, reconnect, and protocol details.

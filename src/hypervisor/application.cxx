@@ -429,7 +429,7 @@ int run_hypervisor(const int argc, char **const argv,
               config.garbage_collection_grace_period,
           .maximum_garbage_deletions_per_pass = 128,
       }};
-  CheckpointOperations operations(creator, restore, maintenance);
+  CheckpointOperations operations(creator, restore, maintenance, podman);
   CheckpointService service(operations, clock, timer, ids, affinity, logger);
 
   gravesentinel::ipc::OperationStoreOptions store_options;

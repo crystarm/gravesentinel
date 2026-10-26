@@ -17,6 +17,11 @@ public:
   create(const CheckpointCreateRequest &request) = 0;
   [[nodiscard]] virtual CheckpointResult<RestoredContainer>
   restore_or_restart(const RestoreRequest &request) = 0;
+  [[nodiscard]] virtual CheckpointResult<RuntimeObservation>
+  inspect_runtime(const ContainerRegistration &registration) = 0;
+  [[nodiscard]] virtual CheckpointResult<void> stop_runtime(
+      const ContainerRegistration &registration,
+      const std::optional<RuntimeIncarnation> &expected_incarnation) = 0;
   [[nodiscard]] virtual CheckpointResult<RetentionReport>
   apply_retention(const ContainerId &container_id, std::size_t keep_last) = 0;
   [[nodiscard]] virtual CheckpointResult<GarbageCollectionReport>
@@ -27,12 +32,18 @@ class CheckpointOperations final : public ICheckpointOperations {
 public:
   CheckpointOperations(CheckpointCreator &creator,
                        RestoreCoordinator &restore_coordinator,
-                       ICheckpointMaintenance &maintenance) noexcept;
+                       ICheckpointMaintenance &maintenance,
+                       IPodmanAdapter &runtime) noexcept;
 
   [[nodiscard]] CheckpointResult<CreatedCheckpoint>
   create(const CheckpointCreateRequest &request) override;
   [[nodiscard]] CheckpointResult<RestoredContainer>
   restore_or_restart(const RestoreRequest &request) override;
+  [[nodiscard]] CheckpointResult<RuntimeObservation>
+  inspect_runtime(const ContainerRegistration &registration) override;
+  [[nodiscard]] CheckpointResult<void> stop_runtime(
+      const ContainerRegistration &registration,
+      const std::optional<RuntimeIncarnation> &expected_incarnation) override;
   [[nodiscard]] CheckpointResult<RetentionReport>
   apply_retention(const ContainerId &container_id,
                   std::size_t keep_last) override;
@@ -43,6 +54,7 @@ private:
   CheckpointCreator &creator_;
   RestoreCoordinator &restore_coordinator_;
   ICheckpointMaintenance &maintenance_;
+  IPodmanAdapter &runtime_;
 };
 
 class SteadyTimer final : public ITimer {
@@ -92,6 +104,12 @@ public:
   restore_or_restart(const ContainerId &container_id,
                      const RequestId &request_id,
                      const OperationId &operation_id) override;
+  [[nodiscard]] CheckpointResult<RuntimeStatus>
+  get_runtime_status(const ContainerId &container_id,
+                     const RequestId &request_id) override;
+  [[nodiscard]] CheckpointResult<void>
+  stop_container(const ContainerId &container_id, const RequestId &request_id,
+                 const OperationId &operation_id) override;
   [[nodiscard]] CheckpointResult<void> shutdown() override;
 
 private:

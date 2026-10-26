@@ -317,8 +317,11 @@ stable_error_from_marker(const std::string_view marker) {
   case StoreErrorCode::journal_corrupt:
     return "storage_error";
   case StoreErrorCode::executor_failed:
-    return operation.method == "SubmitCreateCheckpoint" ? "capture_failed"
-                                                        : "restore_failed";
+    if (operation.method == "SubmitCreateCheckpoint")
+      return "capture_failed";
+    if (operation.method == "SubmitRestoreOrRestart")
+      return "restore_failed";
+    return "unavailable";
   case StoreErrorCode::none:
   case StoreErrorCode::internal:
     return "internal";
@@ -429,6 +432,8 @@ make_operation_executor(ccm::ICheckpointService &service) {
       } else if (operation.method == "SubmitRestoreOrRestart") {
         result =
             service.restore_or_restart(*container, *request, *operation_id);
+      } else if (operation.method == "SubmitStopContainer") {
+        result = service.stop_container(*container, *request, *operation_id);
       } else {
         return std::unexpected(StoreError{StoreErrorCode::internal,
                                           "operation_method_unsupported"});
@@ -500,6 +505,26 @@ nlohmann::json RpcHandler::operator()(const nlohmann::json &request) const {
               {"error_code", std::move(error_code)}};
     }
 
+    if (method == "GetRuntimeStatus") {
+      if (!has_exact_keys(parameters, {"container_id"}))
+        return failure();
+      auto container =
+          decode_identifier<ContainerId>(parameters.at("container_id"));
+      if (!container)
+        return failure();
+      auto status = service_.get_runtime_status(*container, *request_id);
+      if (!status)
+        return failure();
+      const auto state = status->state == ccm::RuntimeState::absent ? "absent"
+                         : status->state == ccm::RuntimeState::running
+                             ? "running"
+                             : "exited";
+      nlohmann::json exit_code = nullptr;
+      if (status->exit_code.has_value())
+        exit_code = *status->exit_code;
+      return {{"state", state}, {"exit_code", std::move(exit_code)}};
+    }
+
     if (method == "Register") {
       auto registration = decode_container_registration(parameters);
       if (!registration ||
@@ -522,7 +547,7 @@ nlohmann::json RpcHandler::operator()(const nlohmann::json &request) const {
     }
 
     if (method == "SubmitCreateCheckpoint" ||
-        method == "SubmitRestoreOrRestart") {
+        method == "SubmitRestoreOrRestart" || method == "SubmitStopContainer") {
       if (!has_exact_keys(parameters, {"container_id"}))
         return failure();
       auto container =

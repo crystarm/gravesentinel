@@ -60,6 +60,10 @@ public:
           const RuntimeContainerRef &runtime_container,
           const std::filesystem::path &staging_directory,
           RuntimeCpuAssignment cpu_assignment) override;
+  [[nodiscard]] CheckpointResult<RuntimeObservation>
+  inspect_runtime(const ContainerId &container_id,
+                  const RuntimeContainerRef &runtime_container,
+                  RuntimeCpuAssignment cpu_assignment) override;
   [[nodiscard]] CheckpointResult<void>
   stop_and_remove(const ContainerId &container_id,
                   const RuntimeIncarnation &expected_incarnation,

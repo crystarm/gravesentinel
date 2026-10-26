@@ -309,10 +309,11 @@ adapter_config(const std::filesystem::path &staging_root) {
 [[nodiscard]] std::string
 inspect_json(std::string_view runtime_id, bool running,
              std::string_view cpuset = "0", std::string_view managed = "true",
-             std::string_view logical_id = "logical-1") {
+             std::string_view logical_id = "logical-1", int exit_code = 0) {
   return "[{\"Id\":\"" + std::string(runtime_id) + "\",\"Image\":\"" +
          std::string(kImageDigest) +
          "\",\"State\":{\"Running\":" + (running ? "true" : "false") +
+         ",\"ExitCode\":" + std::to_string(exit_code) +
          "},\"Config\":{\"Labels\":{\"" +
          std::string(PodmanAdapter::managed_label) + "\":\"" +
          std::string(managed) + "\",\"" +
@@ -823,6 +824,302 @@ TEST(PodmanAdapterTest, RejectsWrongCpusetAndForeignOwnershipBeforeMutation) {
   EXPECT_TRUE(foreign_runner.empty());
 }
 
+TEST(PodmanAdapterTest,
+     InspectRuntimeReportsAbsentAfterBothExistenceProbesAreFalse) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 1);
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto observed =
+      adapter.inspect_runtime(container_id(), runtime_ref(), kCpuAssignment);
+
+  ASSERT_TRUE(observed) << observed.error().diagnostic;
+  EXPECT_EQ(observed->status.state, RuntimeState::absent);
+  EXPECT_FALSE(observed->status.exit_code.has_value());
+  EXPECT_FALSE(observed->incarnation.has_value());
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest,
+     InspectRuntimeReportsOwnedRunningContainerAndIncarnation) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 0);
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kSourceId, true));
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto observed =
+      adapter.inspect_runtime(container_id(), runtime_ref(), kCpuAssignment);
+
+  ASSERT_TRUE(observed) << observed.error().diagnostic;
+  EXPECT_EQ(observed->status.state, RuntimeState::running);
+  EXPECT_FALSE(observed->status.exit_code.has_value());
+  ASSERT_TRUE(observed->incarnation.has_value());
+  EXPECT_EQ(*observed->incarnation, runtime_incarnation());
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, InspectRuntimeReportsExitedContainerAndExitCode) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 0);
+  push_container_inspect(
+      runner, config, "runtime-1",
+      inspect_json(kSourceId, false, "0", "true", "logical-1", 7));
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto observed =
+      adapter.inspect_runtime(container_id(), runtime_ref(), kCpuAssignment);
+
+  ASSERT_TRUE(observed) << observed.error().diagnostic;
+  EXPECT_EQ(observed->status.state, RuntimeState::exited);
+  ASSERT_TRUE(observed->status.exit_code.has_value());
+  EXPECT_EQ(*observed->status.exit_code, 7);
+  ASSERT_TRUE(observed->incarnation.has_value());
+  EXPECT_EQ(*observed->incarnation, runtime_incarnation());
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, InspectRuntimeRejectsForeignOwnership) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 0);
+  push_container_inspect(
+      runner, config, "runtime-1",
+      inspect_json(kSourceId, true, "0", "true", "foreign-logical-id"));
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto observed =
+      adapter.inspect_runtime(container_id(), runtime_ref(), kCpuAssignment);
+
+  ASSERT_FALSE(observed);
+  EXPECT_EQ(observed.error().code, StableErrorCode::permission_denied);
+  EXPECT_EQ(observed.error().runtime_side_effect, RuntimeSideEffect::none);
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, InspectRuntimeRejectsWrongCpuset) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 0);
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kSourceId, true, "2"));
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto observed =
+      adapter.inspect_runtime(container_id(), runtime_ref(), kCpuAssignment);
+
+  ASSERT_FALSE(observed);
+  EXPECT_EQ(observed.error().code, StableErrorCode::conflict);
+  EXPECT_EQ(observed.error().runtime_side_effect, RuntimeSideEffect::none);
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest,
+     InspectRuntimeRejectsExternalPresenceWhenNormalContainerIsAbsent) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 1, 0);
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto observed =
+      adapter.inspect_runtime(container_id(), runtime_ref(), kCpuAssignment);
+
+  ASSERT_FALSE(observed);
+  EXPECT_EQ(observed.error().code, StableErrorCode::conflict);
+  EXPECT_EQ(observed.error().runtime_side_effect, RuntimeSideEffect::none);
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, StopAndRemoveSkipsStopForExitedContainer) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_container_inspect(
+      runner, config, "runtime-1",
+      inspect_json(kSourceId, false, "0", "true", "logical-1", 7));
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"rm", std::string(kSourceId)},
+      .result = exited(0),
+      .inspect_request =
+          [&](const ProcessRequest &request) {
+            EXPECT_EQ(request.timeout, config.cleanup_timeout);
+          },
+  });
+  push_exists(runner, config, "runtime-1", 1);
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto removed = adapter.stop_and_remove(
+      container_id(), runtime_incarnation(), kCpuAssignment);
+
+  EXPECT_TRUE(removed) << removed.error().diagnostic;
+  ASSERT_EQ(runner.requests().size(), 4U);
+  EXPECT_EQ(runner.requests()[1].argv,
+            (std::vector<std::string>{"rm", std::string(kSourceId)}));
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest,
+     StopAndRemovePreservesStopInspectRemoveAbsenceSequence) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kSourceId, true));
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"stop", "--time=10", std::string(kSourceId)},
+      .result = exited(0),
+      .inspect_request =
+          [&](const ProcessRequest &request) {
+            EXPECT_EQ(request.timeout, config.cleanup_timeout);
+          },
+  });
+  push_container_inspect(runner, config, std::string(kSourceId),
+                         inspect_json(kSourceId, false));
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"rm", std::string(kSourceId)},
+      .result = exited(0),
+      .inspect_request =
+          [&](const ProcessRequest &request) {
+            EXPECT_EQ(request.timeout, config.cleanup_timeout);
+          },
+  });
+  push_exists(runner, config, "runtime-1", 1);
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto removed = adapter.stop_and_remove(
+      container_id(), runtime_incarnation(), kCpuAssignment);
+
+  EXPECT_TRUE(removed) << removed.error().diagnostic;
+  ASSERT_EQ(runner.requests().size(), 6U);
+  EXPECT_EQ(
+      runner.requests()[1].argv,
+      (std::vector<std::string>{"stop", "--time=10", std::string(kSourceId)}));
+  EXPECT_EQ(runner.requests()[2].argv,
+            (std::vector<std::string>{"container", "inspect", "--format=json",
+                                      std::string(kSourceId)}));
+  EXPECT_EQ(runner.requests()[3].argv,
+            (std::vector<std::string>{"rm", std::string(kSourceId)}));
+  EXPECT_EQ(runner.requests()[4].argv,
+            (std::vector<std::string>{"container", "exists", "runtime-1"}));
+  EXPECT_EQ(runner.requests()[5].argv,
+            (std::vector<std::string>{"container", "exists", "--external",
+                                      "runtime-1"}));
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, PostStopInspectionFailureIsIndeterminate) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kSourceId, true));
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"stop", "--time=10", std::string(kSourceId)},
+      .result = exited(0),
+      .inspect_request = {},
+  });
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"container", "inspect", "--format=json", std::string(kSourceId)},
+      .result = timed_out(),
+      .inspect_request = {},
+  });
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto removed = adapter.stop_and_remove(
+      container_id(), runtime_incarnation(), kCpuAssignment);
+
+  ASSERT_FALSE(removed);
+  EXPECT_EQ(removed.error().code, StableErrorCode::deadline_exceeded);
+  EXPECT_EQ(removed.error().runtime_side_effect,
+            RuntimeSideEffect::incarnation_may_exist);
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, RemoveFailureIsIndeterminate) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kSourceId, false));
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"rm", std::string(kSourceId)},
+      .result = timed_out(),
+      .inspect_request = {},
+  });
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto removed = adapter.stop_and_remove(
+      container_id(), runtime_incarnation(), kCpuAssignment);
+
+  ASSERT_FALSE(removed);
+  EXPECT_EQ(removed.error().code, StableErrorCode::deadline_exceeded);
+  EXPECT_EQ(removed.error().runtime_side_effect,
+            RuntimeSideEffect::incarnation_may_exist);
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, AbsenceProofFailureAfterRemoveIsIndeterminate) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kSourceId, false));
+  runner.push(ScriptStep{
+      .executable = config.podman_executable,
+      .argv = {"rm", std::string(kSourceId)},
+      .result = exited(0),
+      .inspect_request = {},
+  });
+  push_exists(runner, config, "runtime-1", 0, 1);
+  PodmanAdapter adapter(runner, affinity, logger, config);
+
+  const auto removed = adapter.stop_and_remove(
+      container_id(), runtime_incarnation(), kCpuAssignment);
+
+  ASSERT_FALSE(removed);
+  EXPECT_EQ(removed.error().code, StableErrorCode::unavailable);
+  EXPECT_EQ(removed.error().runtime_side_effect,
+            RuntimeSideEffect::incarnation_may_exist);
+  EXPECT_TRUE(runner.empty());
+}
+
 TEST(PodmanAdapterTest, ProcessNonzeroSignalTimeoutAndTruncationFailClosed) {
   const std::vector<std::pair<ProcessResult, StableErrorCode>> failures{
       {exited(125, {}, "do-not-copy-this-stderr"),
@@ -863,6 +1160,8 @@ TEST(PodmanAdapterTest, ProcessNonzeroSignalTimeoutAndTruncationFailClosed) {
 
     ASSERT_FALSE(removed);
     EXPECT_EQ(removed.error().code, expected_code);
+    EXPECT_EQ(removed.error().runtime_side_effect,
+              RuntimeSideEffect::incarnation_may_exist);
     EXPECT_EQ(removed.error().diagnostic.find("do-not-copy-this-stderr"),
               std::string::npos);
     EXPECT_EQ(logger.text().find("do-not-copy-this-stderr"), std::string::npos);

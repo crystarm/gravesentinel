@@ -51,6 +51,9 @@ public:
   [[nodiscard]] virtual bool unregister_container(const ContainerId &) = 0;
   [[nodiscard]] virtual bool create_checkpoint(const ContainerId &) = 0;
   [[nodiscard]] virtual bool restore_or_restart(const ContainerId &) = 0;
+  [[nodiscard]] virtual bool stop_container(const ContainerId &) = 0;
+  [[nodiscard]] virtual std::expected<RuntimeStatus, RpcFailure>
+  get_runtime_status(const ContainerId &) = 0;
 };
 
 class SchedulerClient final : public IHypervisorClient {
@@ -84,9 +87,14 @@ public:
   submit_create_checkpoint(const ContainerId &, const RequestId &);
   [[nodiscard]] std::expected<OperationId, RpcFailure>
   submit_restore_or_restart(const ContainerId &, const RequestId &);
+  [[nodiscard]] std::expected<OperationId, RpcFailure>
+  submit_stop_container(const ContainerId &, const RequestId &);
   [[nodiscard]] std::expected<OperationStatus, RpcFailure>
   get_operation(const OperationId &operation_id);
   [[nodiscard]] std::expected<HealthStatus, RpcFailure> get_health();
+  [[nodiscard]] std::expected<RuntimeStatus, RpcFailure>
+  get_runtime_status(const ContainerId &) override;
+  [[nodiscard]] bool stop_container(const ContainerId &) override;
 
 private:
   struct Impl;

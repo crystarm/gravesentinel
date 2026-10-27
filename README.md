@@ -75,7 +75,7 @@ Production defaults are:
 | `--storage DIR` | `/var/lib/gravesentinel` |
 | `--podman PATH` | `/usr/bin/podman` |
 | `--criu PATH` | `/usr/sbin/criu` |
-| `--runtime-profile NAME` | only `podman-criu-rootful-v1` is accepted |
+| `--runtime-profile NAME` | only `podman-criu-rootful-v2` is accepted |
 | `--scheduler-uid UID` | if omitted, only the daemon effective UID is accepted |
 | `--socket-gid GID` | optional socket group owner |
 | `--socket-mode OCTAL` | `0660` |
@@ -127,7 +127,8 @@ The example module uses a development `local_path_override` and can be built wit
 sh scripts/check_scheduler_client_boundary.sh
 ```
 
-Protocol v3 exposes durable async create, restore/restart, and stop/remove.
+Protocol v4 exposes durable async create, restore/restart, and stop/remove, plus
+multi-CPU container cpusets.
 Each submission uses a caller-owned `RequestId`, returns a durable `OperationId`,
 and is observed through `get_operation()`. The convenience `bool` wrappers
 generate a request ID, submit, poll until the configured operation timeout, and
@@ -135,8 +136,11 @@ return `true` only for `succeeded`; `false` intentionally collapses transport,
 protocol, terminal failure, timeout, and `indeterminate`. Use the async API when
 the scheduler needs reconciliation detail.
 
-`get_runtime_status()` reports `absent`, `running`, or `exited`; only `exited`
-contains an exit code. A successful inspection validates ownership, cpuset, and
+A registration carries a nonempty `container_cpus` set and one disjoint
+`checkpoint_cpu`, all within logical CPUs `0..7`; active registrations must be
+globally disjoint and at most four may exist. `get_runtime_status()` reports
+`absent`, `running`, or `exited`; only `exited` contains an exit code. A successful
+inspection validates ownership, the exact cpuset, and
 the immutable Podman runtime ID, then adopts that incarnation into the service's
 in-memory fence. This is how a scheduler restores runtime knowledge after replaying
 a registration following daemon restart.

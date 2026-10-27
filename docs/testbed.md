@@ -25,9 +25,13 @@ cleanup scenarios and emitted
 
 The qualified entries are historical qualification records for the measured host on
 those dates, not statements that the current host or current runtime installation has
-been rechecked. They also predate protocol v3 runtime status/adoption and durable
-stop/remove, so they do not qualify those current-code paths. Qualification applies
-only to the exact runtime profile and command boundary in this document. A `+CRIU` feature in `crun --version` means that the
+been rechecked. They qualify only the historical protocol-v2/profile-v1
+implementation. They predate
+protocol v3 runtime status/adoption and durable stop/remove, and current protocol v4,
+profile v2, Manifest v2, and multi-CPU cpuset behavior. They therefore do not qualify
+those current-code paths. Qualification applies only to the exact historical runtime
+profile and command boundary recorded in this document. A `+CRIU` feature in
+`crun --version` means that the
 OCI runtime was compiled with CRIU integration; the successful smoke, not that
 feature flag, is the evidence that the complete workflow works.
 
@@ -76,10 +80,13 @@ the prerequisite script. It requires all of the following observations:
 - `crun` with first version line `crun version 1.21`, commit
   `10269840aa07fb7e6b7e1acff6198692d8ff5c88`, and the required `+APPARMOR`,
   `+CAP`, `+CRIU`, `+SECCOMP`, and `+SELINUX` feature tokens;
-- CRIU with first version line `Version: 4.1.1` and command profile
-  `podman-criu-rootful-v1`.
+- CRIU with first version line `Version: 4.1.1`; the recorded rootful runs used the
+  historical command profile `podman-criu-rootful-v1`.
 
-The host must make `/usr/sbin` available in `PATH`, and `criu check` must pass in
+The current daemon accepts only `podman-criu-rootful-v2`; that profile changes CPU
+assignment from one scalar container CPU to a canonical cpuset and has not yet been
+requalified rootfully. The host must make `/usr/sbin` available in `PATH`, and
+`criu check` must pass in
 the same rootful execution context that will invoke Podman. The adapter itself
 checks `criu --version` but does not run `criu check`; the gate must therefore be
 run separately. The adapter checks AppArmor/SELinux/seccomp state and the seccomp
@@ -101,9 +108,11 @@ The process-boundary target completed successfully in the qualified rootful cont
 on 2026-10-24 and was requalified against the current production recovery code on
 2026-10-25. Both runs emitted
 `RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`. This is historical
-stage-12 production-daemon E2E evidence for protocol v2; it must be rerun and extended
-to exercise protocol-v3 status/adoption and durable stop/remove before it qualifies the
-current lifecycle boundary. The older direct and adapter qualification records remain
+stage-12 production-daemon E2E evidence for protocol v2/profile v1. It must be rerun
+against protocol v4/profile v2 to cover protocol-v3 status/adoption and durable
+stop/remove together with multi-CPU cpusets and Manifest-v2 restore lineage before it
+qualifies the current lifecycle boundary. The older direct and adapter qualification
+records remain
 evidence for their narrower boundaries.
 
 `scripts/check_testbed.sh` is a prerequisite screen, not an exact implementation
@@ -425,16 +434,18 @@ crashes before/after runtime side effects, request deduplication, explicit
 retention/startup GC, and graceful shutdown. The production daemon remains the
 binary used for baseline, restart, stress, and final recovery passes.
 
-The four-container suite registers CPU pairs `0/1`, `2/3`, `4/5`, and `6/7`, proves
-four checkpoint operations overlap, inspects Podman/task/cgroup/worker affinity,
-rejects a fifth valid registration while all four slots are occupied, removes each
-runtime under ownership checks, and restores all four through `SchedulerClient`.
+The historical four-container run registered singleton container cpusets with
+container/checkpoint assignments `0/1`, `2/3`, `4/5`, and `6/7`, and proved four checkpoint operations overlap, inspected Podman/task/cgroup/worker
+affinity, rejected a fifth valid registration while all four slots were occupied,
+removed each runtime under ownership checks, and restored all four through
+`SchedulerClient`.
 
 Exact direct-wrapper commands and cleanup behavior are in
 `tests/integration/README.md`. On 2026-10-25, the four-container suite qualified
 twice, the crash/recovery suite qualified once, and the stage-12 regression wrapper
-qualified against the current startup-recovery code. These three current-code markers
-complete the stage-13 rootful acceptance evidence.
+qualified against the then-current startup-recovery code. These three markers are
+historical protocol-v2/profile-v1 acceptance evidence; they do not qualify protocol
+v4/profile v2.
 
 ## Adapter operation limits
 
@@ -475,8 +486,10 @@ different kernel/package/runtime version, another architecture, cgroup v1,
 another cgroup manager, another CRIU capability profile, SELinux/AppArmor policy
 changes, a different seccomp policy, GPUs/devices, TCP connections, or critically
 mutable shared volumes. The earlier direct smoke exercised CPU 0 and stage 12
-exercised its configured pair; availability of CPUs `0..7` was checked, but full
-the four-pair runtime acceptance qualified on 2026-10-25.
+exercised its configured pair; availability of CPUs `0..7` was checked, but the
+complete
+four-assignment runtime acceptance qualified on 2026-10-25 for profile v1. It does not
+qualify current multi-CPU profile-v2 behavior.
 
 Any change to the kernel, Podman, CRIU, crun, privilege model, cgroup setup,
 security policy, source-image semantics, or command profile requires the

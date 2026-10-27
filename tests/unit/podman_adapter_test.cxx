@@ -285,7 +285,7 @@ adapter_config(const std::filesystem::path &staging_root) {
       .selinux_mode = "disabled",
       .apparmor_profile = "host-default",
       .seccomp_profile = "default",
-      .command_profile = "podman-criu-rootful-v1",
+      .command_profile = "podman-criu-rootful-v2",
   };
 }
 
@@ -427,8 +427,8 @@ runtime_incarnation(std::string runtime_id = std::string(kSourceId)) {
   };
 }
 
-constexpr RuntimeCpuAssignment kCpuAssignment{
-    .container_cpu = 0U,
+const RuntimeCpuAssignment kCpuAssignment{
+    .container_cpus = CpuSet::create({0U}).value(),
     .checkpoint_cpu = 1U,
 };
 
@@ -494,6 +494,10 @@ TEST(PodmanAdapterTest,
   const std::string containers_conf = "/tmp/not-a-real-containers.conf";
   std::filesystem::path observed_environment_file;
   const auto logical = container_id("logical;$(still-one-label)");
+  const RuntimeCpuAssignment multi_cpu_assignment{
+      .container_cpus = CpuSet::create({0U, 2U}).value(),
+      .checkpoint_cpu = 1U,
+  };
   const std::vector<std::string> expected_argv{
       "run",
       "--detach",
@@ -508,7 +512,7 @@ TEST(PodmanAdapterTest,
       "--cap-drop=all",
       "--passwd=false",
       "--security-opt=no-new-privileges",
-      "--cpuset-cpus=0",
+      "--cpuset-cpus=0,2",
       "--env-file",
       std::string(kEnvironmentFilePlaceholder),
       "registry.example/fixture:1",
@@ -552,9 +556,9 @@ TEST(PodmanAdapterTest,
             }
           },
   });
-  push_container_inspect(
-      runner, config, "runtime-1",
-      inspect_json(kTargetId, true, "0", "true", "logical;$(still-one-label)"));
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kTargetId, true, "0,2", "true",
+                                      "logical;$(still-one-label)"));
   PodmanAdapter adapter(runner, affinity, logger, config);
   const ColdStartSpec spec{
       .image_reference = "registry.example/fixture:1",
@@ -570,7 +574,7 @@ TEST(PodmanAdapterTest,
   };
 
   const auto started =
-      adapter.cold_start(logical, runtime_ref(), spec, kCpuAssignment);
+      adapter.cold_start(logical, runtime_ref(), spec, multi_cpu_assignment);
 
   ASSERT_TRUE(started) << started.error().diagnostic;
   EXPECT_EQ(started->runtime_id, kTargetId);
@@ -862,6 +866,31 @@ TEST(PodmanAdapterTest,
   ASSERT_TRUE(observed) << observed.error().diagnostic;
   EXPECT_EQ(observed->status.state, RuntimeState::running);
   EXPECT_FALSE(observed->status.exit_code.has_value());
+  ASSERT_TRUE(observed->incarnation.has_value());
+  EXPECT_EQ(*observed->incarnation, runtime_incarnation());
+  EXPECT_TRUE(runner.empty());
+}
+
+TEST(PodmanAdapterTest, InspectRuntimeAcceptsEquivalentMultiCpuRangeSyntax) {
+  TemporaryDirectory temporary;
+  const auto config = adapter_config(temporary.path());
+  ScriptedProcessRunner runner;
+  FakeAffinityController affinity;
+  RecordingLogger logger;
+  push_exists(runner, config, "runtime-1", 0);
+  push_container_inspect(runner, config, "runtime-1",
+                         inspect_json(kSourceId, true, "0,2-4"));
+  PodmanAdapter adapter(runner, affinity, logger, config);
+  const RuntimeCpuAssignment assignment{
+      .container_cpus = CpuSet::create({0U, 2U, 3U, 4U}).value(),
+      .checkpoint_cpu = 1U,
+  };
+
+  const auto observed =
+      adapter.inspect_runtime(container_id(), runtime_ref(), assignment);
+
+  ASSERT_TRUE(observed) << observed.error().diagnostic;
+  EXPECT_EQ(observed->status.state, RuntimeState::running);
   ASSERT_TRUE(observed->incarnation.has_value());
   EXPECT_EQ(*observed->incarnation, runtime_incarnation());
   EXPECT_TRUE(runner.empty());

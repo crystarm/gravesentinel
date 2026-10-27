@@ -41,8 +41,8 @@ constexpr std::size_t kMaximumMetadataFieldBytes = 4096U;
 constexpr std::string_view kMetadataFilename = "checkpoint-metadata.json";
 constexpr std::string_view kStagingDirectoryName = "staging";
 constexpr std::uint64_t kMetadataSchemaVersion = 1U;
-constexpr RuntimeCpuAssignment kCpuAssignment{
-    .container_cpu = 0U,
+const RuntimeCpuAssignment kCpuAssignment{
+    .container_cpus = CpuSet::create({0U}).value(),
     .checkpoint_cpu = 1U,
 };
 

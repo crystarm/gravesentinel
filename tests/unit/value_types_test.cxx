@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace gravesentinel::ccm {
 namespace {
@@ -38,6 +39,25 @@ TEST(IdentifierTest, RejectsEmbeddedNul) {
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, ValidationErrorCode::embedded_nul);
   EXPECT_EQ(result.error().field, "container_id");
+}
+
+TEST(CpuSetTest, CanonicalizesAndOwnsLogicalCpuIds) {
+  const auto cpus = CpuSet::create({4U, 1U, 3U});
+
+  ASSERT_TRUE(cpus);
+  EXPECT_EQ(cpus->values(), (std::vector<std::uint32_t>{1U, 3U, 4U}));
+  EXPECT_TRUE(cpus->contains(3U));
+  EXPECT_FALSE(cpus->contains(2U));
+}
+
+TEST(CpuSetTest, RejectsEmptyDuplicateAndOutOfProfileSets) {
+  for (auto values :
+       {std::vector<std::uint32_t>{}, std::vector<std::uint32_t>{1U, 1U},
+        std::vector<std::uint32_t>{0U, 8U}}) {
+    const auto result = CpuSet::create(std::move(values));
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, ValidationErrorCode::invalid_cpu_set);
+  }
 }
 
 TEST(ChunkHashTest, HoldsExactlyOneBlake3Digest) {

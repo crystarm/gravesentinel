@@ -332,11 +332,12 @@ private:
 
 [[nodiscard]] EncodedManifest encoded_manifest(const ContainerId &container,
                                                std::uint64_t generation) {
-  auto encoded = encode_manifest_v1(ManifestV1{
+  auto encoded = encode_manifest_v2(ManifestV2{
       .container_id = container,
       .checkpoint_id = checkpoint_id(generation),
       .generation = generation,
       .created_at_unix_nanoseconds = generation,
+      .container_cpus = CpuSet::create({0U}).value(),
       .source_image_identity = "image@test",
       .runtime_fingerprint = runtime_fingerprint(),
       .artifacts = {},
@@ -355,11 +356,12 @@ encoded_manifest_with_chunk(const ContainerId &container,
   if (!path) {
     throw std::runtime_error(path.error().diagnostic);
   }
-  auto encoded = encode_manifest_v1(ManifestV1{
+  auto encoded = encode_manifest_v2(ManifestV2{
       .container_id = container,
       .checkpoint_id = checkpoint_id(generation),
       .generation = generation,
       .created_at_unix_nanoseconds = generation,
+      .container_cpus = CpuSet::create({0U}).value(),
       .source_image_identity = "image@test",
       .runtime_fingerprint = runtime_fingerprint(),
       .artifacts = {ManifestArtifactV1{

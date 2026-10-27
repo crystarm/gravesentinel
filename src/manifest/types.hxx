@@ -102,24 +102,25 @@ struct ManifestArtifactV1 {
   bool operator==(const ManifestArtifactV1 &) const = default;
 };
 
-struct ManifestV1 {
-  static constexpr std::uint64_t format_version = 1;
+struct ManifestV2 {
+  static constexpr std::uint64_t format_version = 2;
 
   ContainerId container_id;
   CheckpointId checkpoint_id;
   std::uint64_t generation;
   std::uint64_t created_at_unix_nanoseconds;
+  CpuSet container_cpus;
   std::string source_image_identity;
   RuntimeFingerprint runtime_fingerprint;
   std::vector<ManifestArtifactV1> artifacts;
 
-  bool operator==(const ManifestV1 &) const = default;
+  bool operator==(const ManifestV2 &) const = default;
 };
 
 [[nodiscard]] ManifestResult<void>
 validate_manifest_artifacts_v1(std::span<const ManifestArtifactV1> artifacts);
 
 [[nodiscard]] ManifestResult<void>
-validate_manifest_v1(const ManifestV1 &manifest);
+validate_manifest_v2(const ManifestV2 &manifest);
 
 } // namespace gravesentinel::ccm

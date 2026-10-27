@@ -21,6 +21,7 @@ enum class ValidationErrorCode : std::uint8_t {
   invalid_interval,
   invalid_keep_last,
   invalid_cpu_pair,
+  invalid_cpu_set,
   duplicate_cpu_assignment,
   too_many_registrations,
   invalid_cold_start_spec,
@@ -96,6 +97,30 @@ using RequestId = BasicIdentifier<detail::RequestIdTag>;
 using OperationId = BasicIdentifier<detail::OperationIdTag>;
 using RuntimeContainerRef = BasicIdentifier<detail::RuntimeContainerRefTag>;
 
+class CpuSet final {
+public:
+  static constexpr std::size_t maximum_size = 8;
+  static constexpr std::uint32_t maximum_cpu = 7;
+
+  CpuSet() : cpus_{0U} {}
+
+  [[nodiscard]] static std::expected<CpuSet, ValidationError>
+  create(std::vector<std::uint32_t> cpus);
+
+  [[nodiscard]] const std::vector<std::uint32_t> &values() const noexcept {
+    return cpus_;
+  }
+  [[nodiscard]] bool contains(std::uint32_t cpu) const noexcept;
+  [[nodiscard]] std::size_t size() const noexcept { return cpus_.size(); }
+
+  auto operator<=>(const CpuSet &) const = default;
+
+private:
+  explicit CpuSet(std::vector<std::uint32_t> cpus) : cpus_(std::move(cpus)) {}
+
+  std::vector<std::uint32_t> cpus_;
+};
+
 class ChunkHash final {
 public:
   static constexpr std::size_t digest_size = 32;
@@ -114,7 +139,7 @@ private:
 struct CheckpointConfig {
   std::chrono::seconds interval{60};
   std::size_t keep_last{3};
-  std::uint32_t container_cpu{};
+  CpuSet container_cpus;
   std::uint32_t checkpoint_cpu{};
 
   bool operator==(const CheckpointConfig &) const = default;
@@ -222,9 +247,6 @@ struct OperationStatus {
 
   bool operator==(const OperationStatus &) const = default;
 };
-
-[[nodiscard]] bool is_standard_cpu_pair(std::uint32_t container_cpu,
-                                        std::uint32_t checkpoint_cpu) noexcept;
 
 [[nodiscard]] std::expected<void, ValidationError>
 validate_checkpoint_config(const CheckpointConfig &config);

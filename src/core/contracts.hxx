@@ -19,7 +19,7 @@
 namespace gravesentinel::ccm {
 
 struct RuntimeCpuAssignment {
-  std::uint32_t container_cpu;
+  CpuSet container_cpus;
   std::uint32_t checkpoint_cpu;
 
   bool operator==(const RuntimeCpuAssignment &) const = default;

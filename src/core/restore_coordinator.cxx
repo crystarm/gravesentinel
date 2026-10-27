@@ -180,7 +180,7 @@ void log_maintenance_failure(ILogger &logger, const RestoreRequest &request,
 [[nodiscard]] CheckpointErrorDetail
 manifest_error(const ManifestError &error, const RequestId &request_id) {
   return make_error(StableErrorCode::corrupted_snapshot,
-                    "Manifest v1 validation failed: " + error.diagnostic,
+                    "Manifest v2 validation failed: " + error.diagnostic,
                     request_id);
 }
 
@@ -374,7 +374,7 @@ RestoreCoordinator::restore_or_restart(const RestoreRequest &request) {
       continue;
     }
 
-    auto manifest = decode_manifest_v1(*encoded);
+    auto manifest = decode_manifest_v2(*encoded);
     if (!manifest) {
       if (auto terminal = reject_candidate(
               manifest_error(manifest.error(), request.request_id));
@@ -389,6 +389,19 @@ RestoreCoordinator::restore_or_restart(const RestoreRequest &request) {
               make_error(StableErrorCode::corrupted_snapshot,
                          "manifest identity does not match its storage "
                          "reference",
+                         request.request_id),
+              &manifest->checkpoint_id);
+          terminal) {
+        return std::move(*terminal);
+      }
+      continue;
+    }
+
+    if (manifest->container_cpus != request.cpu_assignment.container_cpus) {
+      if (auto terminal = reject_candidate(
+              make_error(StableErrorCode::incompatible_runtime,
+                         "checkpoint container CPU set does not match the "
+                         "registered fixed CPU set",
                          request.request_id),
               &manifest->checkpoint_id);
           terminal) {

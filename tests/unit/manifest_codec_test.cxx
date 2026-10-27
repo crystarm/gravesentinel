@@ -26,11 +26,11 @@ constexpr std::string_view kGoldenEncoding =
     R"({"hash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","size":17}],"mode":33188,)"
     R"("path":"memory/pages-1.img","size":4194321},{"chunks":[{"hash":"efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",)"
     R"("size":29}],"mode":33188,"path":"metadata/inventory.json","size":29}],"checkpoint_id":"checkpoint-0007",)"
-    R"("checksum":"de16f4eabc04edca6b98b3b9a3b19854a6b4c541c41aa3eb0b83230bae40298f","container_id":"container-01",)"
-    R"("created_at_unix_nanoseconds":1730000000123456789,"format_version":1,"generation":7,"runtime_fingerprint":{)"
+    R"("checksum":"b711c231b8bb426d5ecc1ccc8d9ae9bcc88a201a5702aafdba8f5142b00ae201","container_cpus":[0,1],)"
+    R"("container_id":"container-01","created_at_unix_nanoseconds":1730000000123456789,"format_version":2,"generation":7,"runtime_fingerprint":{)"
     R"("apparmor_profile":"host-default","architecture":"amd64","capability_profile":"CapEff=000001ffffffffff",)"
     R"("cgroup_controllers":"cpu cpuset hugetlb io memory misc pids rdma","cgroup_manager":"systemd","cgroup_version":"v2",)"
-    R"("command_profile":"podman-criu-rootful-v1","criu_version":"4.1.1","kernel_release":"6.12.111+deb13-amd64",)"
+    R"("command_profile":"podman-criu-rootful-v2","criu_version":"4.1.1","kernel_release":"6.12.111+deb13-amd64",)"
     R"("oci_runtime_commit":"10269840aa07fb7e6b7e1acff6198692d8ff5c88","oci_runtime_features":"+APPARMOR +CAP +CRIU +SECCOMP +SELINUX",)"
     R"("oci_runtime_name":"crun","oci_runtime_version":"1.21","privilege_mode":"rootful","runtime_build_origin":"Debian 13",)"
     R"("runtime_name":"podman","runtime_version":"5.4.2","seccomp_profile":"default","selinux_mode":"disabled",)"
@@ -89,16 +89,17 @@ make_maximum_length_unique_path(std::size_t index) {
       .selinux_mode = "disabled",
       .apparmor_profile = "host-default",
       .seccomp_profile = "default",
-      .command_profile = "podman-criu-rootful-v1",
+      .command_profile = "podman-criu-rootful-v2",
   };
 }
 
-[[nodiscard]] ManifestV1 make_valid_manifest() {
-  return ManifestV1{
+[[nodiscard]] ManifestV2 make_valid_manifest() {
+  return ManifestV2{
       .container_id = ContainerId::create("container-01").value(),
       .checkpoint_id = CheckpointId::create("checkpoint-0007").value(),
       .generation = 7,
       .created_at_unix_nanoseconds = 1730000000123456789ULL,
+      .container_cpus = CpuSet::create({0U, 1U}).value(),
       .source_image_identity = std::string{kSourceImage},
       .runtime_fingerprint = make_valid_runtime_fingerprint(),
       .artifacts =
@@ -154,8 +155,8 @@ make_maximum_length_unique_path(std::size_t index) {
   return text;
 }
 
-[[nodiscard]] std::string encode_manifest(const ManifestV1 &manifest) {
-  auto encoded = encode_manifest_v1(manifest);
+[[nodiscard]] std::string encode_manifest(const ManifestV2 &manifest) {
+  auto encoded = encode_manifest_v2(manifest);
   if (!encoded) {
     throw std::runtime_error(encoded.error().diagnostic);
   }
@@ -189,7 +190,7 @@ make_maximum_length_unique_path(std::size_t index) {
 
 void expect_decode_error(std::string_view text,
                          ManifestErrorCode expected_code) {
-  const auto result = decode_manifest_v1(bytes_from_text(text));
+  const auto result = decode_manifest_v2(bytes_from_text(text));
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, expected_code);
 }
@@ -202,8 +203,8 @@ void expect_pre_checksum_error_after_replacement(
 }
 
 TEST(ManifestCodecTest, EncodesDeterministicGoldenCanonicalJson) {
-  const auto first = encode_manifest_v1(make_valid_manifest());
-  const auto second = encode_manifest_v1(make_valid_manifest());
+  const auto first = encode_manifest_v2(make_valid_manifest());
+  const auto second = encode_manifest_v2(make_valid_manifest());
 
   ASSERT_TRUE(first);
   ASSERT_TRUE(second);
@@ -218,10 +219,10 @@ TEST(ManifestCodecTest, EncodesDeterministicGoldenCanonicalJson) {
 
 TEST(ManifestCodecTest, RoundTripsEqualityAndPreservesOrdering) {
   const auto manifest = make_valid_manifest();
-  const auto encoded = encode_manifest_v1(manifest);
+  const auto encoded = encode_manifest_v2(manifest);
   ASSERT_TRUE(encoded);
 
-  const auto decoded = decode_manifest_v1(*encoded);
+  const auto decoded = decode_manifest_v2(*encoded);
 
   ASSERT_TRUE(decoded);
   EXPECT_EQ(*decoded, manifest);
@@ -255,40 +256,43 @@ TEST(ManifestCodecTest, EveryProtectedFieldAndOrderAffectsChecksum) {
   const auto baseline = make_valid_manifest();
   const auto baseline_checksum =
       checksum_from_encoding(encode_manifest(baseline));
-  std::vector<ManifestV1> variants;
+  std::vector<ManifestV2> variants;
   const auto add_variant = [&baseline, &variants](auto mutate) {
     auto variant = baseline;
     mutate(variant);
     variants.push_back(std::move(variant));
   };
 
-  add_variant([](ManifestV1 &value) {
+  add_variant([](ManifestV2 &value) {
     value.container_id = ContainerId::create("container-02").value();
   });
-  add_variant([](ManifestV1 &value) {
+  add_variant([](ManifestV2 &value) {
     value.checkpoint_id = CheckpointId::create("checkpoint-0008").value();
   });
-  add_variant([](ManifestV1 &value) { ++value.generation; });
-  add_variant([](ManifestV1 &value) { ++value.created_at_unix_nanoseconds; });
-  add_variant([](ManifestV1 &value) {
+  add_variant([](ManifestV2 &value) { ++value.generation; });
+  add_variant([](ManifestV2 &value) { ++value.created_at_unix_nanoseconds; });
+  add_variant([](ManifestV2 &value) {
+    value.container_cpus = CpuSet::create({0U, 2U}).value();
+  });
+  add_variant([](ManifestV2 &value) {
     value.source_image_identity =
         "registry.example/gravesentinel@sha256:1123456789abcdef";
   });
-  add_variant([](ManifestV1 &value) {
-    value.runtime_fingerprint.command_profile = "podman-criu-rootful-v2";
+  add_variant([](ManifestV2 &value) {
+    value.runtime_fingerprint.command_profile = "podman-criu-rootful-v3";
   });
-  add_variant([](ManifestV1 &value) {
+  add_variant([](ManifestV2 &value) {
     value.artifacts[0].path = make_path("memory/pages-2.img");
   });
-  add_variant([](ManifestV1 &value) { value.artifacts[0].mode = 0100600U; });
-  add_variant([](ManifestV1 &value) {
+  add_variant([](ManifestV2 &value) { value.artifacts[0].mode = 0100600U; });
+  add_variant([](ManifestV2 &value) {
     std::swap(value.artifacts[0], value.artifacts[1]);
   });
-  add_variant([](ManifestV1 &value) {
+  add_variant([](ManifestV2 &value) {
     std::swap(value.artifacts[0].chunks[0].hash,
               value.artifacts[0].chunks[1].hash);
   });
-  add_variant([](ManifestV1 &value) {
+  add_variant([](ManifestV2 &value) {
     ++value.artifacts[1].size;
     ++value.artifacts[1].chunks[0].size;
   });
@@ -369,15 +373,16 @@ TEST(ManifestCodecTest, RejectsUnknownAndMissingNestedFields) {
 TEST(ManifestCodecTest, RejectsUnsupportedAndMistypedVersions) {
   const auto encoded = encode_valid_manifest();
 
-  for (const auto version : {std::string_view{"0"}, std::string_view{"2"}}) {
+  for (const auto version :
+       {std::string_view{"0"}, std::string_view{"1"}, std::string_view{"3"}}) {
     SCOPED_TRACE(version);
     expect_pre_checksum_error_after_replacement(
-        encoded, "\"format_version\":1",
+        encoded, "\"format_version\":2",
         std::string{"\"format_version\":"} + std::string{version},
         ManifestErrorCode::unsupported_version);
   }
   expect_pre_checksum_error_after_replacement(
-      encoded, "\"format_version\":1", "\"format_version\":\"1\"",
+      encoded, "\"format_version\":2", "\"format_version\":\"2\"",
       ManifestErrorCode::schema_violation);
 }
 
@@ -524,7 +529,7 @@ TEST(ManifestCodecTest, EncoderRejectsOutputBeyondByteLimit) {
     });
   }
 
-  const auto result = encode_manifest_v1(manifest);
+  const auto result = encode_manifest_v2(manifest);
 
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, ManifestErrorCode::limit_exceeded);
@@ -534,7 +539,7 @@ TEST(ManifestCodecTest, DecoderRejectsEncodingBeyondByteLimit) {
   const EncodedManifest oversized(ManifestLimits::maximum_encoded_bytes + 1U,
                                   std::byte{0x20});
 
-  const auto result = decode_manifest_v1(oversized);
+  const auto result = decode_manifest_v2(oversized);
 
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, ManifestErrorCode::limit_exceeded);

@@ -63,7 +63,7 @@ make_registration(std::string name, std::uint32_t container_cpu,
           CheckpointConfig{
               .interval = interval,
               .keep_last = 3U,
-              .container_cpu = container_cpu,
+              .container_cpus = CpuSet::create({container_cpu}).value(),
               .checkpoint_cpu = checkpoint_cpu,
           },
       .cold_start = std::nullopt,

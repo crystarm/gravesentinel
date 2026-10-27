@@ -12,7 +12,7 @@ The current code includes:
 | Area | Implementation | Status |
 | --- | --- | --- |
 | Common types and validation | `//src/protocol:protocol` | implemented, unit-tested |
-| Manifest v1 and BLAKE3 | `//src/manifest:manifest`, `//src/crypto:blake3` | implemented, unit-tested |
+| Manifest v2 and BLAKE3 | `//src/manifest:manifest`, `//src/crypto:blake3` | implemented, unit-tested |
 | Crash-safe storage | `//src/storage:filesystem_storage` | implemented, unit-tested |
 | Chunking/reassembly | `//src/chunking:snapshot_chunker` | implemented, unit-tested |
 | Linux process/affinity boundary | `//src/hypervisor:linux_runtime` | implemented, unit-tested |
@@ -36,9 +36,10 @@ Podman adapter share `checkpoint-data` as their trusted staging boundary; the ad
 unit test obtains its capture directory from a real `FilesystemStorage` operation.
 This is a real production composition, not a stub. Unit tests cover its components and
 IPC behavior. The complete production binary-to-Podman/CRIU stage-12 path and both
-stage-13 suites qualified rootfully on 2026-10-25 for the then-current protocol-v2
-code. Protocol v3 added runtime status/adoption and durable stop/remove, so those
-markers are historical and affected rootful suites must be rerun before release. The
+stage-13 suites qualified rootfully on 2026-10-25 for the then-current
+protocol-v2/profile-v1 code. Protocol v3 added runtime status/adoption and durable
+stop/remove; current protocol v4/profile v2 and Manifest v2 add multi-CPU cpusets.
+Those markers are historical and affected rootful suites must be rerun before release. The
 runtime remains intentionally restricted to the separately qualified destructive
 rootful profile.
 
@@ -96,7 +97,7 @@ server's allowed peer.
 Only the hypervisor process invokes rootful Podman/CRIU. `IProcessRunner` accepts an
 executable and a separate `argv`; the production `PosixProcessRunner` uses `execve`
 rather than shell concatenation. The only accepted runtime profile is
-`podman-criu-rootful-v1`; the composition defaults to `/usr/bin/podman` and
+`podman-criu-rootful-v2`; the composition defaults to `/usr/bin/podman` and
 `/usr/sbin/criu`. Scheduler-facing code does not depend on storage, Podman, CRIU, or
 Linux APIs.
 
@@ -173,7 +174,7 @@ dependency graph.
 `RuntimeContainerRef` are distinct strong types. Their underlying factory rejects only
 an empty value and an embedded NUL. Stricter constraints are imposed at other layers:
 
-- Manifest v1 and `FilesystemStorage` limit container/checkpoint/storage IDs to 256
+- Manifest v2 and `FilesystemStorage` limit container/checkpoint/storage IDs to 256
   bytes;
 - manifest metadata must be valid UTF-8 without control characters;
 - the runtime adapter applies its own constraints to Podman names, image references,
@@ -196,7 +197,7 @@ represented explicitly as either `null` or the complete object:
   "checkpoint": {
     "interval_seconds": integer,
     "keep_last": integer,
-    "container_cpu": integer,
+    "container_cpus": [integer, ...],
     "checkpoint_cpu": integer
   },
   "cold_start": null | {
@@ -234,8 +235,10 @@ represented explicitly as either `null` or the complete object:
 Registration validation requires:
 
 - `interval_seconds` in `1..31536000` and `keep_last` in `1..3`;
-- one of the CPU pairs `(0,1)`, `(2,3)`, `(4,5)`, `(6,7)`;
-- no more than four registrations, with no duplicate CPU assignments;
+- a nonempty canonical `container_cpus` set and one disjoint `checkpoint_cpu`, all
+  within logical CPUs `0..7`;
+- no more than four registrations, with globally disjoint container/checkpoint CPU
+  assignments;
 - a bounded and syntactically valid `ColdStartSpec`, including unique environment
   names and the complete arrays shown above;
 - non-empty fields in the registration-level `RuntimeFingerprint`, if specified.
@@ -245,7 +248,7 @@ One field currently does not affect the workflow after validation:
 - `ContainerRegistration::runtime_fingerprint`, because create stores the fingerprint
   measured by the adapter, while restore uses the fingerprint from the manifest.
 
-`ColdStartSpec` is separate from the mutable runtime ID. Command profile v1 prohibits
+`ColdStartSpec` is separate from the mutable runtime ID. Command profile v2 prohibits
 mounts and arbitrary runtime options. The production adapter passes the environment
 through a transient mode-`0600` env-file rather than through Podman argv or the process
 environment. Names and values are validated further; NUL, CR, and LF are prohibited.
@@ -314,7 +317,7 @@ sequenceDiagram
     C->>H: ingest(runtime-artifact tree)
     H->>F: validate/reuse or publish chunks
     H-->>C: ordered artifact descriptors
-    C->>C: encode canonical Manifest v1
+    C->>C: encode canonical Manifest v2
     C->>F: publish_manifest
     Note over C,F: confirmed publication is the commit point
     C->>F: apply_retention keep_last under create lease
@@ -398,7 +401,7 @@ Full details: [checkpoint-restore.md](checkpoint-restore.md).
 persistent worker pinned to `checkpoint_cpu`; create, restore, retention, and GC all
 reuse it. There is no fifth CPU-heavy worker. The control caller thread is not rebound.
 Linux CPU availability checks use the process leader's allowed mask rather than the
-already narrowed worker mask, so adapter validation of `container_cpu` remains valid
+already narrowed worker mask, so adapter validation of `container_cpus` remains valid
 while the caller is pinned to `checkpoint_cpu`.
 
 Within a slot, work selection priority is manual foreground, periodic create, retention,
@@ -487,11 +490,11 @@ chunking/reassembly. NFS/FUSE/overlay and filesystems without reliable directory
 `fsync` have not been qualified.
 
 Details: [filesystem-storage.md](filesystem-storage.md),
-[chunking.md](chunking.md), [manifest-v1.md](manifest-v1.md).
+[chunking.md](chunking.md), [manifest-v2.md](manifest-v2.md).
 
 ## Runtime Boundary
 
-`PodmanAdapter` implements only `podman-criu-rootful-v1`. It checks the exact
+`PodmanAdapter` implements only `podman-criu-rootful-v2`. It checks the exact
 fingerprint, immutable image ID, ownership labels, cpuset, and immutable 64-hex runtime
 ID. `ContainerId`, stable `RuntimeContainerRef`, and single-lifetime
 `RuntimeIncarnation` are not interchangeable.
@@ -557,14 +560,14 @@ new destructive attempt.
 ## Implemented IPC and Async Operation Contract
 
 IPC is local `AF_UNIX/SOCK_SEQPACKET` request/response transport. Each JSON request and
-response occupies one packet and is limited to 256 KiB. The protocol-v3 envelopes are:
+response occupies one packet and is limited to 256 KiB. The protocol-v4 envelopes are:
 
 ```text
-request  = {"version": 3, "method": string, "request_id": string,
+request  = {"version": 4, "method": string, "request_id": string,
             "params": object}
-success  = {"version": 3, "request_id": string, "ok": true,
+success  = {"version": 4, "request_id": string, "ok": true,
             "result": object, "close_connection": bool}
-failure  = {"version": 3, "request_id": string, "ok": false,
+failure  = {"version": 4, "request_id": string, "ok": false,
             "error_code": string, "close_connection": bool}
 ```
 
@@ -603,7 +606,7 @@ fails ambiguously it does not transport-retry that mutation. It returns failure 
 the scheduler must reconcile registration state rather than assume the request did or
 did not execute. At the in-process core boundary, `Unregister` returns
 `StableErrorCode::conflict` with `retryable=true` without changing a registration that
-has active work. Protocol v3 intentionally collapses synchronous Register/Unregister
+has active work. Protocol v4 intentionally collapses synchronous Register/Unregister
 service failures to `request_failed`, and the boolean client returns `false`; the
 scheduler must reconcile state and decide whether to retry.
 
@@ -633,9 +636,10 @@ stale staging cleanup, and startup pass repetition are implemented. The remainin
 3. cancellation and service-level deadlines for already accepted operations.
 
 The implemented `//tests/integration:hypervisor_scheduler_e2e` process-boundary
-target completed successfully in the qualified rootful Podman/CRIU environment before
-the protocol-v3 status/stop extension. That result is historical; affected rootful
-suites must be rerun before releasing the current runtime lifecycle code.
+target completed successfully in the qualified rootful Podman/CRIU environment for
+protocol v2/profile v1, before protocol-v3 status/stop and protocol-v4 cpuset
+extensions. That result is historical; affected rootful suites must be rerun before
+releasing the current runtime lifecycle code.
 
 Consequently, `keep_last` does limit committed manifests when immediate retention or a
 retry completes, but registry saturation still rejects new unique public operations and

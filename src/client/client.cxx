@@ -228,7 +228,7 @@ registration_json(const ContainerRegistration &registration) {
           {"checkpoint",
            {{"interval_seconds", registration.checkpoint.interval.count()},
             {"keep_last", registration.checkpoint.keep_last},
-            {"container_cpu", registration.checkpoint.container_cpu},
+            {"container_cpus", registration.checkpoint.container_cpus.values()},
             {"checkpoint_cpu", registration.checkpoint.checkpoint_cpu}}},
           {"cold_start", std::move(cold_start)},
           {"runtime_fingerprint", std::move(fingerprint)}};

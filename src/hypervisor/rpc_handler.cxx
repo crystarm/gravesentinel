@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace gravesentinel::hypervisor {
 namespace {
@@ -366,7 +367,8 @@ decode_container_registration(const nlohmann::json &parameters) {
     const auto &checkpoint = parameters.at("checkpoint");
     if (!container || !runtime ||
         !has_exact_keys(checkpoint, {"interval_seconds", "keep_last",
-                                     "container_cpu", "checkpoint_cpu"})) {
+                                     "container_cpus", "checkpoint_cpu"}) ||
+        !checkpoint.at("container_cpus").is_array()) {
       return std::unexpected(RegistrationDecodeError::invalid_schema);
     }
 
@@ -374,11 +376,19 @@ decode_container_registration(const nlohmann::json &parameters) {
         checkpoint.at("interval_seconds"));
     const auto keep_last =
         nonnegative_integer<std::size_t>(checkpoint.at("keep_last"));
-    const auto container_cpu =
-        nonnegative_integer<std::uint32_t>(checkpoint.at("container_cpu"));
+    std::vector<std::uint32_t> container_cpu_values;
+    container_cpu_values.reserve(checkpoint.at("container_cpus").size());
+    for (const auto &encoded_cpu : checkpoint.at("container_cpus")) {
+      const auto cpu = nonnegative_integer<std::uint32_t>(encoded_cpu);
+      if (!cpu) {
+        return std::unexpected(RegistrationDecodeError::invalid_schema);
+      }
+      container_cpu_values.push_back(*cpu);
+    }
+    auto container_cpus = ccm::CpuSet::create(std::move(container_cpu_values));
     const auto checkpoint_cpu =
         nonnegative_integer<std::uint32_t>(checkpoint.at("checkpoint_cpu"));
-    if (!interval || !keep_last || !container_cpu || !checkpoint_cpu)
+    if (!interval || !keep_last || !container_cpus || !checkpoint_cpu)
       return std::unexpected(RegistrationDecodeError::invalid_schema);
 
     std::optional<ccm::ColdStartSpec> cold_start;
@@ -400,7 +410,7 @@ decode_container_registration(const nlohmann::json &parameters) {
         .runtime_container = std::move(*runtime),
         .checkpoint = {.interval = std::chrono::seconds{*interval},
                        .keep_last = *keep_last,
-                       .container_cpu = *container_cpu,
+                       .container_cpus = std::move(*container_cpus),
                        .checkpoint_cpu = *checkpoint_cpu},
         .cold_start = std::move(cold_start),
         .runtime_fingerprint = std::move(fingerprint),

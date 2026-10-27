@@ -46,7 +46,7 @@ struct Config {
   std::string storage{std::string("/var/lib/gravesentinel")};
   std::string podman{std::string("/usr/bin/podman")};
   std::string criu{std::string("/usr/sbin/criu")};
-  std::string runtime_profile{std::string("podman-criu-rootful-v1")};
+  std::string runtime_profile{std::string("podman-criu-rootful-v2")};
   std::optional<uid_t> scheduler_uid;
   std::optional<gid_t> socket_gid;
   unsigned socket_mode{0660};
@@ -67,7 +67,7 @@ void print_usage(std::ostream &output) {
          "  --scheduler-uid UID      Authorized scheduler UID\n"
          "  --socket-gid GID         Group owner for the Unix socket\n"
          "  --socket-mode OCTAL      Unix socket mode (default: 0660)\n"
-         "  --runtime-profile NAME   Must be podman-criu-rootful-v1\n"
+         "  --runtime-profile NAME   Must be podman-criu-rootful-v2\n"
          "  --gc-grace-seconds N     Unreferenced chunk grace (default: 3600)\n"
          "  --help                   Show this help\n";
 }
@@ -138,7 +138,7 @@ parse_unsigned(const std::string_view text, const int base) {
 
   if (config.socket.empty() || config.storage.empty() ||
       config.podman.empty() || config.criu.empty() ||
-      config.runtime_profile != "podman-criu-rootful-v1") {
+      config.runtime_profile != "podman-criu-rootful-v2") {
     return ParseResult::error;
   }
   return ParseResult::success;

@@ -1,5 +1,6 @@
 #include "src/protocol/types.hxx"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string_view>
@@ -9,7 +10,7 @@ namespace gravesentinel::ccm {
 namespace {
 
 constexpr std::size_t kMaximumRegistrations = 4;
-constexpr std::size_t kMvpCpuCount = 8;
+constexpr std::size_t kMvpCpuCount = CpuSet::maximum_size;
 
 constexpr std::size_t kMaximumColdStartImageBytes = 2048;
 constexpr std::size_t kMaximumColdStartArgvEntries = 256;
@@ -18,9 +19,6 @@ constexpr std::size_t kMaximumColdStartEnvironmentEntries = 256;
 constexpr std::size_t kMaximumColdStartEnvironmentNameBytes = 256;
 constexpr std::size_t kMaximumColdStartEnvironmentValueBytes = 4096;
 constexpr std::size_t kMaximumColdStartTotalBytes = 64U * 1024U;
-
-constexpr std::array<std::array<std::uint32_t, 2>, kMaximumRegistrations>
-    kStandardCpuPairs{{{0, 1}, {2, 3}, {4, 5}, {6, 7}}};
 
 [[nodiscard]] ValidationError make_error(ValidationErrorCode code,
                                          std::string_view field,
@@ -68,14 +66,34 @@ constexpr std::array<std::array<std::uint32_t, 2>, kMaximumRegistrations>
 
 } // namespace
 
-bool is_standard_cpu_pair(std::uint32_t container_cpu,
-                          std::uint32_t checkpoint_cpu) noexcept {
-  for (const auto &pair : kStandardCpuPairs) {
-    if (pair[0] == container_cpu && pair[1] == checkpoint_cpu) {
-      return true;
-    }
+std::expected<CpuSet, ValidationError>
+CpuSet::create(std::vector<std::uint32_t> cpus) {
+  if (cpus.empty()) {
+    return std::unexpected(make_error(
+        ValidationErrorCode::invalid_cpu_set, "checkpoint.container_cpus",
+        "container CPU set must contain at least one logical CPU"));
   }
-  return false;
+  if (cpus.size() > maximum_size) {
+    return std::unexpected(make_error(
+        ValidationErrorCode::invalid_cpu_set, "checkpoint.container_cpus",
+        "container CPU set exceeds the eight-CPU profile limit"));
+  }
+  std::ranges::sort(cpus);
+  if (cpus.back() > maximum_cpu) {
+    return std::unexpected(make_error(
+        ValidationErrorCode::invalid_cpu_set, "checkpoint.container_cpus",
+        "container logical CPUs must be in the inclusive range 0..7"));
+  }
+  if (std::ranges::adjacent_find(cpus) != cpus.end()) {
+    return std::unexpected(make_error(
+        ValidationErrorCode::invalid_cpu_set, "checkpoint.container_cpus",
+        "container CPU set must not contain duplicate logical CPUs"));
+  }
+  return CpuSet(std::move(cpus));
+}
+
+bool CpuSet::contains(const std::uint32_t cpu) const noexcept {
+  return std::ranges::binary_search(cpus_, cpu);
 }
 
 std::expected<void, ValidationError>
@@ -90,10 +108,11 @@ validate_checkpoint_config(const CheckpointConfig &config) {
         ValidationErrorCode::invalid_keep_last, "checkpoint.keep_last",
         "keep_last must be in the inclusive range 1..3"));
   }
-  if (!is_standard_cpu_pair(config.container_cpu, config.checkpoint_cpu)) {
-    return std::unexpected(
-        make_error(ValidationErrorCode::invalid_cpu_pair, "checkpoint.cpu_pair",
-                   "CPU pair must be one of (0,1), (2,3), (4,5), or (6,7)"));
+  if (config.checkpoint_cpu > CpuSet::maximum_cpu ||
+      config.container_cpus.contains(config.checkpoint_cpu)) {
+    return std::unexpected(make_error(
+        ValidationErrorCode::invalid_cpu_pair, "checkpoint.cpu_assignment",
+        "checkpoint CPU must be in 0..7 and outside the container CPU set"));
   }
   return {};
 }
@@ -204,14 +223,14 @@ validate_container_registration(const ContainerRegistration &registration) {
       return std::unexpected(make_error(
           ValidationErrorCode::invalid_cold_start_spec, "cold_start.mounts",
           "cold-start mounts are unsupported by "
-          "podman-criu-rootful-v1"));
+          "podman-criu-rootful-v2"));
     }
     if (!cold_start.runtime_options.empty()) {
       return std::unexpected(
           make_error(ValidationErrorCode::invalid_cold_start_spec,
                      "cold_start.runtime_options",
                      "cold-start runtime options are unsupported by "
-                     "podman-criu-rootful-v1"));
+                     "podman-criu-rootful-v2"));
     }
   }
 
@@ -257,17 +276,23 @@ validate_cpu_assignments(std::span<const ContainerRegistration> registrations) {
       return result;
     }
 
-    const std::array cpus{registration.checkpoint.container_cpu,
-                          registration.checkpoint.checkpoint_cpu};
-    for (const auto cpu : cpus) {
+    for (const auto cpu : registration.checkpoint.container_cpus.values()) {
       if (assigned[cpu]) {
         return std::unexpected(make_error(
             ValidationErrorCode::duplicate_cpu_assignment,
-            "checkpoint.cpu_pair",
+            "checkpoint.cpu_assignment",
             "a logical CPU must not be assigned to multiple registrations"));
       }
       assigned[cpu] = true;
     }
+    const auto checkpoint_cpu = registration.checkpoint.checkpoint_cpu;
+    if (assigned[checkpoint_cpu]) {
+      return std::unexpected(make_error(
+          ValidationErrorCode::duplicate_cpu_assignment,
+          "checkpoint.cpu_assignment",
+          "a logical CPU must not be assigned to multiple registrations"));
+    }
+    assigned[checkpoint_cpu] = true;
   }
 
   return {};

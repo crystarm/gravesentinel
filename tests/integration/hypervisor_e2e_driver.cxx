@@ -39,7 +39,7 @@ using gravesentinel::ccm::ColdStartSpec;
 using gravesentinel::ccm::ContainerId;
 using gravesentinel::ccm::ContainerRegistration;
 using gravesentinel::ccm::HealthState;
-using gravesentinel::ccm::ManifestV1;
+using gravesentinel::ccm::ManifestV2;
 using gravesentinel::ccm::OperationId;
 using gravesentinel::ccm::OperationState;
 using gravesentinel::ccm::QueueState;
@@ -631,7 +631,7 @@ void write_binary_file(const std::filesystem::path &path,
 struct StoredGeneration {
   std::uint64_t generation{};
   std::filesystem::path manifest_path;
-  ManifestV1 manifest;
+  ManifestV2 manifest;
   std::set<std::string> chunks;
 };
 
@@ -724,7 +724,7 @@ public:
             "no manifest exists for incompatibility injection");
     auto manifest = std::move(stored.back().manifest);
     manifest.runtime_fingerprint.kernel_release += "-stage12-incompatible";
-    auto encoded = gravesentinel::ccm::encode_manifest_v1(manifest);
+    auto encoded = gravesentinel::ccm::encode_manifest_v2(manifest);
     if (!encoded)
       fail("cannot re-encode incompatible manifest: " +
            encoded.error().diagnostic);
@@ -740,7 +740,7 @@ private:
       if (!entry.is_regular_file() || entry.path().extension() != ".json")
         continue;
       auto bytes = read_binary_file(entry.path());
-      auto manifest = gravesentinel::ccm::decode_manifest_v1(bytes);
+      auto manifest = gravesentinel::ccm::decode_manifest_v2(bytes);
       if (!manifest) {
         fail("cannot decode manifest " + entry.path().string() + ": " +
              manifest.error().diagnostic);
@@ -862,7 +862,8 @@ make_registration(const Options &options, const Scenario &scenario) {
           CheckpointConfig{
               .interval = std::chrono::hours{24},
               .keep_last = 3,
-              .container_cpu = 0,
+              .container_cpus =
+                  gravesentinel::ccm::CpuSet::create({0U}).value(),
               .checkpoint_cpu = 1,
           },
       .cold_start =

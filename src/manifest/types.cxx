@@ -362,7 +362,7 @@ validate_manifest_artifacts_v1(std::span<const ManifestArtifactV1> artifacts) {
   return {};
 }
 
-ManifestResult<void> validate_manifest_v1(const ManifestV1 &manifest) {
+ManifestResult<void> validate_manifest_v2(const ManifestV2 &manifest) {
   if (manifest.generation == 0) {
     return std::unexpected(
         make_error(ManifestErrorCode::invalid_generation, "generation",

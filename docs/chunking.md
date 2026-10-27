@@ -4,7 +4,7 @@
 
 `//src/chunking:snapshot_chunker` implements the stage-05 transformation between
 an immutable snapshot tree and the artifact/chunk section of
-[Manifest v1](manifest-v1.md). It uses a lock-bound operation supplied by
+[Manifest v2](manifest-v2.md). It uses a lock-bound operation supplied by
 [FilesystemStorage](filesystem-storage.md), but does not capture a runtime
 checkpoint, commit a manifest, select a restore candidate, or invoke the runtime
 adapter.
@@ -12,7 +12,7 @@ adapter.
 The supported tree consists only of regular files. File bytes, relative paths,
 and full regular-file POSIX modes are preserved. Directories are structural only:
 empty directories, directory modes, ownership, ACLs, xattrs, capabilities, and
-timestamps are not represented by Manifest v1. Reassembly requests mode `0700`
+timestamps are not represented by Manifest v2. Reassembly requests mode `0700`
 when creating its output root and intermediate directories. The POSIX backend
 uses `mkdirat`, so the process `umask` may remove permission bits; the
 implementation does not apply a compensating directory `fchmod` and therefore
@@ -159,7 +159,7 @@ be handed a partially validated tree through this API.
 Payload buffering is independent of artifact or snapshot size. Ingest holds one
 source chunk and, while validating deduplication, at most one stored chunk;
 reassembly holds one stored chunk. Artifact and chunk descriptor memory is bounded
-by Manifest v1 limits. A directory listing refuses more than the combined
+by Manifest v2 limits. A directory listing refuses more than the combined
 artifact/directory budget before sorting. Both ingest and manifest validation cap
 the whole tree at 4096 directories including the root and 256 path components.
 

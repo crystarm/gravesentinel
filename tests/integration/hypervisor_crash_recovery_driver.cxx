@@ -36,7 +36,7 @@ using gravesentinel::ccm::ColdStartSpec;
 using gravesentinel::ccm::ContainerId;
 using gravesentinel::ccm::ContainerRegistration;
 using gravesentinel::ccm::HealthState;
-using gravesentinel::ccm::ManifestV1;
+using gravesentinel::ccm::ManifestV2;
 using gravesentinel::ccm::OperationId;
 using gravesentinel::ccm::OperationState;
 using gravesentinel::ccm::OperationStatus;
@@ -832,7 +832,7 @@ read_binary_file(const std::filesystem::path &path) {
 
 struct StoredGeneration {
   std::filesystem::path path;
-  ManifestV1 manifest;
+  ManifestV2 manifest;
 };
 
 class StorageProbe final {
@@ -852,7 +852,7 @@ public:
       require(canonical_manifest_name(name),
               "manifest root contains a non-canonical entry: " + name);
       auto bytes = read_binary_file(entry.path());
-      auto decoded = gravesentinel::ccm::decode_manifest_v1(bytes);
+      auto decoded = gravesentinel::ccm::decode_manifest_v2(bytes);
       if (!decoded) {
         fail("committed manifest is not valid canonical Manifest v1: " +
              decoded.error().diagnostic);
@@ -927,7 +927,7 @@ public:
 
 private:
   void verify_chunks(const std::filesystem::path &directory,
-                     const ManifestV1 &manifest) const {
+                     const ManifestV2 &manifest) const {
     for (const auto &artifact : manifest.artifacts) {
       for (const auto &chunk : artifact.chunks) {
         const auto hash = hash_to_hex(chunk.hash);
@@ -1033,7 +1033,8 @@ struct Context {
           CheckpointConfig{
               .interval = std::chrono::hours{24},
               .keep_last = 3,
-              .container_cpu = 0,
+              .container_cpus =
+                  gravesentinel::ccm::CpuSet::create({0U}).value(),
               .checkpoint_cpu = 1,
           },
       .cold_start =

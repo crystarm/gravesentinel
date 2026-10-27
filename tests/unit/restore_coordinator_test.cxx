@@ -79,7 +79,7 @@ make_test_error(StableErrorCode code, std::string diagnostic,
       .selinux_mode = "disabled",
       .apparmor_profile = "host-default",
       .seccomp_profile = "default",
-      .command_profile = "podman-criu-rootful-v1",
+      .command_profile = "podman-criu-rootful-v2",
   };
 }
 
@@ -419,12 +419,13 @@ public:
       throw std::runtime_error(path.error().diagnostic);
     }
     const auto source_image = "image-generation-" + std::to_string(generation);
-    const ManifestV1 manifest{
+    const ManifestV2 manifest{
         .container_id = container,
         .checkpoint_id = make_identifier<CheckpointId>(
             "checkpoint-" + std::to_string(generation)),
         .generation = generation,
         .created_at_unix_nanoseconds = kCreatedAtNanoseconds + generation,
+        .container_cpus = CpuSet::create({2U}).value(),
         .source_image_identity = source_image,
         .runtime_fingerprint = valid_runtime_fingerprint(),
         .artifacts = {ManifestArtifactV1{
@@ -437,7 +438,7 @@ public:
             }},
         }},
     };
-    auto encoded = encode_manifest_v1(manifest);
+    auto encoded = encode_manifest_v2(manifest);
     if (!encoded) {
       throw std::runtime_error(encoded.error().diagnostic);
     }
@@ -951,7 +952,7 @@ make_request(std::optional<ColdStartSpec> cold_start = cold_start_spec(),
           make_identifier<RuntimeContainerRef>("runtime-container-1"),
       .cpu_assignment =
           RuntimeCpuAssignment{
-              .container_cpu = 2U,
+              .container_cpus = CpuSet::create({2U}).value(),
               .checkpoint_cpu = 3U,
           },
       .expected_source_incarnation = std::move(source),

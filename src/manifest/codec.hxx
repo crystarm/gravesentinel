@@ -11,9 +11,9 @@ namespace gravesentinel::ccm {
 using EncodedManifest = std::vector<std::byte>;
 
 [[nodiscard]] ManifestResult<EncodedManifest>
-encode_manifest_v1(const ManifestV1 &manifest);
+encode_manifest_v2(const ManifestV2 &manifest);
 
-[[nodiscard]] ManifestResult<ManifestV1>
-decode_manifest_v1(std::span<const std::byte> encoded);
+[[nodiscard]] ManifestResult<ManifestV2>
+decode_manifest_v2(std::span<const std::byte> encoded);
 
 } // namespace gravesentinel::ccm

@@ -242,7 +242,7 @@ wall_time_nanoseconds(const IClock &clock, const RequestId &request_id) {
 manifest_encoding_error(const ManifestError &error,
                         const RequestId &request_id) {
   return make_error(StableErrorCode::internal,
-                    "Manifest v1 serialization failed: " + error.diagnostic,
+                    "Manifest v2 serialization failed: " + error.diagnostic,
                     request_id);
 }
 
@@ -360,16 +360,17 @@ CheckpointCreator::create(const CheckpointCreateRequest &request) {
                  &*checkpoint_id, &*generation);
   state = CheckpointCreateState::committing;
 
-  const ManifestV1 manifest{
+  const ManifestV2 manifest{
       .container_id = request.container_id,
       .checkpoint_id = *checkpoint_id,
       .generation = *generation,
       .created_at_unix_nanoseconds = *created_at,
+      .container_cpus = request.cpu_assignment.container_cpus,
       .source_image_identity = captured->source_image_identity,
       .runtime_fingerprint = captured->runtime_fingerprint,
       .artifacts = std::move(*artifacts),
   };
-  auto encoded_manifest = encode_manifest_v1(manifest);
+  auto encoded_manifest = encode_manifest_v2(manifest);
   if (!encoded_manifest) {
     return fail(
         manifest_encoding_error(encoded_manifest.error(), request.request_id));

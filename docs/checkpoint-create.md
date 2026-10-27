@@ -3,7 +3,7 @@
 ## Scope
 
 `//src/core:checkpoint_creator` is the synchronous create orchestration layer. It
-connects `IPodmanAdapter`, `ISnapshotChunker`, Manifest v1, and `IStorage`. It owns
+connects `IPodmanAdapter`, `ISnapshotChunker`, Manifest v2, and `IStorage`. It owns
 post-commit immediate retention under the create lease, but not periodic scheduling,
 restore selection, separate maintenance retries, operation-journal recovery, or
 garbage collection. The production
@@ -110,11 +110,12 @@ The artifact is never re-captured or continued within a failed operation.
 
 ## Manifest-last commit
 
-After every artifact has been chunked, the creator builds canonical Manifest v1
+After every artifact has been chunked, the creator builds canonical Manifest v2
 with:
 
 - logical container and fresh checkpoint identities;
 - monotonic generation and capture timestamp;
+- the exact canonical `container_cpus` assigned to the captured runtime;
 - source image identity and strict runtime fingerprint returned by the adapter;
 - ordered artifact metadata and chunk references returned by the chunker.
 
@@ -219,7 +220,7 @@ serialization/commit, and cleanup. Every failed attempt is
 checked against three pre-existing canonical checkpoints whose referenced chunks
 are reassembled byte-for-byte with the production reassembler.
 
-The lower-level production storage, maintenance layer, chunker, Manifest v1 codec, and
+The lower-level production storage, maintenance layer, chunker, Manifest v2 codec, and
 Podman adapter retain their own unit and opt-in rootful integration tests. Focused
 maintenance coverage includes `//tests/unit:checkpoint_maintenance_test`,
 `//tests/unit:filesystem_storage_test`, and `//tests/unit:checkpoint_service_test`.

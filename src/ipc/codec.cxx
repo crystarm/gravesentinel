@@ -200,24 +200,29 @@ validate_registration(const nlohmann::json &parameters) {
 
   const auto &checkpoint = parameters.at("checkpoint");
   if (!has_exact_keys(checkpoint, {"interval_seconds", "keep_last",
-                                   "container_cpu", "checkpoint_cpu"}) ||
+                                   "container_cpus", "checkpoint_cpu"}) ||
       !integer_in_range(checkpoint.at("interval_seconds"), 1,
                         365U * 24U * 60U * 60U) ||
       !integer_in_range(checkpoint.at("keep_last"), 1, 3) ||
-      !integer_in_range(checkpoint.at("container_cpu"), 0, 7) ||
+      !checkpoint.at("container_cpus").is_array() ||
+      checkpoint.at("container_cpus").empty() ||
+      checkpoint.at("container_cpus").size() > 8U ||
       !integer_in_range(checkpoint.at("checkpoint_cpu"), 0, 7)) {
     return std::unexpected(make_error("invalid checkpoint configuration"));
   }
-  const auto container_cpu =
-      checkpoint.at("container_cpu").get<std::uint64_t>();
+  std::unordered_set<std::uint64_t> container_cpus;
+  container_cpus.reserve(checkpoint.at("container_cpus").size());
+  for (const auto &cpu : checkpoint.at("container_cpus")) {
+    if (!integer_in_range(cpu, 0, 7) ||
+        !container_cpus.insert(cpu.get<std::uint64_t>()).second) {
+      return std::unexpected(make_error("invalid container CPU set"));
+    }
+  }
   const auto checkpoint_cpu =
       checkpoint.at("checkpoint_cpu").get<std::uint64_t>();
-  const bool standard_pair = (container_cpu == 0 && checkpoint_cpu == 1) ||
-                             (container_cpu == 2 && checkpoint_cpu == 3) ||
-                             (container_cpu == 4 && checkpoint_cpu == 5) ||
-                             (container_cpu == 6 && checkpoint_cpu == 7);
-  if (!standard_pair)
-    return std::unexpected(make_error("invalid checkpoint CPU pair"));
+  if (container_cpus.contains(checkpoint_cpu)) {
+    return std::unexpected(make_error("invalid checkpoint CPU assignment"));
+  }
 
   const auto &cold_start = parameters.at("cold_start");
   if (!cold_start.is_null()) {

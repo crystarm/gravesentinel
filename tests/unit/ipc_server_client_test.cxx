@@ -147,14 +147,15 @@ using gravesentinel::ccm::RuntimeContainerRef;
       .selinux_mode = "disabled",
       .apparmor_profile = "host-default",
       .seccomp_profile = "default",
-      .command_profile = "podman-criu-rootful-v1",
+      .command_profile = "podman-criu-rootful-v2",
   };
   return ContainerRegistration{
       .container_id = ContainerId::create("container-1").value(),
       .runtime_container = RuntimeContainerRef::create("runtime-1").value(),
       .checkpoint = {.interval = 60s,
                      .keep_last = 3,
-                     .container_cpu = 0,
+                     .container_cpus =
+                         gravesentinel::ccm::CpuSet::create({0U}).value(),
                      .checkpoint_cpu = 1},
       .cold_start = std::move(cold_start),
       .runtime_fingerprint = std::move(fingerprint),

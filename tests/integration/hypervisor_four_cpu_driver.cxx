@@ -854,7 +854,9 @@ make_registration(const Options &options, const Scenario &scenario) {
           CheckpointConfig{
               .interval = std::chrono::hours{24},
               .keep_last = 3,
-              .container_cpu = scenario.container_cpu,
+              .container_cpus =
+                  gravesentinel::ccm::CpuSet::create({scenario.container_cpu})
+                      .value(),
               .checkpoint_cpu = scenario.checkpoint_cpu,
           },
       .cold_start =

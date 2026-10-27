@@ -38,7 +38,7 @@ public:
       "io.gravesentinel.ccm.managed";
   static constexpr std::string_view logical_id_label =
       "io.gravesentinel.ccm.logical-id";
-  static constexpr std::string_view command_profile = "podman-criu-rootful-v1";
+  static constexpr std::string_view command_profile = "podman-criu-rootful-v2";
   static constexpr std::string_view checkpoint_artifact_name = "checkpoint.tar";
 
   PodmanAdapter(IProcessRunner &process_runner,

@@ -7,7 +7,7 @@
 #include <string_view>
 
 namespace gravesentinel::ipc {
-inline constexpr unsigned protocol_version = 3;
+inline constexpr unsigned protocol_version = 4;
 inline constexpr std::size_t max_message_bytes = 256U * 1024U;
 
 struct CodecError {

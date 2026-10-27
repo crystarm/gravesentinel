@@ -766,7 +766,7 @@ scan_manifests_strict(const std::shared_ptr<IFileOperations> &operations,
     if (!encoded) {
       return std::unexpected(encoded.error());
     }
-    auto manifest = decode_manifest_v1(*encoded);
+    auto manifest = decode_manifest_v2(*encoded);
     if (!manifest || manifest->container_id != container_id ||
         manifest->generation != *generation) {
       return std::unexpected(logical_error(
@@ -1926,7 +1926,7 @@ public:
           "manifest publication is final and requires an active create "
           "operation"));
     }
-    auto manifest = decode_manifest_v1(manifest_bytes);
+    auto manifest = decode_manifest_v2(manifest_bytes);
     if (!manifest) {
       return std::unexpected(logical_error(
           StableErrorCode::invalid_argument,
@@ -1971,7 +1971,7 @@ public:
             "a different immutable manifest already uses this generation"));
       }
 
-      auto existing = decode_manifest_v1(*encoded);
+      auto existing = decode_manifest_v2(*encoded);
       if (!existing) {
         continue;
       }
@@ -2895,7 +2895,7 @@ FilesystemStorage::read_manifest(const ContainerId &container_id,
   if (!encoded) {
     return std::unexpected(encoded.error());
   }
-  auto manifest = decode_manifest_v1(*encoded);
+  auto manifest = decode_manifest_v2(*encoded);
   if (!manifest || manifest->container_id != container_id ||
       manifest->generation != generation) {
     return std::unexpected(logical_error(

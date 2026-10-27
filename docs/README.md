@@ -6,7 +6,7 @@ Podman/CRIU profile, persisted formats, and remaining lifecycle work.
 
 ## Current status
 
-The repository contains tested implementations of Manifest v1, filesystem storage,
+The repository contains tested implementations of Manifest v2, filesystem storage,
 chunking/reassembly, the Linux process and affinity layer, the Podman adapter,
 checkpoint creation, restore/fallback/cold start, retention, chunk garbage
 collection, startup storage recovery, the checkpoint service core, and their
@@ -21,7 +21,7 @@ by `GetOperation` polling. Read-only `GetRuntimeStatus` reports `absent`, `runni
 `exited` and adopts a successfully validated runtime incarnation into the service after
 a registration replay. Register and unregister remain synchronous and are not
 transport-retried after an exchange may have reached the server. At the core boundary,
-a busy unregister returns a retryable conflict instead of waiting; protocol v3 exposes
+a busy unregister returns a retryable conflict instead of waiting; protocol v4 exposes
 all synchronous register/unregister service failures only as `request_failed`, so the
 scheduler must reconcile state before deciding whether to retry.
 
@@ -47,7 +47,7 @@ The remaining important limits are:
   the wire but is not forwarded into create or restore decisions;
 - an indeterminate operation requires scheduler/operator reconciliation and must not
   be blindly resubmitted as a new destructive operation;
-- the only production runtime profile is `podman-criu-rootful-v1`, with executable
+- the only production runtime profile is `podman-criu-rootful-v2`, with executable
   defaults `/usr/bin/podman` and `/usr/sbin/criu`; its destructive checkpoint and
   restore flow must run only in a qualified rootful environment.
 
@@ -57,10 +57,12 @@ unit tests. On 2026-10-25, the manual
 process/IPC/Podman path and emitted
 `RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`; the non-privileged release
 gate, four-container CPU acceptance, and crash/reconnect/recovery suites also passed on
-that date. Those markers predate protocol v3, runtime status/adoption, and durable
-stop/remove and therefore are historical rather than current-code qualification. The
-non-privileged gate and affected rootful suites must be rerun before release. Every
-deployment still requires its own rootful qualification.
+that date. Those markers qualify only the historical protocol-v2/profile-v1 implementation.
+Protocol v3 added runtime status/adoption and durable stop/remove; current protocol v4,
+profile v2, and Manifest v2 additionally add multi-CPU cpusets. The old markers are
+therefore not current rootful qualification. The protocol-v4/profile-v2
+non-privileged release gate passed on 2026-10-26; affected rootful suites remain
+pending. Every deployment still requires its own rootful qualification.
 
 ## Reading guide
 
@@ -71,7 +73,7 @@ deployment still requires its own rootful qualification.
 | [Operations](operations.md) | CLI/defaults, ownership, systemd, startup/recovery, upgrade, logging, diagnostics, and unsupported modes |
 | [Release gate](release-gate.md) | Non-privileged release gate, rootful suites, success markers, and requalification triggers |
 | [Requirements traceability](requirements-traceability.md) | Exact Bazel evidence for requirements 8.1/8.2 and stage-13 process criteria |
-| [Manifest v1](manifest-v1.md) | Normative persisted manifest schema, canonical JSON, checksum, validation, and limits |
+| [Manifest v2](manifest-v2.md) | Normative persisted manifest schema, canonical JSON, checksum, cpuset lineage, validation, and limits |
 | [Chunking](chunking.md) | Fixed-size ingest, namespace-local deduplication, immutable tree checks, and verified reassembly |
 | [Filesystem storage](filesystem-storage.md) | On-disk layout, locking, staging, pins, maintenance records, durable publication/deletion, reads, recovery, and known limits |
 | [Checkpoint creation](checkpoint-create.md) | Capture-to-manifest transaction, generation assignment, commit point, immediate retention, cleanup, and indeterminate publication |
@@ -86,7 +88,7 @@ A useful implementation-order reading path is:
 1. [Architecture](architecture.md)
 2. [SchedulerClient](scheduler-client.md)
 3. [Operations](operations.md)
-4. [Manifest v1](manifest-v1.md)
+4. [Manifest v2](manifest-v2.md)
 5. [Filesystem storage](filesystem-storage.md)
 6. [Chunking](chunking.md)
 7. [Checkpoint creation](checkpoint-create.md)
@@ -121,7 +123,7 @@ A useful implementation-order reading path is:
 
 The documentation deliberately separates four kinds of statements:
 
-1. **Format contracts** — Manifest v1 and the storage layout describe bytes and
+1. **Format contracts** — Manifest v2 and the storage layout describe bytes and
    durability rules implemented by the current code. A persisted-format change
    requires an explicit versioning decision.
 2. **Interface contracts** — types in `src/core/contracts.hxx` define method shapes,

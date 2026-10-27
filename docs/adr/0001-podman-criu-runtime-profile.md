@@ -38,14 +38,20 @@ The accepted MVP runtime profile is:
   container and import restore under a new name.
 
 Rootless Podman, remote Podman, and any version or host-profile variation are
-unsupported until independently requalified. The production implementation accepts
-only the profile name `podman-criu-rootful-v1` and fails closed for every other
-profile.
+unsupported until independently requalified. At the time of this decision, the
+production implementation accepted only the profile name
+`podman-criu-rootful-v1` and failed closed for every other profile.
 
 ## Implementation and verification notes
 
 These notes record the current implementation boundary without changing the
 accepted decision or the historical qualification result.
+
+The current implementation supersedes the command-profile portion of this ADR with
+`podman-criu-rootful-v2`, protocol v4, Manifest v2, and canonical multi-CPU container
+cpusets. The host/runtime assumptions and opaque-artifact decision remain unchanged.
+The historical rootful markers below qualify profile v1 only; profile v2 requires a
+new destructive qualification run.
 
 The successful stage-02 runs on 2026-10-21, the production adapter run on
 2026-10-22, and the production process/IPC E2E run on 2026-10-24 are dated
@@ -68,7 +74,7 @@ The dated adapter smoke exercises the production runtime libraries through a
 purpose-built integration helper and is not by itself evidence for the complete
 production hypervisor + IPC + journal + storage + service + Podman/CRIU flow. The
 manual `//tests/integration:hypervisor_scheduler_e2e` target covers that boundary.
-Its rootful run on 2026-10-24 completed on the qualified profile and emitted
+Its rootful run on 2026-10-24 completed on the historical profile-v1 boundary and emitted
 `RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed`.
 
 The prerequisite gate is intentionally less exact than the adapter profile. It
@@ -110,9 +116,9 @@ The adapter must use an argv process runner and must not concatenate a shell
 command. A disconnect, nonzero exit, malformed result, or indeterminate cleanup
 is never converted to success.
 
-## Adapter command profile v1
+## Adapter command profile v2
 
-The production adapter implements only `podman-criu-rootful-v1`. The composed daemon
+The production adapter implements only `podman-criu-rootful-v2`. The composed daemon
 rejects any other `--runtime-profile` value and defaults to `/usr/bin/podman` and
 `/usr/sbin/criu` for the executable paths. In addition to the two qualified
 checkpoint/restore commands above, its cold-start argv is:
@@ -122,7 +128,7 @@ checkpoint/restore commands above, its cold-start argv is:
  "--label", "io.gravesentinel.ccm.managed=true",
  "--label", "io.gravesentinel.ccm.logical-id=" + CONTAINER_ID,
  "--network=none", "--read-only", "--cap-drop=all", "--passwd=false",
- "--security-opt=no-new-privileges", "--cpuset-cpus=" + CONTAINER_CPU,
+ "--security-opt=no-new-privileges", "--cpuset-cpus=" + CANONICAL_CONTAINER_CPUSET,
  ["--env-file", TRANSIENT_ENV_FILE], IMAGE_REFERENCE, WORKLOAD_ARGV...]
 ```
 
@@ -133,7 +139,7 @@ path is passed through `--env-file`. After the synchronous Podman invocation the
 adapter attempts to unlink the file, and an unlink failure makes the operation
 fail. The destructor retries best-effort, but if both unlink attempts fail the
 file can remain and requires trusted staging cleanup. Values containing NUL, CR,
-or LF are rejected. Mounts and arbitrary runtime options are rejected by v1
+or LF are rejected. Mounts and arbitrary runtime options are rejected by v2
 instead of being mapped to an unqualified command form.
 
 Operational inspection and cleanup use these exact argv forms:
@@ -164,7 +170,7 @@ The adapter's implemented acceptance checks require:
   `10269840aa07fb7e6b7e1acff6198692d8ff5c88`, and required `+APPARMOR`, `+CAP`,
   `+CRIU`, `+SECCOMP`, and `+SELINUX` tokens;
 - CRIU with first version line `Version: 4.1.1` and command profile
-  `podman-criu-rootful-v1`.
+  `podman-criu-rootful-v2`.
 
 It records a canonical fingerprint and requires exact equality before restore.
 The adapter invokes `criu --version` but does not run `criu check`; the separate
@@ -179,11 +185,10 @@ image identity. The source image must remain available in the local Podman image
 store after the original container is removed and until restore validation has
 completed.
 
-The production adapter-mode smoke qualified these adapter assumptions on the rootful
-host on 2026-10-22 and ended with
-`RESULT: QUALIFIED production PodmanAdapter smoke passed`. This remains dated
-recorded evidence under the verification boundary above and must not be described as
-a production daemon end-to-end test.
+The production adapter-mode smoke on 2026-10-22 ended with
+`RESULT: QUALIFIED production PodmanAdapter smoke passed`, but it exercised historical
+profile v1. It remains dated evidence for that narrower boundary and must not be
+described as qualification of profile v2 or as a production daemon end-to-end test.
 
 ### Implemented limits and test coverage boundary
 
@@ -269,8 +274,8 @@ removal.
 
 ## Consequences
 
-- Production runtime support is limited to the exact accepted rootful
-  `podman-criu-rootful-v1` profile.
+- Production runtime support is limited to the exact current rootful
+  `podman-criu-rootful-v2` profile; its rootful qualification is pending.
 - Deployments must deliberately provision the rootful CRIU capability model,
   cgroup v2/systemd, and cpuset availability; repository scripts do not modify the
   host. The daemon defaults to `/usr/bin/podman` and `/usr/sbin/criu`, and alternate

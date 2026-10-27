@@ -3,7 +3,7 @@
 ## Scope
 
 `//src/core:restore_coordinator` is the synchronous restore orchestration layer. It
-selects committed Manifest v1 checkpoints newest-to-oldest, validates and pins each
+selects committed Manifest v2 checkpoints newest-to-oldest, validates and pins each
 candidate, reassembles verified bytes, fences the original runtime incarnation,
 invokes `IPodmanAdapter`, and performs a cold start only after all checkpoint
 candidates are unusable or have failed with confirmed cleanup. The production
@@ -61,14 +61,16 @@ strictly descending order even if an alternative storage implementation returns 
 different order. For each generation it:
 
 1. durably pins the published manifest;
-2. reads and strictly decodes canonical Manifest v1, including schema, checksum,
-   container identity, and generation checks;
-3. asks the runtime adapter to validate the exact fingerprint and immutable source
+2. reads and strictly decodes canonical Manifest v2, including schema, checksum,
+   container identity, generation, and source `container_cpus` checks;
+3. requires the manifest cpuset to equal the requested runtime `container_cpus`
+   exactly, rejecting a mismatch before any runtime mutation;
+4. asks the runtime adapter to validate the exact fingerprint and immutable source
    image identity;
-4. requires the qualified MVP runtime shape of exactly one opaque regular artifact;
-5. reassembles into a fresh `snapshot-<generation>` child of this operation's
+5. requires the qualified MVP runtime shape of exactly one opaque regular artifact;
+6. reassembles into a fresh `snapshot-<generation>` child of this operation's
    staging directory;
-6. verifies every chunk size and BLAKE3 digest before the artifact path can reach
+7. verifies every chunk size and BLAKE3 digest before the artifact path can reach
    the adapter.
 
 Candidate disposition is based only on the stable error code. Any

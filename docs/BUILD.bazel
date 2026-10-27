@@ -13,8 +13,8 @@ filegroup(
 )
 
 filegroup(
-    name = "manifest_v1",
-    srcs = ["manifest-v1.md"],
+    name = "manifest_v2",
+    srcs = ["manifest-v2.md"],
     visibility = ["//visibility:public"],
 )
 
@@ -98,7 +98,7 @@ filegroup(
         "chunking.md",
         "filesystem-storage.md",
         "maintenance.md",
-        "manifest-v1.md",
+        "manifest-v2.md",
         "operations.md",
         "release-gate.md",
         "requirements-traceability.md",

@@ -275,7 +275,7 @@ as_bytes(std::string_view value) noexcept {
   return std::as_bytes(std::span(value.data(), value.size()));
 }
 
-[[nodiscard]] Json manifest_payload_json(const ManifestV1 &manifest) {
+[[nodiscard]] Json manifest_payload_json(const ManifestV2 &manifest) {
   Json artifacts = Json::array();
   for (const auto &artifact : manifest.artifacts) {
     Json chunks = Json::array();
@@ -297,12 +297,13 @@ as_bytes(std::string_view value) noexcept {
   return Json{
       {"artifacts", std::move(artifacts)},
       {"checkpoint_id", manifest.checkpoint_id.value()},
+      {"container_cpus", manifest.container_cpus.values()},
       {"container_id", manifest.container_id.value()},
       {"created_at_unix_nanoseconds",
        static_cast<Json::number_unsigned_t>(
            manifest.created_at_unix_nanoseconds)},
       {"format_version",
-       static_cast<Json::number_unsigned_t>(ManifestV1::format_version)},
+       static_cast<Json::number_unsigned_t>(ManifestV2::format_version)},
       {"generation", static_cast<Json::number_unsigned_t>(manifest.generation)},
       {"runtime_fingerprint",
        Json{
@@ -343,8 +344,8 @@ dump_canonical_json(const Json &document) {
 }
 
 [[nodiscard]] ManifestResult<std::string>
-encode_manifest_text(const ManifestV1 &manifest) {
-  if (auto validation = validate_manifest_v1(manifest); !validation) {
+encode_manifest_text(const ManifestV2 &manifest) {
+  if (auto validation = validate_manifest_v2(manifest); !validation) {
     return std::unexpected(std::move(validation.error()));
   }
 
@@ -387,6 +388,33 @@ has_exact_keys(const Json &object,
                    "field must be an unsigned integer literal"));
   }
   return value.get<std::uint64_t>();
+}
+
+[[nodiscard]] ManifestResult<CpuSet> read_cpu_set(const Json &value) {
+  if (!value.is_array() || value.empty() ||
+      value.size() > CpuSet::maximum_size) {
+    return std::unexpected(
+        make_error(ManifestErrorCode::schema_violation, "container_cpus",
+                   "container_cpus must be a nonempty bounded array"));
+  }
+  std::vector<std::uint32_t> cpus;
+  cpus.reserve(value.size());
+  for (const auto &encoded_cpu : value) {
+    auto cpu = read_unsigned(encoded_cpu, "container_cpus");
+    if (!cpu || *cpu > std::numeric_limits<std::uint32_t>::max()) {
+      return std::unexpected(
+          make_error(ManifestErrorCode::schema_violation, "container_cpus",
+                     "container_cpus entries must be uint32 values"));
+    }
+    cpus.push_back(static_cast<std::uint32_t>(*cpu));
+  }
+  auto result = CpuSet::create(std::move(cpus));
+  if (!result) {
+    return std::unexpected(make_error(ManifestErrorCode::schema_violation,
+                                      "container_cpus",
+                                      result.error().diagnostic));
+  }
+  return std::move(*result);
 }
 
 [[nodiscard]] ManifestResult<std::string> read_string(const Json &value,
@@ -592,7 +620,7 @@ read_artifacts(const Json &value) {
 
 } // namespace
 
-ManifestResult<EncodedManifest> encode_manifest_v1(const ManifestV1 &manifest) {
+ManifestResult<EncodedManifest> encode_manifest_v2(const ManifestV2 &manifest) {
   auto encoded = encode_manifest_text(manifest);
   if (!encoded) {
     return std::unexpected(std::move(encoded.error()));
@@ -600,8 +628,8 @@ ManifestResult<EncodedManifest> encode_manifest_v1(const ManifestV1 &manifest) {
   return string_to_bytes(*encoded);
 }
 
-ManifestResult<ManifestV1>
-decode_manifest_v1(std::span<const std::byte> encoded) {
+ManifestResult<ManifestV2>
+decode_manifest_v2(std::span<const std::byte> encoded) {
   if (encoded.empty()) {
     return std::unexpected(make_error(ManifestErrorCode::malformed_json,
                                       "manifest",
@@ -640,19 +668,19 @@ decode_manifest_v1(std::span<const std::byte> encoded) {
   if (!version) {
     return std::unexpected(std::move(version.error()));
   }
-  if (*version != ManifestV1::format_version) {
+  if (*version != ManifestV2::format_version) {
     return std::unexpected(
         make_error(ManifestErrorCode::unsupported_version, "format_version",
                    "manifest format version is not supported"));
   }
-  if (!has_exact_keys(document,
-                      {"artifacts", "checkpoint_id", "checksum", "container_id",
-                       "created_at_unix_nanoseconds", "format_version",
-                       "generation", "runtime_fingerprint",
-                       "source_image_identity"})) {
+  if (!has_exact_keys(
+          document,
+          {"artifacts", "checkpoint_id", "checksum", "container_cpus",
+           "container_id", "created_at_unix_nanoseconds", "format_version",
+           "generation", "runtime_fingerprint", "source_image_identity"})) {
     return std::unexpected(
         make_error(ManifestErrorCode::schema_violation, "manifest",
-                   "manifest must contain exactly the v1 fields"));
+                   "manifest must contain exactly the v2 fields"));
   }
 
   auto container_text =
@@ -688,6 +716,10 @@ decode_manifest_v1(std::span<const std::byte> encoded) {
   if (!created_at) {
     return std::unexpected(std::move(created_at.error()));
   }
+  auto container_cpus = read_cpu_set(document.at("container_cpus"));
+  if (!container_cpus) {
+    return std::unexpected(std::move(container_cpus.error()));
+  }
   auto source_image = read_string(document.at("source_image_identity"),
                                   "source_image_identity");
   if (!source_image) {
@@ -702,16 +734,17 @@ decode_manifest_v1(std::span<const std::byte> encoded) {
     return std::unexpected(std::move(artifacts.error()));
   }
 
-  ManifestV1 manifest{
+  ManifestV2 manifest{
       .container_id = std::move(*container_id),
       .checkpoint_id = std::move(*checkpoint_id),
       .generation = *generation,
       .created_at_unix_nanoseconds = *created_at,
+      .container_cpus = std::move(*container_cpus),
       .source_image_identity = std::move(*source_image),
       .runtime_fingerprint = std::move(*runtime),
       .artifacts = std::move(*artifacts),
   };
-  if (auto validation = validate_manifest_v1(manifest); !validation) {
+  if (auto validation = validate_manifest_v2(manifest); !validation) {
     return std::unexpected(std::move(validation.error()));
   }
 
@@ -742,7 +775,7 @@ decode_manifest_v1(std::span<const std::byte> encoded) {
   if (*canonical_text != text) {
     return std::unexpected(
         make_error(ManifestErrorCode::non_canonical_encoding, "manifest",
-                   "manifest JSON is valid but not in canonical v1 form"));
+                   "manifest JSON is valid but not in canonical v2 form"));
   }
 
   return manifest;

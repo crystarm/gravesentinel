@@ -65,7 +65,7 @@ client checks the connected server with `SO_PEERCRED`. The hypervisor separately
 checks the scheduler UID; socket mode/group permissions only control whether the
 connection can be attempted.
 
-`connect()` performs an eager connection and protocol-v3 handshake. Public RPC
+`connect()` performs an eager connection and protocol-v4 handshake. Public RPC
 methods also open and handshake a connection when no descriptor is active, so an
 explicit `connect()` is useful for readiness but is not required before every
 call. The class serializes calls with an internal mutex. It is movable, not
@@ -110,19 +110,21 @@ A `ContainerRegistration` binds:
 - a scheduler-owned logical `ContainerId`;
 - a stable Podman `RuntimeContainerRef`;
 - checkpoint interval and `keep_last` policy;
-- one standard CPU pair: container CPU `0/2/4/6` and matching checkpoint CPU
-  `1/3/5/7`;
+- a nonempty canonical `container_cpus` set and one disjoint `checkpoint_cpu`,
+  all within logical CPUs `0..7`;
 - an optional explicit `ColdStartSpec`;
 - an optional runtime fingerprint.
 
-At most four registrations are active. CPU assignments cannot overlap. A cold
+At most four registrations are active. Every container-cpuset member and checkpoint
+CPU is globally exclusive across active registrations. The API supports multi-CPU
+containers but does not dynamically suballocate one registered cpuset. A cold
 start is possible only when `cold_start` is present; it specifies the image,
 argv, environment, mounts, and validated runtime options. It is not synthesized
 from hidden defaults. Mutable shared-volume contents are not checkpointed by CCM.
 
 `register_container()` and `unregister_container()` are synchronous boolean
 operations. Overloads accepting a `RequestId` provide correlation but these
-mutations are not stored in the durable operation journal. Protocol v3 maps
+mutations are not stored in the durable operation journal. Protocol v4 maps
 service-side registration failures to `request_failed`, and the boolean API
 returns only `false`; reconcile scheduler desired state before retrying an
 ambiguous register/unregister exchange.
@@ -239,8 +241,8 @@ and handshakes a new connection on the next call.
 
 ## Protocol compatibility
 
-The current wire protocol is exactly version 3. Handshake requires both version
-3 and service name `gravesentinel_hypervisor`. There is no version negotiation
+The current wire protocol is exactly version 4. Handshake requires both version
+4 and service name `gravesentinel_hypervisor`. There is no version negotiation
 or TCP transport. Unknown versions, envelope fields, methods, and malformed or
 oversized packets are rejected. Upgrade scheduler and hypervisor as a compatible
 pair; see [`operations.md`](operations.md) for the stop/upgrade/re-register

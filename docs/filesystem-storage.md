@@ -5,7 +5,7 @@
 `//src/storage:filesystem_storage` is the durable filesystem backend for CCM. It
 implements storage transactions, immutable file publication, bounded reads,
 per-container locks, operation staging, runtime artifact directories, and
-manifest pins. [Manifest encoding and validation](manifest-v1.md),
+manifest pins. [Manifest encoding and validation](manifest-v2.md),
 [chunking, chunk hash verification, and reassembly](chunking.md), and the
 implemented create/restore orchestration remain separate layers. The backend also
 implements strict retention, candidate-based chunk garbage collection, and conservative
@@ -109,7 +109,7 @@ operation-key = hex(BLAKE3("operation" || 0x00 || OperationId bytes))
 The domain strings contain no terminator other than the single explicit `0x00`
 separator shown above. Identifiers must contain 1 through 256 bytes and must not
 contain NUL. Storage does not require identifier bytes to be UTF-8; the stricter
-[Manifest v1 text rules](manifest-v1.md#validation-invariants) apply before an ID
+[Manifest v2 text rules](manifest-v2.md#validation-invariants) apply before an ID
 can be persisted in a manifest. Raw identifiers are never path components, so
 values containing `/`, `.` or `..` cannot escape the root.
 
@@ -171,7 +171,7 @@ filename generation before any deletion.
 A regular file with a valid manifest name but a size greater than 16 MiB causes
 listing to fail as corrupted storage rather than being silently skipped.
 
-A successful publication requires a canonical, checksum-valid Manifest v1 whose
+A successful publication requires a canonical, checksum-valid Manifest v2 whose
 container and checkpoint identities match the operation. A generation must be
 greater than every previously committed generation name, including a generation
 whose body is no longer decodable. Reads additionally bind the body container and

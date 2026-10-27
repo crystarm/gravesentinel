@@ -6,6 +6,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -212,6 +213,99 @@ private:
          std::all_of(value.begin(), value.end(), is_lower_hex);
 }
 
+[[nodiscard]] std::string canonical_cpu_list(const CpuSet &cpus) {
+  std::string result;
+  const auto &values = cpus.values();
+  for (std::size_t index = 0; index < values.size();) {
+    const auto first = values[index];
+    auto last = first;
+    while (index + 1U < values.size() && values[index + 1U] == last + 1U) {
+      ++index;
+      last = values[index];
+    }
+    if (!result.empty()) {
+      result.push_back(',');
+    }
+    result += std::to_string(first);
+    if (last != first) {
+      result.push_back('-');
+      result += std::to_string(last);
+    }
+    ++index;
+  }
+  return result;
+}
+
+[[nodiscard]] std::expected<std::uint32_t, std::string>
+parse_cpu_number(std::string_view text) {
+  if (text.empty()) {
+    return std::unexpected("CPU number is empty");
+  }
+  std::uint32_t value{};
+  const auto parsed =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+    return std::unexpected("CPU number is not an unsigned decimal integer");
+  }
+  return value;
+}
+
+[[nodiscard]] std::expected<CpuSet, std::string>
+parse_linux_cpu_list(std::string_view text) {
+  if (text.empty()) {
+    return std::unexpected("CPU list is empty");
+  }
+
+  std::vector<std::uint32_t> cpus;
+  std::size_t entry_begin = 0U;
+  while (entry_begin < text.size()) {
+    const auto separator = text.find(',', entry_begin);
+    const auto entry_end =
+        separator == std::string_view::npos ? text.size() : separator;
+    const auto entry = text.substr(entry_begin, entry_end - entry_begin);
+    const auto range_separator = entry.find('-');
+    auto first = parse_cpu_number(entry.substr(0U, range_separator));
+    if (!first) {
+      return std::unexpected(first.error());
+    }
+    auto last = first;
+    if (range_separator != std::string_view::npos) {
+      if (entry.find('-', range_separator + 1U) != std::string_view::npos) {
+        return std::unexpected("CPU range contains multiple separators");
+      }
+      last = parse_cpu_number(entry.substr(range_separator + 1U));
+      if (!last) {
+        return std::unexpected(last.error());
+      }
+    }
+    if (*first > *last || *last > CpuSet::maximum_cpu) {
+      return std::unexpected("CPU range is outside the supported profile");
+    }
+    for (auto cpu = *first;; ++cpu) {
+      if (cpus.size() >= CpuSet::maximum_size) {
+        return std::unexpected("CPU list exceeds the supported profile");
+      }
+      cpus.push_back(cpu);
+      if (cpu == *last) {
+        break;
+      }
+    }
+    if (separator == std::string_view::npos) {
+      break;
+    }
+    entry_begin = separator + 1U;
+    if (entry_begin == text.size()) {
+      return std::unexpected("CPU list has a trailing separator");
+    }
+  }
+
+  auto result = CpuSet::create(std::move(cpus));
+  if (!result) {
+    return std::unexpected(result.error().diagnostic);
+  }
+  return std::move(*result);
+}
+
 [[nodiscard]] std::optional<std::string>
 canonical_image_id(std::string_view value) {
   constexpr std::string_view prefix = "sha256:";
@@ -378,7 +472,7 @@ struct ContainerInspection {
   std::string image_identity;
   bool running;
   int exit_code;
-  std::string cpuset;
+  CpuSet cpuset;
   std::string managed;
   std::string logical_id;
 };
@@ -454,7 +548,7 @@ public:
                 std::unexpected(before.error())};
           }
           if (const auto valid = validate_owned_container(
-                  *before, container_id, cpu_assignment.container_cpu, true);
+                  *before, container_id, cpu_assignment.container_cpus, true);
               !valid) {
             return CheckpointResult<CapturedSnapshot>{
                 std::unexpected(valid.error())};
@@ -485,7 +579,7 @@ public:
                 std::unexpected(after.error())};
           }
           if (const auto valid = validate_owned_container(
-                  *after, container_id, cpu_assignment.container_cpu, true);
+                  *after, container_id, cpu_assignment.container_cpus, true);
               !valid) {
             return CheckpointResult<CapturedSnapshot>{
                 std::unexpected(valid.error())};
@@ -550,9 +644,9 @@ public:
           if (!inspection) {
             return std::unexpected(inspection.error());
           }
-          if (const auto valid =
-                  validate_owned_container(*inspection, container_id,
-                                           cpu_assignment.container_cpu, false);
+          if (const auto valid = validate_owned_container(
+                  *inspection, container_id, cpu_assignment.container_cpus,
+                  false);
               !valid) {
             return std::unexpected(valid.error());
           }
@@ -603,7 +697,7 @@ public:
             return CheckpointResult<void>{std::unexpected(before.error())};
           }
           if (const auto valid = validate_owned_container(
-                  *before, container_id, cpu_assignment.container_cpu, false);
+                  *before, container_id, cpu_assignment.container_cpus, false);
               !valid) {
             return valid;
           }
@@ -636,7 +730,7 @@ public:
             stopped_container = *inspected;
             if (const auto valid = validate_owned_container(
                     stopped_container, container_id,
-                    cpu_assignment.container_cpu, false);
+                    cpu_assignment.container_cpus, false);
                 !valid) {
               return indeterminate(valid.error());
             }
@@ -755,7 +849,7 @@ public:
                 std::unexpected(with_runtime_side_effect(target.error()))};
           }
           if (const auto valid = validate_owned_container(
-                  *target, container_id, cpu_assignment.container_cpu, true);
+                  *target, container_id, cpu_assignment.container_cpus, true);
               !valid) {
             return CheckpointResult<RuntimeIncarnation>{
                 std::unexpected(with_runtime_side_effect(valid.error()))};
@@ -798,7 +892,7 @@ public:
           if (!spec.mounts.empty() || !spec.runtime_options.empty()) {
             return CheckpointResult<RuntimeIncarnation>{std::unexpected(
                 make_error(StableErrorCode::invalid_argument,
-                           "command profile v1 does not support mounts or "
+                           "command profile v2 does not support mounts or "
                            "runtime options"))};
           }
           if (!is_valid_image_reference(spec.image_reference)) {
@@ -873,7 +967,8 @@ public:
               "--cap-drop=all",
               "--passwd=false",
               "--security-opt=no-new-privileges",
-              "--cpuset-cpus=" + std::to_string(cpu_assignment.container_cpu),
+              "--cpuset-cpus=" +
+                  canonical_cpu_list(cpu_assignment.container_cpus),
           };
           if (environment_file) {
             arguments.emplace_back("--env-file");
@@ -915,7 +1010,7 @@ public:
                 std::unexpected(with_runtime_side_effect(target.error()))};
           }
           if (const auto valid = validate_owned_container(
-                  *target, container_id, cpu_assignment.container_cpu, true);
+                  *target, container_id, cpu_assignment.container_cpus, true);
               !valid) {
             return CheckpointResult<RuntimeIncarnation>{
                 std::unexpected(with_runtime_side_effect(valid.error()))};
@@ -975,7 +1070,7 @@ public:
                 std::unexpected(with_runtime_side_effect(before.error()))};
           }
           if (const auto valid = validate_owned_container(
-                  *before, container_id, cpu_assignment.container_cpu, false);
+                  *before, container_id, cpu_assignment.container_cpus, false);
               !valid) {
             return CheckpointResult<void>{
                 std::unexpected(with_runtime_side_effect(valid.error()))};
@@ -994,9 +1089,9 @@ public:
             return CheckpointResult<void>{std::unexpected(
                 with_runtime_side_effect(stopped_container.error()))};
           }
-          if (const auto valid =
-                  validate_owned_container(*stopped_container, container_id,
-                                           cpu_assignment.container_cpu, false);
+          if (const auto valid = validate_owned_container(
+                  *stopped_container, container_id,
+                  cpu_assignment.container_cpus, false);
               !valid) {
             return CheckpointResult<void>{
                 std::unexpected(with_runtime_side_effect(valid.error()))};
@@ -1032,18 +1127,18 @@ private:
       log_failure(operation);
       return std::unexpected(valid.error());
     }
-    if (!is_standard_cpu_pair(cpu_assignment.container_cpu,
-                              cpu_assignment.checkpoint_cpu)) {
+    if (cpu_assignment.checkpoint_cpu > CpuSet::maximum_cpu ||
+        cpu_assignment.container_cpus.contains(cpu_assignment.checkpoint_cpu)) {
       log_failure(operation);
       return std::unexpected(make_error(
           StableErrorCode::invalid_argument,
           "runtime CPU assignment is outside the qualified profile"));
     }
-    if (const auto available =
-            validate_cpu_available(cpu_assignment.container_cpu);
-        !available) {
-      log_failure(operation);
-      return std::unexpected(available.error());
+    for (const auto cpu : cpu_assignment.container_cpus.values()) {
+      if (const auto available = validate_cpu_available(cpu); !available) {
+        log_failure(operation);
+        return std::unexpected(available.error());
+      }
     }
     if (const auto available =
             validate_cpu_available(cpu_assignment.checkpoint_cpu);
@@ -1684,12 +1779,17 @@ private:
       return std::unexpected(make_error(
           failure_code, "container inspect JSON is incomplete or malformed"));
     }
+    auto parsed_cpuset = parse_linux_cpu_list(*cpuset);
+    if (!parsed_cpuset) {
+      return std::unexpected(make_error(
+          failure_code, "container inspect JSON contains an invalid CPU list"));
+    }
     return ContainerInspection{
         .runtime_id = *runtime_id,
         .image_identity = *canonical_image,
         .running = *running,
         .exit_code = *exit_code,
-        .cpuset = *cpuset,
+        .cpuset = std::move(*parsed_cpuset),
         .managed = *managed,
         .logical_id = *logical_id,
     };
@@ -1727,14 +1827,14 @@ private:
 
   [[nodiscard]] CheckpointResult<void> validate_owned_container(
       const ContainerInspection &inspection, const ContainerId &container_id,
-      std::uint32_t container_cpu, bool require_running) const {
+      const CpuSet &container_cpus, bool require_running) const {
     if (inspection.managed != "true" ||
         inspection.logical_id != container_id.value()) {
       return std::unexpected(make_error(
           StableErrorCode::permission_denied,
           "container ownership labels do not match the logical container"));
     }
-    if (inspection.cpuset != std::to_string(container_cpu)) {
+    if (inspection.cpuset != container_cpus) {
       return std::unexpected(make_error(
           StableErrorCode::conflict,
           "container CPU assignment does not match the registered profile"));

@@ -22,7 +22,7 @@ namespace {
                   {"checkpoint",
                    {{"interval_seconds", 60},
                     {"keep_last", 3U},
-                    {"container_cpu", 0U},
+                    {"container_cpus", {0U, 2U}},
                     {"checkpoint_cpu", 1U}}},
                   {"cold_start",
                    {{"image_reference", "registry.example/worker:latest"},
@@ -55,7 +55,7 @@ namespace {
                     {"selinux_mode", "disabled"},
                     {"apparmor_profile", "host-default"},
                     {"seccomp_profile", "default"},
-                    {"command_profile", "podman-criu-rootful-v1"}}}});
+                    {"command_profile", "podman-criu-rootful-v2"}}}});
 }
 
 TEST(IpcCodecTest, AcceptsNoArgumentRequestOnlyWithObjectParams) {

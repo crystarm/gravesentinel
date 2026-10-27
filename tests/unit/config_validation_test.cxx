@@ -33,7 +33,7 @@ namespace {
       .selinux_mode = "disabled",
       .apparmor_profile = "host-default",
       .seccomp_profile = "default",
-      .command_profile = "podman-criu-rootful-v1",
+      .command_profile = "podman-criu-rootful-v2",
   };
 }
 
@@ -48,7 +48,7 @@ make_registration(std::string suffix, std::uint32_t container_cpu,
           CheckpointConfig{
               .interval = std::chrono::seconds{60},
               .keep_last = 3,
-              .container_cpu = container_cpu,
+              .container_cpus = CpuSet::create({container_cpu}).value(),
               .checkpoint_cpu = checkpoint_cpu,
           },
       .cold_start = std::nullopt,
@@ -92,7 +92,7 @@ TEST(CheckpointConfigTest, AcceptsAllFourStandardCpuPairs) {
     const CheckpointConfig config{
         .interval = std::chrono::seconds{1},
         .keep_last = 1,
-        .container_cpu = pair[0],
+        .container_cpus = CpuSet::create({pair[0]}).value(),
         .checkpoint_cpu = pair[1],
     };
     EXPECT_TRUE(validate_checkpoint_config(config));
@@ -123,9 +123,9 @@ TEST(CheckpointConfigTest, RejectsRetentionOutsideOneThroughThree) {
             ValidationErrorCode::invalid_keep_last);
 }
 
-TEST(CheckpointConfigTest, RejectsInvalidOrReversedCpuPairs) {
-  constexpr std::array<std::array<std::uint32_t, 2>, 5> invalid_pairs{
-      {{0, 0}, {1, 0}, {0, 3}, {2, 5}, {6, 8}}};
+TEST(CheckpointConfigTest, RejectsOverlappingOrOutOfRangeCpuAssignments) {
+  constexpr std::array<std::array<std::uint32_t, 2>, 2> invalid_pairs{
+      {{0, 0}, {6, 8}}};
 
   for (const auto &pair : invalid_pairs) {
     const auto registration = make_registration("invalid", pair[0], pair[1]);
@@ -311,6 +311,29 @@ TEST(CpuAssignmentsTest, AcceptsFourUniqueStandardPairs) {
       make_registration("two", 4, 5), make_registration("three", 6, 7)};
 
   EXPECT_TRUE(validate_cpu_assignments(registrations));
+}
+
+TEST(CpuAssignmentsTest, AcceptsDisjointMultiCpuRegistrations) {
+  auto first = make_registration("first", 0, 2);
+  first.checkpoint.container_cpus = CpuSet::create({0U, 1U}).value();
+  auto second = make_registration("second", 3, 5);
+  second.checkpoint.container_cpus = CpuSet::create({3U, 4U}).value();
+
+  EXPECT_TRUE(validate_cpu_assignments(std::vector{first, second}));
+}
+
+TEST(CpuAssignmentsTest, RejectsContainerSetAndCrossCheckpointOverlap) {
+  auto first = make_registration("first", 0, 2);
+  first.checkpoint.container_cpus = CpuSet::create({0U, 1U}).value();
+  auto container_overlap = make_registration("container-overlap", 1, 3);
+  auto checkpoint_overlap = make_registration("checkpoint-overlap", 2, 4);
+
+  for (const auto &second : {container_overlap, checkpoint_overlap}) {
+    const auto result = validate_cpu_assignments(std::vector{first, second});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code,
+              ValidationErrorCode::duplicate_cpu_assignment);
+  }
 }
 
 TEST(CpuAssignmentsTest, RejectsPairReuseAcrossRegistrations) {

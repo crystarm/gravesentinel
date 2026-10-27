@@ -50,16 +50,17 @@ static_assert(kRegularFileMode ==
       .selinux_mode = "disabled",
       .apparmor_profile = "host-default",
       .seccomp_profile = "default",
-      .command_profile = "podman-criu-rootful-v1",
+      .command_profile = "podman-criu-rootful-v2",
   };
 }
 
-[[nodiscard]] ManifestV1 make_valid_manifest() {
-  return ManifestV1{
+[[nodiscard]] ManifestV2 make_valid_manifest() {
+  return ManifestV2{
       .container_id = ContainerId::create("container-01").value(),
       .checkpoint_id = CheckpointId::create("checkpoint-0007").value(),
       .generation = 7,
       .created_at_unix_nanoseconds = 1730000000123456789ULL,
+      .container_cpus = CpuSet::create({0U, 1U}).value(),
       .source_image_identity =
           "registry.example/gravesentinel@sha256:0123456789abcdef",
       .runtime_fingerprint = make_valid_runtime_fingerprint(),
@@ -97,9 +98,9 @@ static_assert(kRegularFileMode ==
   };
 }
 
-void expect_manifest_error(const ManifestV1 &manifest,
+void expect_manifest_error(const ManifestV2 &manifest,
                            ManifestErrorCode expected_code) {
-  const auto result = validate_manifest_v1(manifest);
+  const auto result = validate_manifest_v2(manifest);
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().code, expected_code);
 }
@@ -199,7 +200,7 @@ TEST(ManifestValidationTest, AcceptsValidManifestWithoutReorderingIt) {
   auto manifest = make_valid_manifest();
   const auto original = manifest;
 
-  const auto result = validate_manifest_v1(manifest);
+  const auto result = validate_manifest_v2(manifest);
 
   ASSERT_TRUE(result);
   EXPECT_EQ(manifest, original);
@@ -278,7 +279,7 @@ TEST(ManifestValidationTest, AcceptsEmptyFileOnlyWithoutChunks) {
   artifact.size = 0;
   artifact.chunks.clear();
 
-  EXPECT_TRUE(validate_manifest_v1(manifest));
+  EXPECT_TRUE(validate_manifest_v2(manifest));
 
   artifact.chunks.push_back(ManifestChunkV1{
       .hash = make_hash(std::byte{0x01}),

@@ -94,8 +94,9 @@ separate success marker:
 RESULT: QUALIFIED production PodmanAdapter smoke passed
 ```
 
-This marker was obtained on the qualified rootful profile on 2026-10-22; rerun
-the gate and complete smoke whenever the runtime or host profile changes.
+This marker was obtained on the historical rootful profile v1 on 2026-10-22; it
+does not qualify current profile v2. Rerun the gate and complete smoke whenever the
+runtime or host profile changes.
 
 ## Hypervisor + SchedulerClient process-boundary E2E
 
@@ -104,9 +105,11 @@ stage-02 direct Podman smoke and stage-06 adapter helper, it starts the real
 `gravesentinel_hypervisor` subprocess with unique socket and storage roots. Every
 functional lifecycle request uses `SchedulerClient`: handshake, health, register,
 async create/restore submission, `GetOperation` polling, and unregister. The recorded
-2026-10-25 marker predates protocol-v3 `GetRuntimeStatus` and durable
-`SubmitStopContainer`; extend and rerun this harness before treating those paths as
-rootfully qualified. Direct Podman access is limited to building the fixture image,
+2026-10-25 marker qualifies protocol v2/profile v1 only; it predates protocol-v3
+`GetRuntimeStatus` and durable `SubmitStopContainer` as well as protocol-v4/profile-v2
+multi-CPU cpusets and Manifest-v2 restore lineage. Rerun the current harness before
+treating those paths as rootfully qualified. Direct Podman access is limited to
+building the fixture image,
 read-only observations, fault
 oracles, and final ownership-checked cleanup after the daemon has stopped.
 
@@ -158,15 +161,17 @@ Only a run that finishes cleanup and prints this final marker is stage-12 eviden
 RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed
 ```
 
-The rootful wrapper first qualified on 2026-10-24. On 2026-10-25 it completed a
-regression run against the current production recovery code and emitted both:
+The rootful wrapper first qualified protocol v2/profile v1 on 2026-10-24. On
+2026-10-25 it completed a regression run against the then-current production recovery
+code and emitted both:
 
 ```text
 PASS: all SchedulerClient/process-boundary scenarios passed
 RESULT: QUALIFIED Hypervisor + SchedulerClient E2E passed
 ```
 
-This is dated evidence for the measured host, not a portability claim.
+This is dated protocol-v2/profile-v1 evidence for the measured host, not a
+portability or current-code qualification claim.
 
 ## Stage-13 crash/reconnect/recovery acceptance
 
@@ -208,13 +213,14 @@ Only successful assertions plus ownership-checked cleanup produce:
 RESULT: QUALIFIED crash/reconnect/recovery acceptance passed
 ```
 
-**Status: QUALIFIED on 2026-10-25.** The run completed all scenarios and strict
-cleanup and emitted the final marker above.
+**Historical status: QUALIFIED on 2026-10-25 for protocol v2/profile v1.** The run
+completed all scenarios and strict cleanup and emitted the final marker above.
 
 ## Stage-13 four-container CPU acceptance
 
-`//tests/integration:hypervisor_four_cpu_e2e` uses the standard pairs `0/1`, `2/3`,
-`4/5`, and `6/7`. It proves deterministic overlap of four checkpoint operations,
+`//tests/integration:hypervisor_four_cpu_e2e` uses four disjoint singleton container
+cpusets with checkpoint assignments `0/1`, `2/3`, `4/5`, and `6/7`. It proves
+deterministic overlap of four checkpoint operations,
 checks container tasks, Podman cpusets, effective cgroup cpusets, daemon worker TIDs,
 control/client affinity and the gated Podman child, rejects a fifth valid registration
 at capacity, then restores all four containers after controlled removal.
@@ -248,8 +254,8 @@ Only successful assertions plus strict cleanup produce:
 RESULT: QUALIFIED four-container CPU acceptance passed
 ```
 
-**Status: QUALIFIED twice on 2026-10-25.** Both runs completed cleanup and emitted
-the final marker above.
+**Historical status: QUALIFIED twice on 2026-10-25 for protocol v2/profile v1.**
+Both runs completed cleanup and emitted the final marker above.
 
 ## Complete stage-13 suite
 
@@ -257,5 +263,6 @@ the final marker above.
 rootful targets for a CI process already running in the qualified rootful context.
 Interactive developers must not use `sudo bazel`; build normally and invoke the
 three wrappers through `sudo env` as shown above. On 2026-10-25, the three constituent
-wrappers all produced their current-code qualification markers: stage 12 once,
-crash/reconnect/recovery once, and four-container CPU acceptance twice.
+wrappers all produced protocol-v2/profile-v1 qualification markers: stage 12 once,
+crash/reconnect/recovery once, and four-container CPU acceptance twice. These markers
+do not qualify current protocol v4/profile v2.

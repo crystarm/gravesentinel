@@ -38,8 +38,8 @@ RESULT: QUALIFIED non-privileged release gate passed
 The sanitizer profiles deliberately target the unit suite. The rootful static
 fixture and Podman/CRIU suites are not run under sanitizers.
 
-On 2026-10-25 the complete non-privileged script passed in the development
-workspace and emitted:
+On 2026-10-26 the complete non-privileged script passed against current protocol v4,
+profile v2, and Manifest v2 in the development workspace and emitted:
 
 ```text
 RESULT: QUALIFIED non-privileged release gate passed
@@ -93,12 +93,12 @@ not rootful qualification.
 
 ## Qualification status
 
-The non-privileged release gate and all three rootful acceptance suites produced their
-markers on 2026-10-25 for the then-current protocol-v2 code. Protocol v3 subsequently
-added runtime status/adoption and durable stop/remove, changing IPC, journal admission,
-per-container service work, and privileged cleanup. The old markers are historical and
-do not qualify the current code. Rerun the non-privileged gate and all affected rootful
-suites before release.
+All three rootful acceptance suites produced markers on 2026-10-25 for the
+then-current protocol-v2/profile-v1 code. Protocol v3 subsequently added runtime
+status/adoption and durable stop/remove. Current protocol v4, profile v2, and Manifest
+v2 add multi-CPU cpusets and exact cpuset restore lineage. The current non-privileged
+gate passed on 2026-10-26, but the old rootful markers remain historical and do not
+qualify current privileged behavior. Rerun all affected rootful suites before release.
 
 ## Requalification triggers
 
@@ -110,4 +110,5 @@ suites after changes to:
   maintenance, or runtime code;
 - kernel, Podman, crun, CRIU, cgroup, CPU, privilege, AppArmor, SELinux, seccomp,
   or capability profile;
-- runtime command argv, fixture, container security options, or cleanup logic.
+- runtime command argv, fixture, container security options, CPU/cpuset semantics,
+  manifest compatibility, or cleanup logic.

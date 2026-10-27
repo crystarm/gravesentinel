@@ -45,7 +45,7 @@ using ccm::StorageSideEffect;
       {"checkpoint",
        {{"interval_seconds", 60},
         {"keep_last", 3U},
-        {"container_cpu", 0U},
+        {"container_cpus", {0U, 2U}},
         {"checkpoint_cpu", 1U}}},
       {"cold_start",
        {{"image_reference", "registry.example/worker:latest"},
@@ -78,7 +78,7 @@ using ccm::StorageSideEffect;
         {"selinux_mode", "disabled"},
         {"apparmor_profile", "host-default"},
         {"seccomp_profile", "default"},
-        {"command_profile", "podman-criu-rootful-v1"}}},
+        {"command_profile", "podman-criu-rootful-v2"}}},
   };
 }
 
@@ -355,7 +355,7 @@ TEST_F(HypervisorRpcHandlerTest,
   ASSERT_TRUE(decoded->runtime_fingerprint);
   EXPECT_EQ(decoded->runtime_fingerprint->runtime_build_origin, "Debian 13");
   EXPECT_EQ(decoded->runtime_fingerprint->command_profile,
-            "podman-criu-rootful-v1");
+            "podman-criu-rootful-v2");
 
   RpcHandler handler(service_, *store_);
   const auto rejected =

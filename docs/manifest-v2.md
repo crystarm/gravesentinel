@@ -1,13 +1,13 @@
-# Checkpoint Manifest v1
+# Checkpoint Manifest v2
 
 ## Status and scope
 
 This document is the normative persisted-format contract for Checkpoint Manifest
-v1. The implementation lives in `//src/manifest:manifest`; the production BLAKE3
+v2. The implementation lives in `//src/manifest:manifest`; the production BLAKE3
 wrapper is `//src/crypto:blake3`, and `//src/core:blake3_hasher` adapts it to
 `IHasher`.
 
-Manifest v1 describes an immutable checkpoint as an ordered set of regular-file
+Manifest v2 describes an immutable checkpoint as an ordered set of regular-file
 artifacts and their ordered fixed-size chunks. It does not publish files, read
 chunks, follow filesystem links, invoke Podman, or decide runtime compatibility.
 Those operations belong to [filesystem storage](filesystem-storage.md),
@@ -15,15 +15,16 @@ Those operations belong to [filesystem storage](filesystem-storage.md),
 
 ## Data model
 
-A `ManifestV1` contains:
+A `ManifestV2` contains:
 
 | Field | Representation and meaning |
 | --- | --- |
-| `format_version` | Unsigned integer `1`; encoded by the codec rather than stored as mutable model state |
+| `format_version` | Unsigned integer `2`; encoded by the codec rather than stored as mutable model state |
 | `container_id` | Logical scheduler `ContainerId`, never a transient Podman container ID |
 | `checkpoint_id` | Unique ID of the immutable checkpoint |
 | `generation` | Unsigned per-container ordering value; must be greater than zero |
 | `created_at_unix_nanoseconds` | Unsigned nanoseconds since the Unix epoch; diagnostic metadata, not version ordering |
+| `container_cpus` | Nonempty canonical sorted set of unique logical CPU IDs in the inclusive range `0..7`; the exact source container cpuset required for restore |
 | `source_image_identity` | Non-secret immutable image reference, digest, or runtime image identity |
 | `runtime_fingerprint` | Exact runtime/host compatibility inputs listed below |
 | `artifacts` | Ordered array of regular-file artifact descriptors |
@@ -46,7 +47,7 @@ when publishing successive manifests for one `ContainerId`.
 
 ## Runtime fingerprint
 
-Manifest v1 persists these exact non-secret strings:
+Manifest v2 persists these exact non-secret strings:
 
 - `runtime_name`, `runtime_version`, `runtime_build_origin`;
 - `architecture`, `kernel_release`, `criu_version`;
@@ -68,10 +69,10 @@ stderr belongs in either field.
 
 ## Canonical JSON profile
 
-Manifest v1 uses a narrow project-defined canonical JSON profile, not a claim of
+Manifest v2 uses a narrow project-defined canonical JSON profile, not a claim of
 full RFC 8785 conformance. The encoder uses the repository-pinned
 `nlohmann_json` implementation with its ordered object representation and strict
-UTF-8 serializer. The following rules are part of the persisted v1 format:
+UTF-8 serializer. The following rules are part of the persisted v2 format:
 
 1. The document is UTF-8 without BOM, comments, control characters, trailing
    bytes, or trailing newline.
@@ -79,8 +80,8 @@ UTF-8 serializer. The following rules are part of the persisted v1 format:
 3. Object keys are emitted in the exact sequences specified below. These
    sequences are the lexicographic order produced by the pinned implementation,
    but consumers must treat the explicit sequences, rather than a dependency's
-   future ordering behavior, as the v1 contract.
-4. The root and every nested object contain exactly the fields defined by v1;
+   future ordering behavior, as the v2 contract.
+4. The root and every nested object contain exactly the fields defined by v2;
    missing, unknown, or duplicate keys are rejected.
 5. Versions, timestamps, modes, and sizes are unsigned decimal integer literals.
    Negative, floating-point, exponent, or out-of-range alternatives are rejected.
@@ -100,6 +101,7 @@ The complete top-level object uses this exact key order:
 artifacts
 checkpoint_id
 checksum
+container_cpus
 container_id
 created_at_unix_nanoseconds
 format_version
@@ -137,15 +139,15 @@ user_namespace_mode
 
 ### Decoder acceptance order
 
-`decode_manifest_v1` applies checks in this order:
+`decode_manifest_v2` applies checks in this order:
 
 1. reject an empty encoding or an encoding larger than 16 MiB;
 2. run the bounded SAX preflight pass;
 3. build the JSON DOM and require one root object;
 4. require and parse `format_version`, reject unsupported versions, then require
-   the exact v1 root key set;
+   the exact v2 root key set;
 5. parse the exact nested schemas and unsigned/string field types;
-6. construct the model and run all Manifest v1 semantic validation;
+6. construct the model and run all Manifest v2 semantic validation;
 7. parse the checksum, reconstruct the canonical payload, and compare BLAKE3-256;
 8. encode the complete canonical document and require byte-for-byte equality with
    the original input.
@@ -158,7 +160,9 @@ such a document could be accepted, but checksum checking is not the first decode
 step.
 
 Changing this schema, key set or order, integer representation, checksum
-algorithm, or canonicalization rules requires a new manifest version.
+algorithm, or canonicalization rules requires a new manifest version. Manifest v1
+snapshots are intentionally incompatible with the current decoder and command profile;
+a migration must be added explicitly rather than inferred during restore.
 
 ## Checksum
 
@@ -171,16 +175,20 @@ Encoding is deterministic:
 4. Insert the lowercase hex digest as `checksum`.
 5. Serialize the complete object canonically.
 
-The checksum protects every semantic field and both array orders. The decoder
+The checksum protects every semantic field, including `container_cpus`, and both
+array orders. The decoder
 reconstructs the payload, recomputes BLAKE3, and compares the digest before
-accepting the document. This is corruption detection, not authentication or a
-MAC; authenticity must come from the trusted storage/process boundary.
+accepting the document. Restore additionally requires `container_cpus` to match the
+requested runtime cpuset exactly and rejects a mismatch before runtime mutation. This
+is corruption detection, not authentication or a MAC; authenticity must come from the
+trusted storage/process boundary.
 
 ## Validation invariants
 
 The model and decoder enforce all of the following:
 
 - `generation > 0`;
+- `container_cpus` is nonempty, sorted, duplicate-free, and contains only logical CPU IDs `0..7`; the `CpuSet` value type canonicalizes valid caller input before it reaches the manifest model;
 - artifact paths are unique, and no file path may be the parent prefix of another
   file path (for example, `a` and `a/b` conflict);
 - only regular-file modes are accepted; symlink, directory, device, socket, and
@@ -199,7 +207,7 @@ The model and decoder enforce all of the following:
 
 ## Resource limits
 
-The v1 parser applies these limits before accepting untrusted input:
+The v2 parser applies these limits before accepting untrusted input:
 
 | Resource | Limit |
 | --- | ---: |
@@ -229,7 +237,7 @@ field-specific limits from the table.
 The current SAX implementation does not apply that 4096-byte per-string bound to
 object keys. A key is still bounded by the 16 MiB encoded-document limit and the
 32-fields-per-object limit, and every accepted object must later match an exact
-small v1 key set. This is an implementation resource-bound limitation, not a
+small v2 key set. This is an implementation resource-bound limitation, not a
 permission for extensions or oversized keys in an accepted manifest.
 
 The typed parse enforces the exact schema, numeric ranges, aggregate chunk count,
@@ -264,10 +272,10 @@ host filesystem that changed after parsing.
 
 ## API and errors
 
-- `validate_manifest_v1` validates an in-memory model without serializing it.
-- `encode_manifest_v1` validates and returns canonical bytes with a derived
+- `validate_manifest_v2` validates an in-memory model without serializing it.
+- `encode_manifest_v2` validates and returns canonical bytes with a derived
   checksum.
-- `decode_manifest_v1` treats bytes as untrusted input and returns only a fully
+- `decode_manifest_v2` treats bytes as untrusted input and returns only a fully
   validated canonical model.
 - `ManifestResult<T>` is `std::expected<T, ManifestError>` with stable structured
   `ManifestErrorCode`, field path, and internal diagnostic.

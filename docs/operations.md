@@ -71,7 +71,7 @@ ExecStart=/usr/local/libexec/gravesentinel_hypervisor \
   --storage /var/lib/gravesentinel \
   --podman /usr/bin/podman \
   --criu /usr/sbin/criu \
-  --runtime-profile podman-criu-rootful-v1 \
+  --runtime-profile podman-criu-rootful-v2 \
   --scheduler-uid 1234 \
   --socket-gid 1234 \
   --socket-mode 0660 \
@@ -153,7 +153,7 @@ phase-aware automatic classification of interrupted restore or stop as succeeded
 
 ## Upgrade policy
 
-Protocol version 3 has exact envelopes and no negotiation. The persisted manifest,
+Protocol version 4 has exact envelopes and no negotiation. The persisted manifest,
 storage layout, and operation journal are compatibility-sensitive. Unless release
 notes explicitly state compatibility, do not perform a rolling mixed-version
 upgrade and do not let two versions touch the same storage.
@@ -169,15 +169,16 @@ Safe single-host sequence:
    formats;
 7. run the non-privileged release gate and requalify the rootful testbed after any
    protocol, lifecycle, runtime, kernel, security, or command-profile change;
-8. start the hypervisor and require a healthy protocol-v3 response;
+8. start the hypervisor and require a healthy protocol-v4 response;
 9. replay desired registrations and inspect/adopt runtime state;
 10. reconcile known `indeterminate` operations, then resume new operations.
 
 If the old daemon crashed rather than stopped cleanly, reconcile every recovered
-`indeterminate` operation before allowing a logically equivalent new request. Protocol
-v3 runtime status and stop/remove changed privileged lifecycle behavior, so the
-2026-10-25 rootful markers from protocol v2 do not qualify the current code; rerun all
-affected destructive suites before release.
+`indeterminate` operation before allowing a logically equivalent new request.
+Protocol v3 runtime status and stop/remove changed privileged lifecycle behavior;
+protocol v4/profile v2 and Manifest v2 additionally changed CPU assignment and restore
+compatibility. The 2026-10-25 rootful markers from protocol v2/profile v1 do not
+qualify the current code; rerun all affected destructive suites before release.
 There is no online journal migration, cross-host failover, or inter-host checkpoint
 migration in the MVP.
 
@@ -239,4 +240,5 @@ The MVP does not support:
 - atomic snapshot/rollback of critically mutable shared volumes;
 - storage shared by multiple daemons or hosts;
 - inter-host migration, rolling mixed-version upgrade, or automatic failover;
-- arbitrary logical CPU layouts outside the four standard pairs.
+- more than four registrations, CPU IDs outside `0..7`, overlapping
+  container/checkpoint CPU assignments, or dynamic cpuset suballocation.

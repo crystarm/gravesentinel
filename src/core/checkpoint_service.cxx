@@ -167,9 +167,13 @@ next_deadline(IClock::MonotonicTime now, std::chrono::seconds interval,
 
 [[nodiscard]] bool cpu_assignments_overlap(const CheckpointConfig &left,
                                            const CheckpointConfig &right) {
-  return left.container_cpu == right.container_cpu ||
-         left.container_cpu == right.checkpoint_cpu ||
-         left.checkpoint_cpu == right.container_cpu ||
+  const bool container_sets_overlap =
+      std::ranges::any_of(left.container_cpus.values(), [&](const auto cpu) {
+        return right.container_cpus.contains(cpu);
+      });
+  return container_sets_overlap ||
+         left.container_cpus.contains(right.checkpoint_cpu) ||
+         right.container_cpus.contains(left.checkpoint_cpu) ||
          left.checkpoint_cpu == right.checkpoint_cpu;
 }
 
@@ -196,7 +200,7 @@ CheckpointResult<RuntimeObservation> CheckpointOperations::inspect_runtime(
   return runtime_.inspect_runtime(
       registration.container_id, registration.runtime_container,
       RuntimeCpuAssignment{
-          .container_cpu = registration.checkpoint.container_cpu,
+          .container_cpus = registration.checkpoint.container_cpus,
           .checkpoint_cpu = registration.checkpoint.checkpoint_cpu,
       });
 }
@@ -223,7 +227,7 @@ CheckpointResult<void> CheckpointOperations::stop_runtime(
   return runtime_.stop_and_remove(
       registration.container_id, *target,
       RuntimeCpuAssignment{
-          .container_cpu = registration.checkpoint.container_cpu,
+          .container_cpus = registration.checkpoint.container_cpus,
           .checkpoint_cpu = registration.checkpoint.checkpoint_cpu,
       });
 }
@@ -508,14 +512,20 @@ struct CheckpointService::Implementation {
         }
       }
 
-      for (const auto cpu : {registration.checkpoint.container_cpu,
-                             registration.checkpoint.checkpoint_cpu}) {
+      for (const auto cpu : registration.checkpoint.container_cpus.values()) {
         auto available = affinity_controller.validate_cpu_available(cpu);
         if (!available) {
           auto error = std::move(available.error());
           attach_correlation(error, request_id);
           return std::unexpected(std::move(error));
         }
+      }
+      if (auto available = affinity_controller.validate_cpu_available(
+              registration.checkpoint.checkpoint_cpu);
+          !available) {
+        auto error = std::move(available.error());
+        attach_correlation(error, request_id);
+        return std::unexpected(std::move(error));
       }
 
       const auto now = clock.monotonic_now();
@@ -1249,8 +1259,8 @@ struct CheckpointService::Implementation {
             .runtime_container = slot->registration.runtime_container,
             .cpu_assignment =
                 RuntimeCpuAssignment{
-                    .container_cpu =
-                        slot->registration.checkpoint.container_cpu,
+                    .container_cpus =
+                        slot->registration.checkpoint.container_cpus,
                     .checkpoint_cpu =
                         slot->registration.checkpoint.checkpoint_cpu,
                 },
@@ -1302,7 +1312,8 @@ struct CheckpointService::Implementation {
           .runtime_container = slot->registration.runtime_container,
           .cpu_assignment =
               RuntimeCpuAssignment{
-                  .container_cpu = slot->registration.checkpoint.container_cpu,
+                  .container_cpus =
+                      slot->registration.checkpoint.container_cpus,
                   .checkpoint_cpu =
                       slot->registration.checkpoint.checkpoint_cpu,
               },

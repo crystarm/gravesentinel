@@ -53,7 +53,7 @@ its `ICheckpointOperations` seam without constructing storage or Podman.
 
 ## `ContainerRegistration` wire schema
 
-In protocol v3, the `Register` method carries the complete registration as its `params`
+In protocol v4, the `Register` method carries the complete registration as its `params`
 object. The schema is exact: all keys shown below are required, no extra keys are
 accepted, and optional C++ values are encoded as `null` or a complete object.
 
@@ -64,7 +64,7 @@ accepted, and optional C++ values are encoded as `null` or a complete object.
   "checkpoint": {
     "interval_seconds": integer,
     "keep_last": integer,
-    "container_cpu": integer,
+    "container_cpus": [integer, ...],
     "checkpoint_cpu": integer
   },
   "cold_start": null | {
@@ -104,12 +104,14 @@ accepted, and optional C++ values are encoded as `null` or a complete object.
 ```
 
 Wire identifiers are 1–128 bytes and use only ASCII letters, digits, `_`, `-`, `.`,
-or `:`. `interval_seconds` is `1..31536000`, `keep_last` is `1..3`, and the CPU
-values must form one of the standard pairs listed below. Cold-start arrays, strings,
+or `:`. `interval_seconds` is `1..31536000`, `keep_last` is `1..3`, and
+`container_cpus` must be nonempty with unique members in `0..7`; `CpuSet`
+canonicalizes them into ascending order. `checkpoint_cpu` must also be in `0..7`
+and outside that set. Cold-start arrays, strings,
 environment names, and aggregate content are bounded by the codec; environment names
 must be unique. A non-null runtime fingerprint must contain all 20 non-empty string
 fields. Although `mounts` and `runtime_options` are part of the complete wire schema,
-`podman-criu-rootful-v1` rejects non-empty values because those command forms are not
+`podman-criu-rootful-v2` rejects non-empty values because those command forms are not
 qualified.
 
 ## Registration and CPU validation
@@ -119,16 +121,19 @@ before it becomes visible:
 
 1. the complete `ContainerRegistration` passes value/configuration validation;
 2. the `ContainerId` is not already registered;
-3. neither CPU is assigned to another live or retiring registration;
-4. both `container_cpu` and `checkpoint_cpu` are online and present in the
-   process-level allowed affinity mask according to `IAffinityController`; this
-   validation is independent of a narrower binding on the calling worker;
+3. no member of `container_cpus` and no `checkpoint_cpu` overlaps any CPU owned
+   by another live or retiring registration;
+4. every member of `container_cpus` and `checkpoint_cpu` is online and present in
+   the process-level allowed affinity mask according to `IAffinityController`;
+   this validation is independent of a narrower binding on the calling worker;
 5. the registration interval has a representable monotonic deadline;
 6. the worker starts and successfully binds itself to `checkpoint_cpu`.
 
-The standard accepted pairs remain `(0,1)`, `(2,3)`, `(4,5)`, and `(6,7)`. A slot
-with active work rejects unregister with a retryable conflict and remains registered,
-so a fifth registration cannot reuse its CPUs prematurely.
+Any nonempty container cpuset within `0..7` is accepted when its checkpoint CPU is
+disjoint and the complete assignment does not overlap another registration. The
+registry still has at most four slots. A slot with active work rejects unregister with
+a retryable conflict and remains registered, so a fifth registration cannot reuse its
+CPUs prematurely.
 
 `CheckpointConfig::keep_last` is operational: its validated `1..3` value is passed to
 every manual or periodic create for immediate post-commit retention and to separate
@@ -185,7 +190,8 @@ The worker binds its own thread to the registration's `checkpoint_cpu` before th
 registration succeeds and attempts to restore its original affinity on exit. The
 production Linux controller validates CPU availability against the process leader's
 allowed mask, not this already narrowed worker mask; consequently the runtime adapter
-can still validate `container_cpu` while executing on `checkpoint_cpu`. An
+can still validate every member of `container_cpus` while executing on
+`checkpoint_cpu`. An
 affinity-restore error is returned by unregister/shutdown (and cached by shutdown);
 the destructor invokes shutdown but cannot report that error. The calling control
 thread is never rebound. Capture, chunking, hashing, reassembly, runtime adapter calls,

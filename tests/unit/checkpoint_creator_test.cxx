@@ -80,7 +80,7 @@ template <typename Identifier>
       .selinux_mode = "disabled",
       .apparmor_profile = "host-default",
       .seccomp_profile = "default",
-      .command_profile = "podman-criu-rootful-v1",
+      .command_profile = "podman-criu-rootful-v2",
   };
 }
 
@@ -371,11 +371,12 @@ public:
     if (!relative) {
       throw std::runtime_error(relative.error().diagnostic);
     }
-    const ManifestV1 manifest{
+    const ManifestV2 manifest{
         .container_id = container,
         .checkpoint_id = checkpoint,
         .generation = generation,
         .created_at_unix_nanoseconds = kCreatedAtNanoseconds - generation,
+        .container_cpus = CpuSet::create({0U}).value(),
         .source_image_identity = "registry.example/previous@sha256:abcdef",
         .runtime_fingerprint = valid_runtime_fingerprint(),
         .artifacts = {ManifestArtifactV1{
@@ -388,7 +389,7 @@ public:
             }},
         }},
     };
-    auto encoded = encode_manifest_v1(manifest);
+    auto encoded = encode_manifest_v2(manifest);
     if (!encoded) {
       throw std::runtime_error(encoded.error().diagnostic);
     }
@@ -441,7 +442,7 @@ public:
   publish_manifest(const std::shared_ptr<OperationRecord> &record,
                    const CheckpointId &checkpoint,
                    std::span<const std::byte> encoded) {
-    auto decoded = decode_manifest_v1(encoded);
+    auto decoded = decode_manifest_v2(encoded);
     if (!decoded) {
       return std::unexpected(
           make_test_error(StableErrorCode::storage_error,
@@ -1089,7 +1090,7 @@ make_request(std::string operation_value = "operation-create-1",
           make_identifier<RuntimeContainerRef>("runtime-container-1"),
       .cpu_assignment =
           RuntimeCpuAssignment{
-              .container_cpu = 2U,
+              .container_cpus = CpuSet::create({2U}).value(),
               .checkpoint_cpu = 3U,
           },
   };
@@ -1127,9 +1128,9 @@ void expect_previous_checkpoints_intact(TestRig &rig) {
   for (const auto &[generation, expected_contents] : rig.previous_contents) {
     auto encoded = rig.storage.read_manifest(container, generation);
     ASSERT_TRUE(encoded.has_value()) << encoded.error().diagnostic;
-    auto decoded = decode_manifest_v1(*encoded);
+    auto decoded = decode_manifest_v2(*encoded);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().diagnostic;
-    auto canonical = encode_manifest_v1(*decoded);
+    auto canonical = encode_manifest_v2(*decoded);
     ASSERT_TRUE(canonical.has_value()) << canonical.error().diagnostic;
     EXPECT_EQ(*canonical, *encoded);
 
@@ -1204,7 +1205,7 @@ TEST(CheckpointCreatorTest,
 
   auto encoded = rig.storage.read_manifest(request.container_id, 8U);
   ASSERT_TRUE(encoded.has_value()) << encoded.error().diagnostic;
-  auto manifest = decode_manifest_v1(*encoded);
+  auto manifest = decode_manifest_v2(*encoded);
   ASSERT_TRUE(manifest.has_value()) << manifest.error().diagnostic;
   EXPECT_EQ(manifest->container_id, request.container_id);
   EXPECT_EQ(manifest->checkpoint_id, result->checkpoint_id);
@@ -1392,7 +1393,7 @@ TEST(CheckpointCreatorTest,
   EXPECT_TRUE(created->staging_cleanup_complete);
   auto encoded = (*storage)->read_manifest(request.container_id, 1U);
   ASSERT_TRUE(encoded.has_value()) << encoded.error().diagnostic;
-  auto manifest = decode_manifest_v1(*encoded);
+  auto manifest = decode_manifest_v2(*encoded);
   ASSERT_TRUE(manifest.has_value()) << manifest.error().diagnostic;
   ASSERT_EQ(manifest->artifacts.size(), 1U);
   EXPECT_EQ(manifest->artifacts.front().path.value(), "snapshot-1.bin");
@@ -1583,7 +1584,7 @@ TEST(CheckpointCreatorTest,
   EXPECT_EQ(listed->size(), 4U);
   auto visible = rig.storage.read_manifest(request.container_id, 8U);
   ASSERT_TRUE(visible.has_value()) << visible.error().diagnostic;
-  EXPECT_TRUE(decode_manifest_v1(*visible));
+  EXPECT_TRUE(decode_manifest_v2(*visible));
   ASSERT_FALSE(rig.storage.publication_events().empty());
   EXPECT_EQ(rig.storage.publication_events().back().kind,
             "manifest-visible-unconfirmed");

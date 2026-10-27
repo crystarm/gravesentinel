@@ -331,7 +331,7 @@ printf 'RUN: gravesentinel_hypervisor socket=%s storage=%s\n' \
   --storage "$storage_root" \
   --podman "$podman" \
   --criu "$criu" \
-  --runtime-profile podman-criu-rootful-v1 \
+  --runtime-profile podman-criu-rootful-v2 \
   --scheduler-uid "$(id -u)" \
   --socket-mode 0600 \
   --gc-grace-seconds 1 \
